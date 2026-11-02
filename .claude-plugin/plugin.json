@@ -1,0 +1,5 @@
+{
+  "name": "uniqlaw",
+  "version": "0.1.0",
+  "description": "UniQlaw: multi-channel agent daemon — Telegram / Discord / Slack / LINE chats driven by Claude Code, Codex, OpenCode, Antigravity, ACP agents or any LLM API, with a shared message bus and A2A"
+}

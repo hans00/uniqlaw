@@ -1,0 +1,14 @@
+{
+  "name": "uniqlaw",
+  "owner": { "name": "hans00" },
+  "plugins": [
+    {
+      "name": "uniqlaw",
+      "source": "./",
+      "description": "Multi-channel, multi-provider agent daemon with a provider-independent message bus and A2A",
+      "version": "0.1.0",
+      "keywords": ["telegram", "discord", "slack", "line", "daemon", "multi-agent", "a2a", "mcp", "codex", "opencode"],
+      "category": "productivity"
+    }
+  ]
+}
