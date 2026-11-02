@@ -1,0 +1,15 @@
+{
+  "name": "@uniqlaw/provider-acp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.2.0",
+    "@uniqlaw/core": "workspace:*",
+    "@uniqlaw/credentials": "workspace:*",
+    "@uniqlaw/provider-opencode": "workspace:*",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": { "@uniqlaw/testkit": "workspace:*" }
+}

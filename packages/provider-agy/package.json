@@ -1,0 +1,9 @@
+{
+  "name": "@uniqlaw/provider-agy",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@uniqlaw/core": "workspace:*", "@uniqlaw/credentials": "workspace:*", "zod": "^3.25.0" },
+  "devDependencies": { "@uniqlaw/testkit": "workspace:*" }
+}
