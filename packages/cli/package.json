@@ -1,0 +1,19 @@
+{
+  "name": "@uniqlaw/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "uniqlaw": "./src/main.ts"
+  },
+  "dependencies": {
+    "@uniqlaw/core": "workspace:*",
+    "@uniqlaw/daemon": "workspace:*",
+    "@uniqlaw/migrate-v2": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "@uniqlaw/credentials": "workspace:*"
+  },
+  "devDependencies": {
+    "@uniqlaw/testkit": "workspace:*"
+  }
+}

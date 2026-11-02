@@ -1,0 +1,29 @@
+{
+  "name": "@uniqlaw/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@uniqlaw/core": "workspace:*",
+    "@uniqlaw/platform-telegram": "workspace:*",
+    "@uniqlaw/provider-claude-tmux": "workspace:*",
+    "@uniqlaw/scheduler": "workspace:*",
+    "@uniqlaw/provider-claude-sdk": "workspace:*",
+    "@uniqlaw/transport-a2a": "workspace:*",
+    "@uniqlaw/provider-pi": "workspace:*",
+    "@uniqlaw/provider-codex": "workspace:*",
+    "@uniqlaw/platform-discord": "workspace:*",
+    "@uniqlaw/platform-slack": "workspace:*",
+    "@uniqlaw/platform-line": "workspace:*",
+    "@uniqlaw/provider-agy": "workspace:*",
+    "@uniqlaw/provider-opencode": "workspace:*",
+    "@uniqlaw/provider-acp": "workspace:*"
+  },
+  "devDependencies": {
+    "zod": "^3.25.0",
+    "@modelcontextprotocol/sdk": "^1.32.0"
+  }
+}

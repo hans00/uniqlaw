@@ -1,0 +1,91 @@
+// One plugin shell for every kind (docs §3).
+import type { z } from "zod";
+import type { AgentProvider } from "./provider.ts";
+import type { PlatformAdapter } from "./platform.ts";
+
+export interface Logger {
+  debug(msg: string, extra?: Record<string, unknown>): void;
+  info(msg: string, extra?: Record<string, unknown>): void;
+  warn(msg: string, extra?: Record<string, unknown>): void;
+  error(msg: string, extra?: Record<string, unknown>): void;
+  child(scope: string): Logger;
+}
+
+export interface PluginContext {
+  log: Logger;
+  instanceId: string;
+  /** Project root (where `.uniqlaw/` lives). */
+  projectDir: string;
+  /** `.uniqlaw/` directory. */
+  stateDir: string;
+  timezone: string;
+}
+
+/** What a scheduler plugin may do (docs §3). */
+export interface SchedulerApi {
+  /** Run a prompt in a channel's session as a scheduled turn. */
+  fire(o: { channelKey: string; job: string; text: string; sourceLine: string; deliverTo?: string; raw?: boolean }): Promise<void>;
+  isBusy(channelKey: string): boolean;
+  /** Durable per-plugin key/value (e.g. lastFiredAt for catch-up). */
+  kvGet(key: string): string | undefined;
+  kvSet(key: string, value: string): void;
+}
+
+/** A tool a plugin contributes to the MCP Gateway. `caller` is the calling session (from its token). */
+export interface GatewayTool {
+  name: string;
+  description: string;
+  /** zod raw shape of the arguments. */
+  inputSchema: Record<string, z.ZodTypeAny>;
+  handler(args: Record<string, unknown>, caller: string): Promise<unknown>;
+}
+
+export interface Scheduler {
+  start(api: SchedulerApi): void | Promise<void>;
+  stop(): void | Promise<void>;
+  /** Optional MCP tools for agents (e.g. cron job management). */
+  tools?(): GatewayTool[];
+}
+
+/** An agent reachable through a transport (e.g. a remote A2A agent). Appears in agents_list. */
+export interface RemoteAgent {
+  /** Unique name, conventionally "<transport>:<name>", e.g. "a2a:research". */
+  name: string;
+  description?: string;
+  ask(o: { from: string; message: string; hop: number; signal?: AbortSignal }): Promise<{ ok: boolean; text: string }>;
+}
+
+export interface TransportApi {
+  /** Run an inbound request from a remote agent against a local profile. Resolves with the answer. */
+  runInbound(o: { profile: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }>;
+  /** Profiles that may be exposed (name + provider). */
+  profiles(): { name: string; provider: string }[];
+  maxHops: number;
+}
+
+export interface Transport {
+  start(api: TransportApi): void | Promise<void>;
+  stop(): void | Promise<void>;
+  remoteAgents?(): RemoteAgent[];
+  /** Actual listening ports after start() (published in runtime.json), e.g. { a2a: 41234, "a2a-grpc": 41235 }. */
+  ports?(): Record<string, number>;
+}
+
+export interface PluginInstanceMap {
+  provider: AgentProvider;
+  platform: PlatformAdapter;
+  scheduler: Scheduler;
+  transport: Transport;
+}
+export type PluginKind = keyof PluginInstanceMap;
+
+export interface PluginDef<K extends PluginKind = PluginKind, S extends z.ZodTypeAny = z.ZodTypeAny> {
+  kind: K;
+  name: string;
+  configSchema: S;
+  create(ctx: PluginContext, cfg: z.infer<S>): Promise<PluginInstanceMap[K]> | PluginInstanceMap[K];
+}
+
+export function definePlugin<K extends PluginKind, S extends z.ZodTypeAny>(def: PluginDef<K, S>): PluginDef<K, S> {
+  return def;
+}

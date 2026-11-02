@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UniQlaw</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>UniQlaw</h1>
+  <span id="version" class="muted"></span>
+  <nav>
+    <button data-tab="sessions" class="active">Sessions</button>
+    <button data-tab="jobs">Jobs</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
+  <span id="live" class="pill off" title="live event stream">offline</span>
+</header>
+<main>
+  <section id="tab-sessions" class="tab active">
+    <aside>
+      <table id="agents"><thead><tr><th>Session</th><th>Profile</th><th>State</th></tr></thead><tbody></tbody></table>
+      <p id="no-agents" class="muted" hidden>No sessions yet.</p>
+    </aside>
+    <article>
+      <div id="detail-head" hidden>
+        <h2 id="detail-title"></h2>
+        <div id="detail-meta" class="muted"></div>
+        <div class="actions">
+          <button id="btn-stop">Stop turn</button>
+          <button id="btn-reset" class="danger">New session</button>
+        </div>
+      </div>
+      <ol id="transcript"></ol>
+      <p id="pick" class="muted">Select a session.</p>
+    </article>
+  </section>
+  <section id="tab-jobs" class="tab">
+    <table id="jobs"><thead><tr><th>Job</th><th>Schedule</th><th>Target</th><th>Reply to</th><th>Next run</th><th>Prompt</th></tr></thead><tbody></tbody></table>
+    <p id="no-jobs" class="muted" hidden>No scheduled jobs.</p>
+  </section>
+  <section id="tab-logs" class="tab">
+    <div class="actions"><button id="btn-logs">Refresh</button></div>
+    <pre id="logs"></pre>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
