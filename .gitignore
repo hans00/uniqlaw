@@ -1,0 +1,7 @@
+node_modules/
+spikes/**/out/
+.uniqlaw/
+*.log
+spikes/*/work/
+packages/*/.work/
+spikes/codex/schema/

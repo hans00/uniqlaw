@@ -1,0 +1,2 @@
+{ "name": "@uniqlaw-spike/acp", "private": true, "type": "module",
+  "dependencies": { "@agentclientprotocol/sdk": "2.2.0" } }
