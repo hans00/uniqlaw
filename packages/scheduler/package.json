@@ -1,0 +1,8 @@
+{
+  "name": "@uniqlaw/scheduler",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./cron": "./src/cron-plugin.ts", "./heartbeat": "./src/heartbeat-plugin.ts" },
+  "dependencies": { "@uniqlaw/core": "workspace:*", "zod": "^3.25.0" }
+}

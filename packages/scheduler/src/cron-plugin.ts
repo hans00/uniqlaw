@@ -1,0 +1,109 @@
+// Cron scheduler plugin: fires `.uniqlaw/jobs/*.md` (re-read every tick, so the agent can
+// add/edit jobs by writing files). Optional catch-up for occurrences missed while down.
+import { resolve } from "node:path";
+import { unlinkSync } from "node:fs";
+import { z } from "zod";
+import { definePlugin, type GatewayTool, type Logger, type Scheduler, type SchedulerApi } from "@uniqlaw/core";
+import { cronMatches, occurrencesBetween } from "./cron.ts";
+import { deleteJob, loadJobs, saveJob, type Job } from "./jobs.ts";
+import { isValidCron, nextMatch } from "./cron.ts";
+
+export const cronConfigSchema = z.object({
+  /** Jobs directory (relative to the project). */
+  dir: z.string().default(".uniqlaw/jobs"),
+  /** Fire ONE catch-up run for jobs whose last occurrence was missed within this window (0 = off). */
+  catchUpHours: z.number().nonnegative().default(0),
+});
+
+export class CronScheduler implements Scheduler {
+  private timer?: ReturnType<typeof setTimeout>;
+  private api?: SchedulerApi;
+  private warned = new Set<string>();
+  constructor(private dir: string, private cfg: z.infer<typeof cronConfigSchema>, private tz: string, private log: Logger, private now: () => Date = () => new Date()) {}
+
+  start(api: SchedulerApi) {
+    this.api = api;
+    if (this.cfg.catchUpHours > 0) void this.catchUp();
+    const n = this.now();
+    const ms = (60 - n.getSeconds()) * 1000 - n.getMilliseconds();
+    this.timer = setTimeout(() => this.loop(), ms);
+    this.log.info("cron started", { dir: this.dir, firstTickInSec: Math.round(ms / 1000) });
+  }
+  stop() { clearTimeout(this.timer); }
+
+  private loop() {
+    void this.tick();
+    const n = this.now();
+    this.timer = setTimeout(() => this.loop(), (60 - n.getSeconds()) * 1000 - n.getMilliseconds() || 60_000);
+  }
+
+  jobs(): Job[] {
+    return loadJobs(this.dir, (f, err) => { if (!this.warned.has(f + err)) { this.warned.add(f + err); this.log.warn("bad job file", { file: f, err }); } });
+  }
+
+  /** MCP tools so agents manage jobs with validation instead of hand-writing files. */
+  tools(): GatewayTool[] {
+    return [
+      { name: "cron_list", description: "List scheduled jobs (name, schedule, target, replyTo, next run).", inputSchema: {},
+        handler: async () => this.jobs().map((j) => ({ name: j.name, schedule: j.schedule, recurring: j.recurring, target: j.target,
+          replyTo: j.replyTo, timezone: j.timezone ?? this.tz, next: nextMatch(j.schedule, this.now(), j.timezone ?? this.tz)?.toISOString(), prompt: j.body })) },
+      { name: "cron_save",
+        description: "Create or replace a scheduled job. schedule = 5-field cron. target = session that runs it (default: you). replyTo = chat target for its output, e.g. \"telegram:<chatId>\" (default: background-notify policy).",
+        inputSchema: { name: z.string().regex(/^[a-zA-Z0-9._-]+$/), schedule: z.string(), prompt: z.string(), recurring: z.boolean().optional(),
+          target: z.string().optional(), replyTo: z.string().optional(), timezone: z.string().optional() },
+        handler: async (a, caller) => {
+          const schedule = String(a.schedule);
+          if (!isValidCron(schedule)) throw new Error(`invalid cron "${schedule}" (need 5 fields: minute hour day month weekday)`);
+          const tz = (a.timezone as string | undefined) ?? undefined;
+          saveJob(this.dir, String(a.name), { schedule, recurring: a.recurring !== false, target: (a.target as string | undefined) ?? caller,
+            replyTo: a.replyTo as string | undefined, timezone: tz, body: String(a.prompt) });
+          return { saved: a.name, next: nextMatch(schedule, this.now(), tz ?? this.tz)?.toISOString() };
+        } },
+      { name: "cron_delete", description: "Delete a scheduled job by name.", inputSchema: { name: z.string() },
+        handler: async (a) => ({ deleted: deleteJob(this.dir, String(a.name)) }) },
+    ];
+  }
+
+  async tick(at = this.now()): Promise<string[]> {
+    const fired: string[] = [];
+    const minute = Math.floor(at.getTime() / 60_000);
+    for (const job of this.jobs()) {
+      if (!cronMatches(job.schedule, at, job.timezone ?? this.tz)) continue;
+      if (Number(this.api!.kvGet(`cron:${job.name}:minute`)) === minute) continue; // already fired this minute
+      this.api!.kvSet(`cron:${job.name}:minute`, String(minute));
+      await this.fire(job, false);
+      fired.push(job.name);
+    }
+    return fired;
+  }
+
+  async catchUp(at = this.now()): Promise<string[]> {
+    const fired: string[] = [];
+    const windowStart = new Date(at.getTime() - this.cfg.catchUpHours * 3600_000);
+    for (const job of this.jobs()) {
+      const last = Number(this.api!.kvGet(`cron:${job.name}:minute`) ?? 0) * 60_000;
+      const from = new Date(Math.max(last, windowStart.getTime()));
+      const missed = occurrencesBetween(job.schedule, from, new Date(at.getTime() - 60_000), job.timezone ?? this.tz);
+      if (!missed.length) continue;
+      this.api!.kvSet(`cron:${job.name}:minute`, String(Math.floor(missed.at(-1)!.getTime() / 60_000)));
+      await this.fire(job, true, missed.length);
+      fired.push(job.name);
+    }
+    return fired;
+  }
+
+  private async fire(job: Job, catchUp: boolean, missed = 0) {
+    this.log.info("firing job", { job: job.name, target: job.target, catchUp });
+    const tag = catchUp ? `catch-up · cron (missed ${missed}× while UniQlaw was down)` : "scheduled · cron";
+    try {
+      await this.api!.fire({ channelKey: job.target, job: job.name, text: job.body, deliverTo: job.replyTo,
+        sourceLine: `[${tag} · ${job.name} (${job.schedule})]` });
+    } catch (e) { this.log.error("job fire failed", { job: job.name, e: String(e) }); }
+    if (!job.recurring) { try { unlinkSync(job.filePath); this.log.info("one-shot job removed", { job: job.name }); } catch {} }
+  }
+}
+
+export default definePlugin({
+  kind: "scheduler", name: "cron", configSchema: cronConfigSchema,
+  create: (ctx, cfg) => new CronScheduler(resolve(ctx.projectDir, cfg.dir), cfg, ctx.timezone, ctx.log),
+});

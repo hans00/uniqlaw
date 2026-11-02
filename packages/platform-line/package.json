@@ -1,0 +1,16 @@
+{
+  "name": "@uniqlaw/platform-line",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@uniqlaw/core": "workspace:*",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@line/bot-sdk": "11.4.0",
+    "ajv": "8.20.0"
+  }
+}

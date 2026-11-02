@@ -1,0 +1,17 @@
+{
+  "name": "@uniqlaw/platform-discord",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@uniqlaw/core": "workspace:*",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "discord-api-types": "0.38.57",
+    "typescript-json-schema": "^0.68.0"
+  }
+}
