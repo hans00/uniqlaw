@@ -240,7 +240,9 @@ export async function buildSystemPrompt(projectDir: string, settings: Settings, 
 export { runForever } from "./run.ts";
 
 /** Foreground entry: `bun packages/daemon/src/index.ts <projectDir>`. */
+// No top-level await here: run.ts imports this module, and awaiting it during this module's own
+// evaluation is a circular-import deadlock (Bun >= 1.4 follows the spec and hangs).
 if (import.meta.main) {
-  const { runForever } = await import("./run.ts");
-  await runForever(process.argv[2] ?? process.cwd(), { logToStderr: true });
+  void import("./run.ts").then(({ runForever }) => runForever(process.argv[2] ?? process.cwd(), { logToStderr: true }))
+    .catch((e) => { console.error(e); process.exit(1); });
 }

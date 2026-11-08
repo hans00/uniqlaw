@@ -112,6 +112,8 @@ test("gRPC: tenant routes to the right profile; streaming; missing token rejecte
   expect(events.length).toBeGreaterThanOrEqual(3);
   expect(JSON.stringify(events)).toContain("answer[main]: stream main");
 
-  await expect(main.sendMessage(message("no token") as never)).rejects.toThrow();
+  // Not `expect(...).rejects`: with Bun 1.4.4 that matcher hangs on this rejection (cause not pinned down).
+  const noToken = await main.sendMessage(message("no token") as never).then(() => undefined, (e: unknown) => e);
+  expect(String(noToken)).toContain("unauthorized");
   expect(calls.filter((c) => c.text === "no token")).toHaveLength(0);
 });
