@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@uniqlaw/core": "workspace:*",
-    "zod": "^3.25.0"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@grammyjs/types": "5.0.0",

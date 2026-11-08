@@ -9,7 +9,7 @@ export const configSchema = z.object({
   width: z.number().int().positive().default(200),
   height: z.number().int().positive().default(50),
   takeOverLegacy: z.boolean().default(true),
-  timings: z.record(z.number()).optional(),
+  timings: z.record(z.string(), z.number()).optional(),
 }).passthrough();
 
 export default definePlugin({

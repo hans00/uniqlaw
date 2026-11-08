@@ -42,5 +42,10 @@
   },
   "bin": {
     "uniqlaw": "packages/cli/src/main.ts"
+  },
+  "overrides": {
+    "undici": "^8.12.4",
+    "glob": "^14.0.4",
+    "minimatch": "^11.0.1"
   }
 }

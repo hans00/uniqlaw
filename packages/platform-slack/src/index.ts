@@ -20,7 +20,7 @@ export const slackConfigSchema = z.object({
   /** Who may answer approvals / receives operator DMs. Default = allowedUserIds. */
   operatorUserIds: z.array(z.string()).optional(),
   defaultMode: mode.default("channel"),
-  channels: z.record(z.object({ mode: mode.optional() }).passthrough()).default({}),
+  channels: z.record(z.string(), z.object({ mode: mode.optional() }).passthrough()).prefault({}),
   webApiBase: z.string().url().default("https://slack.com/api"),
 }).passthrough();
 

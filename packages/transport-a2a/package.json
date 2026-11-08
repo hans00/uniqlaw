@@ -10,7 +10,7 @@
   "dependencies": {
     "@uniqlaw/core": "workspace:*",
     "@a2a-js/sdk": "1.3.0",
-    "zod": "^3.25.0",
+    "zod": "^4.6.6",
     "@grpc/grpc-js": "^1.14.0",
     "@bufbuild/protobuf": "^2.10.0"
   }

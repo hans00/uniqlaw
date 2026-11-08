@@ -11,7 +11,7 @@ export const agenticSchema = z.object({
     scoreMargin: z.number().default(2),
     stickyWindowMinutes: z.number().default(30),
     stickyWindowTurns: z.number().default(5),
-  }).default({}),
+  }).prefault({}),
 });
 export type AgenticConfig = z.infer<typeof agenticSchema>;
 type Mode = AgenticConfig["modes"][number];

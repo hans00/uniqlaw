@@ -5,6 +5,6 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts" },
-  "dependencies": { "@uniqlaw/core": "workspace:*", "@uniqlaw/credentials": "workspace:*", "zod": "^3.25.0" },
+  "dependencies": { "@uniqlaw/core": "workspace:*", "@uniqlaw/credentials": "workspace:*", "zod": "^4.6.6" },
   "devDependencies": { "@uniqlaw/testkit": "workspace:*" }
 }

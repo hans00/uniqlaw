@@ -6,7 +6,7 @@ export const configSchema = z.object({
   enabled: z.boolean().default(true),
   /** Path to a claude executable; default = the SDK's bundled binary. */
   claudePath: z.string().optional(),
-  extraArgs: z.record(z.string().nullable()).optional(),
+  extraArgs: z.record(z.string(), z.string().nullable()).optional(),
 }).passthrough();
 
 export class ClaudeSdkProvider implements AgentProvider {

@@ -84,7 +84,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
       const def = await loadPlugin(name, raw, projectDir);
       const { enabled: _e, module: _m, ...rest } = raw;
       const parsed = def.configSchema.safeParse(rest);
-      if (!parsed.success) throw new Error(`plugins.${name}: ${parsed.error.issues.map((i: { path: (string | number)[]; message: string }) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+      if (!parsed.success) throw new Error(`plugins.${name}: ${parsed.error.issues.map((i: { path: PropertyKey[]; message: string }) => `${i.path.map(String).join(".")}: ${i.message}`).join("; ")}`);
       if (def.kind === "platform") {
         const secret = await claimSecret(rest);
         if (secret) cleanups.push(claim(`${name} bot token`, `${name}:${secret}`, projectDir));

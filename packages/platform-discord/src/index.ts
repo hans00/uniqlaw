@@ -16,11 +16,11 @@ export const discordConfigSchema = z.object({
   /** Who may answer approvals / receives operator DMs. Default = allowedUserIds. */
   operatorUserIds: z.array(id).optional(),
   /** Guild channels the bot participates in (keyed by channel id). Unlisted guild channels are ignored. */
-  channels: z.record(z.object({
+  channels: z.record(z.string(), z.object({
     enabled: z.boolean().default(true),
     requireMention: z.boolean().default(false),
     ignoreOtherMentions: z.boolean().default(false),
-  }).passthrough()).default({}),
+  }).passthrough()).prefault({}),
   apiBase: z.string().url().default("https://discord.com/api/v10"),
   gatewayUrl: z.string().default("wss://gateway.discord.gg/?v=10&encoding=json"),
   cdnBase: z.string().url().default("https://media.discordapp.net"),

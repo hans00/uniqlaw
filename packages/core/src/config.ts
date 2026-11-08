@@ -29,7 +29,7 @@ export const permissionSchema = z.object({
   approval: z.object({
     mode: z.enum(["ask-operator", "auto-deny", "auto-allow"]).default("ask-operator"),
     timeoutSec: z.number().int().positive().default(300),
-  }).default({}),
+  }).prefault({}),
   dirScope: z.array(z.string()).optional(),
 });
 
@@ -37,56 +37,56 @@ export const profileSchema = z.object({
   provider: z.string(),
   model: z.string().optional(),
   credential: z.string().optional(),
-  permissions: permissionSchema.default({}),
+  permissions: permissionSchema.prefault({}),
   /** Prompt fragment files (relative to project dir), appended in order. */
   prompts: z.array(z.string()).optional(),
   /** Provider-specific options. */
-  options: z.record(z.unknown()).default({}),
+  options: z.record(z.string(), z.unknown()).prefault({}),
 });
 
 export const settingsSchema = z.object({
   instance: z.object({
     id: z.string().regex(/^[a-z0-9-]{1,32}$/).optional(),
     name: z.string().optional(),
-  }).default({}),
+  }).prefault({}),
   timezone: z.string().default("UTC"),
-  credentials: z.record(credentialSchema).default({}),
-  profiles: z.record(profileSchema).default({ main: { provider: "claude-tmux" } as never }),
+  credentials: z.record(z.string(), credentialSchema).prefault({}),
+  profiles: z.record(z.string(), profileSchema).prefault({ main: { provider: "claude-tmux" } as never }),
   bindings: z.object({
     default: z.string().default("main"),
     /** channelKey → profile name */
-    channels: z.record(z.string()).default({}),
-  }).default({}),
+    channels: z.record(z.string(), z.string()).prefault({}),
+  }).prefault({}),
   prompts: z.object({
     /** Default prompt fragments for all profiles (relative paths). */
     files: z.array(z.string()).default(["prompts/IDENTITY.md", "prompts/USER.md", "prompts/SOUL.md"]),
-  }).default({}),
+  }).prefault({}),
   queue: z.object({
     mode: z.enum(["queue", "steer", "interrupt"]).default("queue"),
     debounceMs: z.number().int().nonnegative().default(1500),
     cap: z.number().int().positive().default(20),
     dropPolicy: z.enum(["old", "new", "summarize"]).default("summarize"),
-  }).default({}),
+  }).prefault({}),
   sessionCleanup: z.object({
     idleTimeoutHours: z.number().nonnegative().default(168),
     checkIntervalMinutes: z.number().positive().default(30),
-  }).default({}),
-  backgroundNotify: z.object({ mode: z.enum(["last", "all", "off"]).default("last") }).default({}),
+  }).prefault({}),
+  backgroundNotify: z.object({ mode: z.enum(["last", "all", "off"]).default("last") }).prefault({}),
   output: z.object({
     toolStatus: z.boolean().default(true),
     thinking: z.boolean().default(false),
     /** Edit-in-place streaming for platforms that support edits. */
     stream: z.enum(["replace", "keep", "off"]).default("replace"),
-  }).default({}),
+  }).prefault({}),
   turn: z.object({
     /** Abandon a turn after this long with no provider events (0 = off). Paused while a
      *  permission/input request waits for a human. Raise it for long silent tools. */
     stallTimeoutSec: z.number().int().nonnegative().default(900),
-  }).default({}),
+  }).prefault({}),
   bus: z.object({
     maxHops: z.number().int().positive().default(4),
     askTimeoutSec: z.number().int().positive().default(600),
-  }).default({}),
+  }).prefault({}),
   /** Worker sessions: other coding agents a session can start in a chosen directory (worker_start). */
   workers: z.object({
     /** Directories a worker may run in (it may also use any subdirectory). `~` is expanded.
@@ -95,17 +95,17 @@ export const settingsSchema = z.object({
     /** Profiles a worker may use. Empty = any profile. */
     profiles: z.array(z.string()).default([]),
     max: z.number().int().positive().default(8),
-  }).default({}),
-  mcpGateway: z.object({ host: z.string().default("127.0.0.1"), port: z.number().int().nonnegative().default(0) }).default({}),
+  }).prefault({}),
+  mcpGateway: z.object({ host: z.string().default("127.0.0.1"), port: z.number().int().nonnegative().default(0) }).prefault({}),
   web: z.object({
     enabled: z.boolean().default(true),
     host: z.string().default("127.0.0.1"),
     port: z.number().int().nonnegative().default(0),
     /** Required (Bearer header or `uq_token` cookie) when host is not loopback. */
     token: secretRef.optional(),
-  }).default({}),
+  }).prefault({}),
   /** plugin name → plugin config (must include `enabled`). */
-  plugins: z.record(z.object({ enabled: z.boolean().default(true) }).passthrough()).default({}),
+  plugins: z.record(z.string(), z.object({ enabled: z.boolean().default(true) }).passthrough()).prefault({}),
 });
 
 export type Settings = z.infer<typeof settingsSchema>;

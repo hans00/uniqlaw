@@ -5,7 +5,7 @@ import { AcpProvider } from "./provider.ts";
 export const configSchema = z.object({
   enabled: z.boolean().default(true),
   command: z.array(z.string()).min(1).default(["opencode", "acp"]),
-  env: z.record(z.string()).default({}),
+  env: z.record(z.string(), z.string()).prefault({}),
   preset: z.enum(["auto", "opencode", "generic"]).default("auto"),
   /** Share one agent process across sessions. Only for agents that pass the S6b isolation contract test. */
   shareProcess: z.boolean().default(false),

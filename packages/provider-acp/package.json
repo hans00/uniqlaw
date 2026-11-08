@@ -10,7 +10,7 @@
     "@uniqlaw/core": "workspace:*",
     "@uniqlaw/credentials": "workspace:*",
     "@uniqlaw/provider-opencode": "workspace:*",
-    "zod": "^3.25.0"
+    "zod": "^4.6.6"
   },
   "devDependencies": { "@uniqlaw/testkit": "workspace:*" }
 }

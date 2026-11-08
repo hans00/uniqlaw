@@ -26,16 +26,16 @@ export const a2aConfigSchema = z.object({
   /** Externally reachable base URL (behind a proxy); default http://host:port. */
   publicUrl: z.string().url().optional(),
   /** Profiles exposed as A2A agents (only these get an Agent Card). */
-  expose: z.record(z.object({ description: z.string().default(""), name: z.string().optional(), skills: z.array(skill).default([]) })).default({}),
+  expose: z.record(z.string(), z.object({ description: z.string().default(""), name: z.string().optional(), skills: z.array(skill).default([]) })).prefault({}),
   auth: z.object({
     /** Accepted bearer tokens; the caller is identified as `token#<index>` (or the entry's name). */
     bearerTokens: z.array(z.union([secretRef, z.object({ name: z.string(), token: secretRef })])).default([]),
-  }).default({}),
-  remotes: z.record(z.object({
+  }).prefault({}),
+  remotes: z.record(z.string(), z.object({
     url: z.string().url(), bearer: secretRef.optional(), description: z.string().optional(),
     /** Transport preference when the remote card offers several (default: the card's own order). */
     preferredTransports: z.array(z.enum(["JSONRPC", "HTTP+JSON", "GRPC"])).optional(),
-  })).default({}),
+  })).prefault({}),
   /** Bindings served for exposed profiles, in card preference order. */
   transports: z.array(z.enum(["JSONRPC", "HTTP+JSON", "GRPC"])).min(1).default(["JSONRPC"]),
   /** gRPC port when "GRPC" is enabled (0 = auto). */
