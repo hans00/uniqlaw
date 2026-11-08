@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { silentLogger, type SchedulerApi } from "@uniqlaw/core";
-import { CronScheduler, HeartbeatScheduler, cronMatches, inExcludeWindow, isValidCron, loadJobs, occurrencesBetween, parseJob, saveJob } from "../src/index.ts";
+import { CronScheduler, HeartbeatScheduler, cronMatches, heartbeatConfigSchema, inExcludeWindow, isValidCron, loadJobs, occurrencesBetween, parseJob, saveJob } from "../src/index.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -43,7 +43,7 @@ describe("cron expressions", () => {
 describe("job files (v2 format)", () => {
   test("parse with comments, quotes and defaults", () => {
     const j = parseJob("/x/daily.md", '---\nschedule: "0 9 * * *"   # every day\nrecurring: false\nreplyTo: telegram:123\n---\nDo the thing.\n');
-    expect(j).toMatchObject({ name: "daily", schedule: "0 9 * * *", recurring: false, target: "global", replyTo: "telegram:123", body: "Do the thing." });
+    expect(j).toMatchObject({ name: "daily", schedule: "0 9 * * *", recurring: false, target: "cron:daily", replyTo: "telegram:123", body: "Do the thing." });
   });
   test("save → load round trip; bad files reported", () => {
     const d = tmp();
@@ -53,6 +53,25 @@ describe("job files (v2 format)", () => {
     expect(loadJobs(d, (f) => errs.push(f)).map((j) => [j.name, j.target, j.timezone])).toEqual([["a", "discord:1", "+08:00"]]);
     expect(errs).toEqual(["bad.md"]);
     expect(() => saveJob(d, "../evil", { schedule: "* * * * *", recurring: true, target: "global", body: "" })).toThrow();
+  });
+});
+
+describe("job sessions, profile and model", () => {
+  test("default target is the job's own session; profile/model round-trip; cron_save target \"own\"", async () => {
+    const d = tmp();
+    saveJob(d, "digest", { schedule: "0 8 * * *", recurring: true, target: "cron:digest", replyTo: "none", profile: "cheap", model: "small", body: "go" });
+    const text = (await Bun.file(join(d, "digest.md")).text());
+    expect(text).not.toContain("target:");
+    expect(loadJobs(d)[0]).toMatchObject({ target: "cron:digest", replyTo: "none", profile: "cheap", model: "small" });
+    const s = new CronScheduler(d, { dir: d, catchUpHours: 0 }, "UTC", silentLogger);
+    const save = s.tools().find((t) => t.name === "cron_save")!;
+    await save.handler({ name: "mine", schedule: "* * * * *", prompt: "a" }, "telegram:100");
+    await save.handler({ name: "solo", schedule: "* * * * *", prompt: "b", target: "own", model: "small" }, "telegram:100");
+    const { api, fired } = fakeApi();
+    (s as unknown as { api: SchedulerApi }).api = api;
+    await s.tick(new Date("2026-11-02T08:00:00Z"));
+    expect(Object.fromEntries(fired.map((f) => [f.job, [f.channelKey, f.profile, f.model, f.deliverTo]]))).toEqual({
+      digest: ["cron:digest", "cheap", "small", "none"], mine: ["telegram:100", undefined, undefined, undefined], solo: ["cron:solo", undefined, "small", undefined] });
   });
 });
 
@@ -99,6 +118,16 @@ describe("HeartbeatScheduler", () => {
     expect(await h.tick(new Date("2026-11-02T16:00:00Z"))).toBe(false);   // 00:00 local: quiet hours
     expect(await h.tick(new Date("2026-11-02T23:01:00Z"))).toBe(true);    // 07:01 local
     expect(fired[0]).toMatchObject({ channelKey: "global", raw: true, text: "TEMPLATE\n\nUser custom heartbeat prompt:\nalso check mail" });
+  });
+  test("defaults to its own session; passes profile/model/replyTo through", async () => {
+    const c = heartbeatConfigSchema.parse({ profile: "cheap", model: "small", replyTo: "none" });
+    expect(c.target).toBe("heartbeat");
+    const h = new HeartbeatScheduler(c, tmp(), "UTC", silentLogger);
+    const { api, fired, kv } = fakeApi();
+    (h as unknown as { api: SchedulerApi }).api = api;
+    kv.set("heartbeat:lastFiredAt", "0");
+    expect(await h.tick(new Date())).toBe(true);
+    expect(fired[0]).toMatchObject({ channelKey: "heartbeat", profile: "cheap", model: "small", deliverTo: "none" });
   });
   test("busy channel defers", async () => {
     const h = new HeartbeatScheduler(cfg(), tmp(), "UTC", silentLogger);

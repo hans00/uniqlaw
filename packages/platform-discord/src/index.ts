@@ -6,7 +6,7 @@ import { DiscordAdapter } from "./adapter.ts";
 const secretRef = z.union([z.object({ env: z.string() }), z.object({ file: z.string() }), z.object({ command: z.string() })]);
 const id = z.union([z.string(), z.number()]).transform(String);
 
-/** Accepts the v2 `discord` block that packages/migrate-v2 copies verbatim (incl. messageStream). */
+/** Accepts the v2 `discord` block as copied over by docs/MIGRATE.md (incl. messageStream). */
 export const discordConfigSchema = z.object({
   enabled: z.boolean().default(true),
   token: z.union([z.string().min(1), secretRef]),
@@ -49,4 +49,4 @@ export default definePlugin({
   },
 });
 
-export { DiscordAdapter, GLOBAL_KEY } from "./adapter.ts";
+export { DiscordAdapter } from "./adapter.ts";

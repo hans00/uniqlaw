@@ -2,10 +2,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  BRAND_PROMPT, ChannelManager, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt,
+  BRAND_PROMPT, ChannelManager, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
   createLogger, dirScopePrompt, parseSettings, resolveSecret,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
-  type Profile, type Scheduler, type SecretRef, type Settings, type SystemPromptParts, type Transport,
+  type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transport,
 } from "@uniqlaw/core";
 import { acquireLock, claim, deriveInstanceId, registerInstance, stateDirOf, writeRuntime } from "./instance.ts";
 import { startApi } from "./api.ts";
@@ -36,7 +36,7 @@ const DEFAULT_ON = ["cron"];
 
 export function loadSettings(projectDir: string): Settings {
   const p = join(stateDirOf(projectDir), "settings.json");
-  if (!existsSync(p)) throw new Error(`no settings at ${p} — run \`uniqlaw init\` or \`uniqlaw migrate\``);
+  if (!existsSync(p)) throw new Error(`no settings at ${p} — run \`uniqlaw init\` (ClaudeClaw v2: follow docs/MIGRATE.md)`);
   return parseSettings(JSON.parse(readFileSync(p, "utf8")));
 }
 
@@ -122,7 +122,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     manager = new ChannelManager({
       log, settings, store, transcript, projectDir, instanceId, providers, platforms, profiles,
       gatewayFor: (key) => gateway.endpointFor(key),
-      systemPrompt: (profile, multiparty, toolNames) => buildSystemPrompt(projectDir, settings, profile, multiparty, toolNames),
+      systemPrompt: (profile, multiparty, toolNames, session) => buildSystemPrompt(projectDir, settings, profile, multiparty, toolNames, session),
       providerEnv: async () => {
         const env: Record<string, string> = {};
         for (const k of BASE_ENV_KEYS) if (process.env[k]) env[k] = process.env[k]!;
@@ -211,19 +211,29 @@ async function claimSecret(cfg: Record<string, unknown>): Promise<string | undef
   return undefined;
 }
 
-export async function buildSystemPrompt(projectDir: string, settings: Settings, profile: Profile, multiparty: boolean, toolNames: string[]): Promise<SystemPromptParts> {
+export async function buildSystemPrompt(projectDir: string, settings: Settings, profile: Profile, multiparty: boolean, toolNames: string[],
+  session?: SessionContext): Promise<SystemPromptParts> {
   const fragments: { id: string; text: string }[] = [{ id: "brand", text: BRAND_PROMPT }];
-  const files = (profile.options.prompts as string[] | undefined) ?? settings.prompts.files;
+  // Workers get the profile's own prompt files only: the assistant persona (IDENTITY/USER/SOUL) is for chats.
+  const files = (profile.options.prompts as string[] | undefined) ?? (session?.worker ? [] : settings.prompts.files);
   for (const f of files) {
     const p = resolve(projectDir, f);
     if (!existsSync(p)) continue;
     const text = readFileSync(p, "utf8").trim();
     if (text) fragments.push({ id: `file:${f}`, text });
   }
-  if (profile.permissions.level !== "unrestricted") fragments.push({ id: "dir-scope", text: dirScopePrompt(projectDir) });
+  if (profile.permissions.level !== "unrestricted") fragments.push({ id: "dir-scope", text: dirScopePrompt(session?.cwd ?? projectDir) });
   if (multiparty) fragments.push({ id: "silent", text: SILENT_REPLY_PROMPT });
   fragments.push({ id: "reactions", text: REACTION_PROMPT });
   if (toolNames.length) fragments.push({ id: "bus-tools", text: busToolsPrompt(toolNames) });
+  if (session?.internal) fragments.push({ id: "internal-session", text: internalSessionPrompt(session.channelKey) });
+  if (toolNames.includes("worker_start")) {
+    const roots = settings.workers.roots.length ? settings.workers.roots.map((r) => resolve(projectDir, expandHome(r))) : [projectDir];
+    const allowed = Object.entries(settings.profiles).filter(([n]) => !settings.workers.profiles.length || settings.workers.profiles.includes(n))
+      .map(([name, p]) => ({ name, provider: p.provider, ...(p.model ? { model: p.model } : {}) }));
+    fragments.push({ id: "workers", text: workersPrompt(roots, allowed) });
+  }
+  if (session?.worker) fragments.push({ id: "worker-session", text: workerSessionPrompt(session.channelKey, session.cwd ?? projectDir, session.worker.owner) });
   return { fragments };
 }
 

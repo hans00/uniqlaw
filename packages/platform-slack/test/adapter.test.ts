@@ -33,14 +33,16 @@ beforeEach(async () => {
 afterEach(async () => { await adapter.stop(); fake.stop(); rmSync(dir, { recursive: true, force: true }); });
 
 describe("routing", () => {
-  test("auth + socket; IM → global; channel → slack:<ch>; envelopes acked; names looked up", async () => {
+  test("auth + socket; IM → slack:dm:<userId>; channel → slack:<ch>; envelopes acked; names looked up", async () => {
     expect(adapter.botUser).toBe("UBOT");
     const id = fake.event(ev(OWNER, "hello", { channel: "D9", channel_type: "im" }));
     fake.event(ev(FRIEND, `<@UBOT> look`));
     await waitFor(() => inbox.length === 2);
     expect(fake.acks).toContain(id);
-    expect(inbox[0]).toMatchObject({ channelKey: "global", multiparty: false, trusted: true, addressed: true, sender: { id: OWNER, name: `Real ${OWNER}`, username: `n${OWNER}` } });
+    expect(inbox[0]).toMatchObject({ channelKey: `slack:dm:${OWNER}`, multiparty: false, trusted: true, addressed: true, sender: { id: OWNER, name: `Real ${OWNER}`, username: `n${OWNER}` } });
     expect(inbox[1]).toMatchObject({ channelKey: "slack:C1", multiparty: true, addressed: true, text: "look" });
+    expect(adapter.channelKeyForTarget({ platform: "slack", chatId: "D9" })).toBe(`slack:dm:${OWNER}`);
+    expect(adapter.channelKeyForTarget(adapter.parseTarget(`slack:dm:${OWNER}`)!)).toBe(`slack:dm:${OWNER}`);
   });
 
   test("thread-per-message: top-level anchors on its ts, replies join; channel mode threads collapse", async () => {
@@ -54,7 +56,7 @@ describe("routing", () => {
     expect(inbox[2]).toMatchObject({ channelKey: "slack:C1", replyTarget: { threadId: "1700000050.000001" } });
     expect(adapter.channelKeyForTarget({ platform: "slack", chatId: "CT", threadId: "1700000100.000001" })).toBe("slack:CT:1700000100.000001");
     expect(adapter.channelKeyForTarget({ platform: "slack", chatId: "C1", threadId: "1.2" })).toBe("slack:C1");
-    expect(adapter.channelKeyForTarget({ platform: "slack", chatId: "D9" })).toBe("global");
+    expect(adapter.channelKeyForTarget({ platform: "slack", chatId: "D7" })).toBe("slack:D7"); // unknown DM channel: plain channel key
   });
 
   test("allowlists, own/edited messages, bots, file_share attachments", async () => {

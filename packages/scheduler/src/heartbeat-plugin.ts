@@ -1,5 +1,5 @@
-// Heartbeat: periodic ambient prompt into a channel (default "global"), skipped during
-// quiet hours and while the channel is busy. Port of v2 heartbeat.ts.
+// Heartbeat: periodic ambient prompt into a session (default: its own internal session
+// "heartbeat"), skipped during quiet hours and while that session is busy. Port of v2 heartbeat.ts.
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod";
@@ -16,9 +16,15 @@ export const heartbeatConfigSchema = z.object({
   prompt: z.string().default(""),
   /** Template file (relative to project); falls back to the built-in template. */
   templateFile: z.string().default("prompts/heartbeat/HEARTBEAT.md"),
-  target: z.string().default("global"),
-  /** Where output goes, e.g. "telegram:<chatId>"; default = backgroundNotify policy. */
+  /** Session that runs it: an internal name ("heartbeat") or a chat key ("telegram:<chatId>"). */
+  target: z.string().default("heartbeat"),
+  /** Where the final reply goes, e.g. "telegram:<chatId>"; "none" = nowhere (the agent uses
+   *  notify / agent_trigger itself); default = backgroundNotify policy. */
   replyTo: z.string().optional(),
+  /** Pin the heartbeat session to this profile (provider + model + permissions). */
+  profile: z.string().optional(),
+  /** Run heartbeat turns on this model (live model switch; use `profile` for spawn-only providers). */
+  model: z.string().optional(),
   excludeWindows: z.array(window).default([]),
 }).passthrough(); // tolerate migrated keys (v2Enabled)
 
@@ -60,7 +66,8 @@ export class HeartbeatScheduler implements Scheduler {
     if (inExcludeWindow(at, this.cfg.excludeWindows, this.tz)) return false; // fire right after quiet hours end
     if (api.isBusy(this.cfg.target)) return false;
     api.kvSet("heartbeat:lastFiredAt", String(at.getTime()));
-    await api.fire({ channelKey: this.cfg.target, job: "heartbeat", text: this.prompt(), raw: true, deliverTo: this.cfg.replyTo, sourceLine: "[heartbeat]" })
+    await api.fire({ channelKey: this.cfg.target, job: "heartbeat", text: this.prompt(), raw: true, deliverTo: this.cfg.replyTo, sourceLine: "[heartbeat]",
+      ...(this.cfg.profile ? { profile: this.cfg.profile } : {}), ...(this.cfg.model ? { model: this.cfg.model } : {}) })
       .catch((e) => this.log.error("heartbeat fire failed", { e: String(e) }));
     return true;
   }

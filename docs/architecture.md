@@ -103,7 +103,8 @@ settings 用 `plugins: { "<name>": { enabled, ...cfg } }` 啟用。
 | 概念 | 說明 |
 |---|---|
 | **Agent Profile** | 具名設定：provider + model + system prompt 組件 + 權限 + 工具集。例如 `main`（claude/opus）、`cheap`（pi/gemini-flash）、`coder`（codex）。 |
-| **Channel** | 平台上的一個對話端點（`telegram:<chatId>`、`discord:<channelId>`、`slack:<ch>:<ts>`），沿用 v2 的 key 規則，包括 DM 收斂到 `global`。 |
+| **Channel** | 平台上的一個對話端點（`telegram:<chatId>`、`discord:<channelId>`、`slack:<ch>:<ts>`）。**每個私訊也是自己的 channel**（`telegram:<userId>`、`discord:dm:<userId>`、`slack:dm:<userId>`、`line:<userId>`），不再像 v2 收斂到 `global`（§13 #10）。 |
+| **內部 session** | 沒有綁 chat 的 session，名稱不是任何平台能解析的 key：`heartbeat`、`cron:<job>`、`global`…。由排程或 bus 建立，沒有人直接在看；要對人說話就用 `notify` / `agent_trigger`（§8.5）。 |
 | **Binding** | channel → profile 的對應（可在 settings 依 channel 覆寫）。同一個 daemon 裡，不同 channel 可以跑不同 provider。 |
 | **Session** | 一個 profile 在一個 channel 上的長期對話，對應 provider 的 session/thread id。A2A `contextId` = session id。 |
 | **Turn** | 一次送進 agent 到 turn 結束。A2A `taskId` ≈ turn id。 |
@@ -285,7 +286,7 @@ slash commands。我們只要補：
 | v2 功能 | uniqlaw 歸屬 | 怎麼做到 provider 無關 |
 |---|---|---|
 | 多平台（TG/DC/Slack/LINE） | platform plugin | 不變，介面抽出來 |
-| DM 收斂 global、per-channel/thread session | core Router | 沿用 v2 key 規則 |
+| DM 收斂 global、per-channel/thread session | platform 給 key，core Router | 群組 / 頻道 / thread 沿用 v2 規則；**DM 改成每個人各自一個 session**（§13 #10） |
 | queue / native / interrupt 模式 | core Session Manager | 改為 queue / steer / interrupt（native 實為 steer），依 §6 polyfill；遷移時 `native` → `steer` |
 | Permission 核准（inline 按鈕） | core Approval Broker | 來源統一成 `permission_request` event，或 pi 的 `tool_call` hook；以前是 tmux pane 偵測，現在不需要 |
 | login / survey / model-switch dialog | claude-tmux adapter 內部 | 只存在 tmux adapter 內；對 core 統一為 `permission_request` 或 `error{auth}` → 通知 operator |
@@ -304,7 +305,7 @@ slash commands。我們只要補：
 | system prompt 組合（IDENTITY/USER/SOUL、dir scope、NO_REPLY rules） | core `SystemPromptParts` → adapter 決定怎麼注入（append flag / system message / AGENTS.md） | |
 | Web dashboard + HTTP API | `web` platform plugin + core API | |
 | statusline / state.json | core | |
-| v1→v2 migrate | `uniqlaw migrate`（見 §11.1） | v2 → uniqlaw 完整遷移 |
+| v1→v2 migrate | agent 照 `docs/MIGRATE.md` 做（見 §11.1） | v2 → uniqlaw 完整遷移 |
 
 ---
 
@@ -368,9 +369,39 @@ interface Envelope {
 | human | 該 channel（reply 到觸發訊息） | 該 channel 的可信 operator |
 | peer / ask | 回給發問者（作為 task result） | 發起鏈最源頭的 human channel，否則送 operator |
 | peer / trigger | 被觸發 session 自己的 channel | 同上 |
-| scheduler | `deliverTo` 或 job 設定 | operator |
+| scheduler | job / heartbeat 的 `replyTo`；`"none"` = 不送（agent 自己用工具送）；沒設就照 `backgroundNotify` | operator |
 | a2a | A2A task artifact | operator（task 維持 WORKING；被拒則 FAILED） |
 | 合併 turn（多個 origin） | 只要含 human，就送該 human channel；其餘 origin 收到 task result | — |
+
+### 8.5 內部 session、排程的 session / profile / model
+
+- **Session 種類**：`agents_list` 每筆都有 `kind`：`chat`（名稱就是 notify / trigger 的 target）、`internal`（沒有 chat）、`a2a`（服務遠端 A2A 呼叫）、`remote`（遠端 A2A agent）。內部 session 的 system prompt 會多一段說明：你沒有自己的 chat，要對人說話用 `notify` / `agent_trigger`，要問別的 session 用 `agent_ask`。
+- **bus 可以到達的對象**：已存在的 session（chat、內部、A2A），以及平台能解析的 chat key（第一次觸發時才建立）。**拼錯的內部名稱不會被建立**，避免 agent 打錯字就多開一個 session。
+- **排程跑在哪個 session**：heartbeat 預設跑在自己的內部 session `heartbeat`；cron job 檔沒寫 `target` 時跑在 `cron:<job>`；`cron_save` 預設是呼叫者自己，`target: "own"` 是 `cron:<name>`。也可以指定任何 chat key（例如在某個私訊裡跑，就有那段對話的 context）。
+- **profile**（heartbeat 的 `profile`、job frontmatter 的 `profile:`）：把那個 session 固定在某個 profile（provider + model + 權限），存在 `state.db` 的 kv（`session-profile:<key>`），重啟後也保留。session 閒置時換 profile 會重開；忙碌中就等它下次關閉。也可以直接在 `bindings.channels` 綁（`"heartbeat": "cheap"`），效果一樣。優先順序：A2A 指定 > 排程固定 > `bindings.channels` > `bindings.default`。
+- **model**（heartbeat 的 `model`、job 的 `model:`）：只對那一個排程 turn 生效。需要 provider 支援 live 換 model（`modelSwitch: "live"`）；下一個不帶 model 的 turn 開始前會換回原本的 model（profile 沒設 model、只用 provider 預設值時沒辦法換回，會寫 warning）。不支援 live 換 model 的 provider（agy、部分 ACP）請改用 `profile`。
+- **跨 session**：每個 session（含內部）都有自己的 MCP Gateway token，所以 heartbeat / cron 都可以 `agent_ask` 別的 session、`agent_trigger` 讓某個私訊 / 群組的 session 用自己的 context 跟它的人說話，或直接 `notify` 任何 chat target。
+
+### 8.6 Worker：指揮同一台機器上的其他 coding agent
+
+任何 session 都可以用 `worker_start` 在指定目錄開一個 coding agent（Claude Code、Codex、OpenCode…，就是某個 profile），把工作交給它。之後用一般的 `agent_ask` 跟它溝通。人類可以從聊天室或終端機接管它。
+
+- **身分**：worker 是 session key `worker:<name>`（`agents_list` 的 `kind: "worker"`，附 `cwd`、`owner`、`heldBy`）。建立時記錄在 kv：`worker-meta:<key>`、`session-cwd:<key>`、`session-profile:<key>`。**工作目錄建立後就固定**：claude-tmux 用 cwd 找 jsonl，codex 用 cwd 算 sandbox，resume 時 cwd 不能變。要換目錄就開新的 worker。
+- **工作目錄**：`SessionSpec.cwd` 本來就有，各 provider 也都照用，只是以前 core 一律傳專案目錄。現在改成 `host.cwdFor(key)`，沒設定時才用專案目錄。
+- **限制**（`settings.workers`）：`roots`（允許的目錄和其子目錄，比對 realpath，`..` 和 symlink 都先解析；空陣列 = 只能用專案目錄）、`profiles`（允許的 profile，空陣列 = 全部）、`max`（預設 8）。能呼叫 `worker_start` 的 session，系統提示會多一段 `workers`：列出允許的目錄和 profile，並說明「派到你自己範圍外的目錄是允許的，由 UniQlaw 負責檢查」。實測發現少了這段，主 agent 會因為自己的 dir-scope 提示拒絕派工。
+- **worker 的系統提示**：不載入 IDENTITY / USER / SOUL（那是聊天助理的人設），改加 `worker-session` 段落：你在哪個目錄、任務是誰派的、回覆會送回給它、結尾要報告改了什麼和怎麼驗證的。dir-scope 改成以 worker 的 cwd 為準。目標目錄本身的 CLAUDE.md / AGENTS.md 由 provider 照常載入。
+- **回報**：`worker_start` 帶 `task` 時走 `agent_ask` 的語意，預設 `wait:false`，worker 做完時結果會以新訊息的形式送回派工的 session。worker 的權限請求照 §8.4 送到這條委派鏈最上層的人。worker 的背景輸出（例如人類在終端機裡打字觸發的 turn）**不走** backgroundNotify：有聊天室 attach 時送到那個聊天室，沒有就只留在 transcript。
+- **人類接管**，有兩種：
+  - **聊天室**（所有 provider 都能用）：可信任的使用者在聊天室打 `/attach <worker>`，之後這個聊天室的訊息改送給 worker，回覆和權限請求也回到這裡；`/stop`、`/new`、`/model`、`/status` 都作用在 worker 上。`/detach` 結束接管。`/attach` 不帶參數會列出所有 worker。這個綁定存在 kv（`chat-attach:<chatKey>`），重啟後仍有效。
+  - **終端機**（`uniqlaw attach <worker>`，provider 要實作 `attachCommand`）：
+    - claude-tmux 是 **live** 接管：直接 `tmux -L uniqlaw-<instanceId> attach-session -t uq-…`，agent 繼續跑，daemon 也繼續監看。
+    - claude-sdk / codex 是 **handoff**：core 先關掉 session（保留 provider session id），CLI 在 worker 目錄執行 `claude --resume <id>` / `codex resume <id>`。人類離開那個 CLI 後交還 daemon，下一個任務會 resume 同一段對話，包含人類在 CLI 裡做的事。只支援預設登入或 `provider-login` 的 home（會帶 `CLAUDE_CONFIG_DIR` / `CODEX_HOME`）；API key 類的憑證不交出 secret，所以不支援。
+    - 其他 provider 沒有終端機接管，請用聊天室 attach。聊天 session 只能 live attach，handoff 只限 worker。
+    - 驗證狀態（2026-11-08，`packages/daemon/test/workers-e2e.test.ts`，真 Claude）：claude-tmux 的 live attach 目標確實是那個 worker 的 tmux session，而且 pane 在 worker 目錄。claude-sdk handoff 期間人類用 `claude --resume <id> -p …` 交代的事，daemon 接回後 worker 記得。**codex handoff 只用 fake 測過**：`thread/unsubscribe` 之後，同一個還活著的 app-server 再 `thread/resume`，能不能讀到別的程序寫進 rollout 的內容，還沒驗證。
+  - 接管狀態存在 kv（`hold:<key>`）。daemon 重啟時不會 restore 仍在 handoff 中的 session；排程、async 結果、無 task 的 `worker_start` 也都不會在接管期間重新打開它（async 結果會改放進 worker 的待讀訊息）。終端機被關掉、沒有正常交還時，用 `uniqlaw release <worker>` 解除。
+  - 接管期間 worker 處於 **held** 狀態：owner 再 `agent_ask` / `agent_trigger` 會收到「有人在操作，等他離開」的錯誤，不會把指令插進人類的對話。人類離開時，owner 會收到一則待讀通知：「有人操作過 worker，可能改了檔案或給了新指示」。
+- **停止**：`worker_stop(name)` 關掉 agent 程序，但保留對話，同名 `worker_start` 會接著做。`forget: true` 會刪掉紀錄和對話。worker 改過的檔案一律不動。
+- **CLI / API**：`uniqlaw workers`、`uniqlaw worker start|stop`、`uniqlaw attach`、`uniqlaw release`；`GET/POST /api/workers`、`POST /api/takeover`、`POST /api/release`。
 
 ---
 
@@ -501,26 +532,23 @@ agy 那幾格的環境變數名稱是從執行檔字串找到的，尚未實測�
 
 ---
 
-### 11.1 v2 → uniqlaw 遷移（`uniqlaw migrate`）
+### 11.1 v2 → uniqlaw 遷移（agent 照文件做）
 
-一次性、冪等、可重跑，原檔保留（沿用 v2 的 `*.v2-backup` 慣例，搬進 `.uniqlaw/migrated-from-v2/`）。
+**不做固定的遷移腳本。** 遷移是一次性的工作，每個 v2 安裝又都不太一樣：v1 留下的 key、手改過的檔案、空的 allowlist、時區格式。寫死的轉換器要嘛猜錯，要嘛要一直補例外。所以改成寫一份給 agent 看的作業指南 [`docs/MIGRATE.md`](MIGRATE.md)：有對應表、鐵則（先停 v2、v2 檔案只讀、不印 secret、遇到要使用者決定的事就停下來問），以及範例片段（用 `StateStore` 匯入 session）。agent 讀實際的檔案、先給使用者看計畫、確認後才寫入，最後跑 `uniqlaw doctor` 驗證。Claude Code plugin 的 `/uniqlaw:migrate` 就是「照這份文件做」。
 
-| v2 來源 | uniqlaw 目標 | 說明 |
-|---|---|---|
-| `.claude/claudeclaw/settings.json` | `.uniqlaw/settings.json` | 平台 token / allowlist → `plugins.<platform>`；`security` / `approval` → 預設 profile 的 `PermissionPolicy`；`model` / `agentic` → profile model + model router；`queue` / `heartbeat` / `backgroundNotify` / `sessionCleanup` / `timezone` 直接對應 |
-| （隱含） | profile `main`，provider = **`claude-tmux`** | 預設用 tmux adapter，行為和 v2 一致、零意外；之後可手動把 profile 改成 `claude-sdk`（若 §5.2 session 互通驗證通過，舊 session 可直接接續） |
-| `.claude/claudeclaw/sessions.json` | `state.db.sessions` | channelKey、sessionId（= `providerSessionId`）、multiparty、lastActivityAt；binding 全部指向 `main` |
-| `inbox/<key>.jsonl`（未消化） | `state.db` pending-input 佇列 | 保留未讀的跨 session 訊息 |
-| cron `.md` jobs | 原格式保留，由 scheduler-cron 讀取 | frontmatter 相容；`target` / `replyTo` 照 v2 key 規則解析；新增 `lastFiredAt` 從遷移時開始記錄 |
-| `prompts/`（IDENTITY / USER / SOUL / heartbeat） | 原位置或 `.uniqlaw/prompts/` | profile 的 `systemPrompt` 指向它們 |
-| `CLAUDE.md` | 不動 | 對 claude adapter 照常自動載入；其他 provider 由 core 視需要注入（或對應到 `AGENTS.md`） |
-| 執行中的 v2 tmux session（`claudeclaw-*`） | 由 claude-tmux adapter 接管或重開 | 先停 v2 daemon；adapter 啟動時若發現同名 tmux session 就 attach，否則 `--resume` |
+程式裡留下的相容部分（給遷移過來的資料用，不是遷移工具）：
 
-流程：`uniqlaw migrate --from <v2 project dir> [--dry-run]`
-→ 偵測 v2 daemon 是否在跑（有就要求先停）→ 印出對應計畫 → 寫入 → 驗證（每個 session 的 jsonl
-存在、平台 token 能連線）→ 輸出報告。`--dry-run` 只印計畫。
+| 位置 | 相容什麼 |
+|---|---|
+| `provider-claude-tmux` `legacy.ts` | 第一次 `--resume` 前，關掉 default tmux socket 上還在跑同一個 session 的 v2 `claudeclaw-*` session |
+| core runtime | `pending_input` 裡 `source: "v2-inbox"` 的資料，用 v2 的 inbox 格式放進 prompt |
+| scheduler | v2 的 cron `.md` 格式、`UTC±H` 時區 |
+| platform-discord / slack / line | 接受 v2 的設定欄位名稱（含 `messageStream`） |
+| platform-telegram | token 接受字串（v2 相容），建議改成 SecretRef |
+| model router | 直接讀 v2 的 `agentic` 區塊（`profiles.<p>.options.agentic`） |
+| `uniqlaw doctor` / `init` | 偵測 v2 是否在跑、是否用同一個 bot token；有 v2 設定時提示改用遷移 |
 
-v1 → uniqlaw：不直接支援，先用 v2 的 `/claudeclaw2:migrate` 升到 v2 再遷移（避免維護兩套轉換）。
+v1 → uniqlaw：不直接支援，先用 v2 的 `/claudeclaw2:migrate` 升到 v2。
 
 ### 11.2 同一台機器跑多個 claw（多實例隔離）
 
@@ -557,9 +585,8 @@ packages/
   platform-telegram/  platform-discord/  platform-slack/  platform-line/  platform-web/
   scheduler-cron/     scheduler-heartbeat/
   transport-a2a/
-  cli/                uniqlaw start|stop|status|ls|send|trigger|migrate|mcp-shim
+  cli/                uniqlaw init|doctor|start|stop|reload|status|ls|send|trigger|mcp-shim
   credentials/        Credential 解析、SecretRef（env / file / command）、轉成各 provider 的 env
-  migrate-v2/         v2 設定 / 狀態轉換（給 cli 用，含 fixture 測試）
   testkit/            provider-mock、platform-mock、capability 合約測試
 ```
 
@@ -576,13 +603,14 @@ interrupt、steer、permission、resume、跨 session MCP 隔離、原生跨 ses
 | 2 | Runtime | **Bun**。A2A 三種 transport（含 gRPC）都已在 Bun 1.3.4 實測可用 |
 | 3 | 不同 channel 綁不同 provider | **可以**（§4 Binding） |
 | 4 | A2A 公開粒度 | **以 Agent Profile 為單位**（§9） |
-| 5 | v2 遷移 | **要做**：`uniqlaw migrate`（§11.1） |
-
+| 5 | v2 遷移 | **要做**：一開始寫成 `uniqlaw migrate` 腳本，後來改成給 agent 照著做的文件 `docs/MIGRATE.md`（§11.1） |
 | 6 | 認證政策 | **只做相容與支援**：provider 能用的方式（訂閱登入、API key、雲端憑證）全支援，使用由使用者自行負責（目標 8、§10.1） |
 | 7 | 雲端 LLM | **三大雲（Bedrock / Vertex / Azure）+ 直連 API 全支援**，API key、ADC、AWS chain、Entra ID 都要能設定（§10.1）；**同一台機器可跑多個 claw**（§11.2） |
 | 8 | Google 的 coding agent | **Antigravity CLI（agy）**，Gemini CLI 不列入支援目標；Gemini 模型的 API 路線走 pi（Gemini API / Vertex） |
-
 | 9 | provider 的使用者層級設定 | **沿用 v2 的「繼承 + 覆蓋」**：每個 provider 照常讀自己的全域設定與 hooks（`~/.claude`、`~/.codex`、`~/.config/opencode`、`~/.pi/agent`、agy 的 HOME），讓 claude-mem 這類記憶層可以運作；UniQlaw 的強制規則用 agent 專案目錄的設定與 CLI 參數覆蓋（見 §10.2） |
+| 10 | 私訊的 session | **每個私訊各自一個 session**（2026-11-08 變更，參考 OpenClaw 的做法）。v2 把所有私訊收斂到 `global`：不同使用者、不同平台共用同一段對話 context，多人使用時會互相看到彼此交代的事。現在 DM key 是 `telegram:<userId>`、`discord:dm:<userId>`、`slack:dm:<userId>`、`line:<userId>`，`parseTarget` ↔ `channelKeyForTarget` 可以互相還原。`global` 變成普通的內部 session 名稱。跨平台同一個人合併成一個 session 不在這次範圍內 |
+| 11 | heartbeat / cron 的 session 與模型 | **預設跑在自己的內部 session**（`heartbeat`、`cron:<job>`），可用 `profile` 固定 profile、用 `model` 指定單次 turn 的 model；對人說話靠 bus 工具（§8.5）|
+| 12 | 指揮其他 coding agent | **worker session**（§8.6）：agent 用 `worker_start` 在允許的目錄開某個 profile 的 agent，結果透過 bus 送回。人類可以用 `/attach`（聊天室，所有 provider）或 `uniqlaw attach`（終端機：claude-tmux 是 live，claude-sdk / codex 交給原生 CLI resume）接管，接管期間 owner 的訊息會被拒絕。允許的目錄預設只有專案目錄 |
 
 M0 結果見 `docs/spikes/M0-results.md`。目前沒有待決事項。
 
@@ -591,7 +619,7 @@ M0 結果見 `docs/spikes/M0-results.md`。目前沒有待決事項。
 | M | 內容 | 驗收 |
 |---|---|---|
 | M0 | Spike：每個 adapter 各寫一個 50 行 PoC，把 event 映射到 `AgentEvent`。必驗：(0) claude-tmux 和 claude-sdk 能不能互相 resume 同一個 session id；(1) Claude SDK 用 `settingSources` / plugins 是否載入 `~/.claude` 的 skills、plugins、hooks、plugin slash commands，並對照 TUI；(2) 訂閱帳號在 SDK 下的授權方式（查 SDK auth 文件和條款，不要用猜的）；(3) Claude streaming input 的排隊語意；(4) `turn/steer` 參數；(5) `agy` headless 是否官方支援；(6) pi SDK 模式下 project trust 怎麼決定（`.pi/mcp.json` 會不會被自動拒絕，類似 v2 init-watch 的問題）| capability 矩陣補完，§13 列出的技術問題都有答案 |
-| M1 ✅ | core（含多實例隔離：lock、runtime.json、tmux socket、token claims）+ mcp-gateway + claude-common + **provider-claude-tmux**（v2 移植，風險最低）+ platform-telegram + bus 工具 + `migrate-v2` | 用遷移過來的 v2 專案在 TG 上跑，行為跟 v2 一致 |
+| M1 ✅ | core（含多實例隔離：lock、runtime.json、tmux socket、token claims）+ mcp-gateway + claude-common + **provider-claude-tmux**（v2 移植，風險最低）+ platform-telegram + bus 工具 + v2 遷移 | 用遷移過來的 v2 專案在 TG 上跑，行為跟 v2 一致 |
 | M1.5 ✅ | provider-claude-sdk；Claude 訊息 socket 風險的緩解；steer 競態（steer 呼叫與 turn 結束同時發生時，回覆會被當成背景輸出、沒有引用原訊息）；權限拒絕路徑的真實 e2e（目前只有假 provider 的單元測試）；型別化 error 的自動重試 | 跟 tmux adapter 通過同一組合約測試（session 互通 M0 已驗證） |
 | M2 🟡 | credentials 套件 + provider-pi（直連 API + Bedrock / Vertex / Azure） | 合約測試在每種憑證類型各跑一次 |
 | M3 ✅ | provider-codex、provider-opencode、provider-acp（S5/S6/S6b 待 opencode 免費額度恢復後重驗）、provider-agy | 合約測試通過；polyfill 規則生效 |

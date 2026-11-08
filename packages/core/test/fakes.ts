@@ -22,6 +22,8 @@ export class FakeSession implements AgentSession {
   async send(input: TurnInput) { this.sent.push(input); this.n++; this.emit({ type: "turn_start", turnId: this.turnId() }); await this.script(input, this); }
   async steer(input: TurnInput) { this.steered.push(input); }
   async interrupt() { this.interrupted++; this.emit({ type: "turn_end", turnId: this.turnId(), reason: "interrupted" }); }
+  models: string[] = [];
+  async setModel(m: string) { this.models.push(m); }
   async respondPermission(id: string, d: PermissionDecision, idx?: number) { this.permissions.push({ id, d, idx }); }
   async close() { this.closed = true; this.wake?.(); }
   async alive() { return !this.closed; }
@@ -42,7 +44,10 @@ export class FakeProvider implements AgentProvider {
   sessions = new Map<string, FakeSession>();
   constructor(public script: Script, public caps: ProviderCapabilities = CAPS) {}
   capabilities() { return this.caps; }
+  /** Every open() spec (profile name/model, system prompt…), in order. */
+  specs: { sessionId: string; cwd?: string; providerSessionId?: string; profile?: { name: string; model?: string }; systemPrompt?: { fragments: { id: string; text?: string }[] } }[] = [];
   async open(spec: { sessionId: string }) {
+    this.specs.push(spec);
     const s = new FakeSession(this.caps, this.script);
     this.sessions.set(spec.sessionId, s);
     s.emit({ type: "session", providerSessionId: `p-${spec.sessionId}` });
@@ -68,6 +73,6 @@ export class FakePlatform implements PlatformAdapter {
   async askChoice(_t: Target, req: ChoiceRequest) { this.choices.push(req); return this.choiceAnswer; }
   operatorTargets() { return [{ platform: "tg", chatId: "1" }]; }
   parseTarget(s: string) { const [p, id] = s.split(":"); return p === "tg" && id ? { platform: "tg", chatId: id } : undefined; }
-  channelKeyForTarget(t: Target) { return Number(t.chatId) > 0 ? "global" : `tg:${t.chatId}`; }
+  channelKeyForTarget(t: Target) { return `tg:${t.chatId}`; }
 }
 

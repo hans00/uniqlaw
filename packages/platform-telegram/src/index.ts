@@ -46,5 +46,5 @@ export default definePlugin({
   },
 });
 
-export { TelegramAdapter, startTypingPulse, GLOBAL_KEY } from "./adapter.ts";
+export { TelegramAdapter, startTypingPulse } from "./adapter.ts";
 export { markdownToTelegramHtml, chunkHtml, chunkText } from "./format.ts";

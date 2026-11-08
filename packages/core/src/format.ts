@@ -171,6 +171,18 @@ export function dirScopePrompt(projectDir: string): string {
   ].join("\n");
 }
 
+/** For sessions that can call worker_start: where workers may run and with which profiles. */
+export function workersPrompt(roots: string[], profiles: { name: string; provider: string; model?: string }[]): string {
+  return [
+    "## Workers",
+    "`worker_start` runs another coding agent on this machine, in its own directory, and hands it a task. Delegating there is allowed even "
+      + "when the directory is outside your own scope: the worker runs in that directory under its own profile and permissions, and UniQlaw enforces the allowed list below.",
+    `Allowed worker directories (and their subdirectories): ${roots.map((r) => `\`${r}\``).join(", ")}.`,
+    `Worker profiles: ${profiles.map((p) => `\`${p.name}\` (${p.provider}${p.model ? ` ${p.model}` : ""})`).join(", ")}.`,
+    "Use one worker per task and directory, give it a self-contained task, and use agent_ask to `worker:<name>` for follow-ups. A human may take a worker over; then it refuses your messages until they detach.",
+  ].join("\n");
+}
+
 export const SILENT_REPLY_PROMPT = [
   "## Silent Replies", "",
   "You are in a multi-party channel. Not every message needs a reply from you — e.g. two other people are talking to each other, the message is not addressed to you, it is an off-topic aside, or you genuinely have nothing meaningful to add.", "",
@@ -183,6 +195,18 @@ export const SILENT_REPLY_PROMPT = [
 
 export const REACTION_PROMPT = "To react to the user's message with an emoji, include `[react:<emoji>]` anywhere in your reply (it is removed from the text and applied as a native reaction). A reply consisting only of reaction tags sends just the reaction.";
 
+/** For sessions with no chat of their own (heartbeat, cron jobs, "global"…). */
+export function internalSessionPrompt(channelKey: string): string {
+  return [
+    "## Internal session",
+    `You are the internal session \`${channelKey}\`. You have no chat of your own and no human is reading this session directly.`,
+    "- To tell a human something, use `notify` with a chat target (e.g. \"telegram:<chatId>\"); `agents_list` shows each chat session's target.",
+    "- To have a chat session talk to its own human (with its own context), use `agent_trigger`.",
+    "- To get information from another session without a human seeing it, use `agent_ask`.",
+    "- Your final reply is only delivered where the job/heartbeat config says (replyTo); if it says none, nothing you write is shown unless you send it with a tool.",
+  ].join("\n");
+}
+
 export function busToolsPrompt(toolNames: string[]): string {
   return [
     "## UniQlaw tools",
@@ -191,7 +215,19 @@ export function busToolsPrompt(toolNames: string[]): string {
     "- `agent_ask`: ask another session something; its answer comes back to YOU (no human sees it).",
     "- `agent_trigger`: make another session answer ITS OWN human on its own chat.",
     "- `notify`: send text you wrote to a chat target (a human sees it verbatim).",
+    ...(toolNames.includes("worker_start") ? ["- `worker_start` / `worker_stop`: run another coding agent (a profile) in a directory on this machine and hand it work; follow up with `agent_ask` to `worker:<name>`."] : []),
     ...(toolNames.includes("cron_save") ? ["- `cron_list` / `cron_save` / `cron_delete`: manage your scheduled jobs (validated cron; prefer these over editing job files)."] : []),
     "When you receive a message from another agent session, answer once and stop; do not reply to replies unless asked a question.",
+  ].join("\n");
+}
+
+/** Extra system prompt for worker sessions (started by another session via worker_start). */
+export function workerSessionPrompt(channelKey: string, cwd: string, owner?: string): string {
+  return [
+    "## Worker session",
+    `You are \`${channelKey}\`, a coding agent working in \`${cwd}\`. Follow that directory's own project instructions (CLAUDE.md, AGENTS.md, …).`,
+    `Tasks come from ${owner ? `the agent session \`${owner}\`` : "another agent session"}; your final reply to each task is returned to it, not to a human. `
+      + "End each task with a short report: what you changed (files), how you checked it, and anything left open.",
+    "A human may attach to this session and talk to you directly; then you are answering them, and their instructions win.",
   ].join("\n");
 }

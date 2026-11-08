@@ -7,7 +7,7 @@ const secretRef = z.union([z.object({ env: z.string() }), z.object({ file: z.str
 const token = z.union([z.string(), secretRef]);
 const mode = z.enum(["channel", "thread-per-message"]);
 
-/** Accepts the v2 `slack` block that packages/migrate-v2 copies verbatim (incl. messageStream). */
+/** Accepts the v2 `slack` block as copied over by docs/MIGRATE.md (incl. messageStream). */
 export const slackConfigSchema = z.object({
   enabled: z.boolean().default(true),
   /** xapp-… app-level token (Socket Mode). */
@@ -50,5 +50,5 @@ export default definePlugin({
   },
 });
 
-export { SlackAdapter, GLOBAL_KEY } from "./adapter.ts";
+export { SlackAdapter } from "./adapter.ts";
 export { markdownToMrkdwn, slackReactionName } from "./format.ts";

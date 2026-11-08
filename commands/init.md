@@ -14,5 +14,5 @@ description: Set up UniQlaw in the current project (interactive wizard → .uniq
    bun ${CLAUDE_PLUGIN_ROOT}/packages/cli/src/main.ts init --yes --project "$PWD" --provider claude-tmux --model sonnet --telegram-users 123456789 --telegram-token TELEGRAM_BOT_TOKEN
    ```
    Other flags: `--credential <login|anthropic-api-key|openai-api-key|gemini-api-key|openai-compatible|aws|gcp|azure>`, `--key <ENV|file:…|cmd:…>`, `--base-url`, `--region`, `--aws-profile`, `--gcp-project`, `--location`, `--service-account`, `--endpoint`, `--deployment`, `--discord-token`, `--slack-bot-token --slack-app-token`, `--line-channel-access-token --line-channel-secret`, `--<platform>-users`, `--no-web`, `--heartbeat`, `--force`.
-5. If the output mentions a ClaudeClaw v2 config, suggest `/uniqlaw:migrate` instead.
+5. If the project has a ClaudeClaw v2 config (`.claude/claudeclaw/settings.json`), suggest `/uniqlaw:migrate` instead.
 6. Finish with `/uniqlaw:doctor`, then `/uniqlaw:start`.

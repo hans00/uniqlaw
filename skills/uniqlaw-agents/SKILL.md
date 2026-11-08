@@ -1,6 +1,6 @@
 ---
 name: uniqlaw-agents
-description: Talk to other UniQlaw agent sessions or chat platforms — `agent_ask` when YOU need an answer from another session (no human sees it), `notify` to send a human text you wrote, `agent_trigger` to make another session answer ITS OWN human, `cron_*` to schedule yourself. Use when asked to "ask the Discord agent", "tell me on Telegram when X finishes", "have #dev look at this", "delegate to the global session", "remind me every morning", or to reach a remote A2A agent.
+description: Talk to other UniQlaw agent sessions or chat platforms — `agent_ask` when YOU need an answer from another session (no human sees it), `notify` to send a human text you wrote, `agent_trigger` to make another session answer ITS OWN human, `cron_*` to schedule yourself, `worker_*` to run another coding agent (Claude Code, Codex, …) in some directory. Use when asked to "ask the Discord agent", "tell me on Telegram when X finishes", "have #dev look at this", "check with the heartbeat session", "remind me every morning", "have Codex fix this in ~/Projects/foo", or to reach a remote A2A agent.
 ---
 
 # UniQlaw agent bus
@@ -20,12 +20,14 @@ One-line rule: a human must see an agent-composed reply on another chat → `age
 
 ## Tools
 
-- `agents_list()` — sessions you can reach: name (= channel key such as `global`, `telegram:-100…`, `discord:<id>`, `slack:<ch>[:<ts>]`, `line:<id>`), profile, provider, state. Remote A2A agents appear as `a2a:<name>` with state `remote`. Call it instead of guessing names.
+- `agents_list()` — sessions you can reach: name, `kind`, profile, provider, state. `kind: "chat"` names are chat keys and double as notify targets: `telegram:<chatId>` (DMs are `telegram:<userId>`), `discord:<id>` / `discord:dm:<userId>`, `slack:<ch>[:<ts>]` / `slack:dm:<userId>`, `line:<id>`. Each DM is its own session. `kind: "internal"` sessions have no chat: `heartbeat`, `cron:<job>`, and so on. Remote A2A agents appear as `a2a:<name>` with `kind: "remote"`. Call it instead of guessing names.
 - `agent_ask(to, message, wait?)` — the other session runs a normal turn; its final answer comes back to you. `wait` defaults to true (blocks until done, with a timeout). `wait:false` returns a `taskId` and the answer arrives later as a new message in your session. Works for remote `a2a:*` agents too.
-- `agent_trigger(to, prompt, replyTo?)` — the other session runs a turn and its reply is posted to its own chat. For `global` (no fixed chat) pass `replyTo: {platform, chatId}`. Not available for remote agents. You get the reply text later as activity context.
+- `agent_trigger(to, prompt, replyTo?)` — the other session runs a turn and its reply is posted to its own chat. For an internal session (no chat) pass `replyTo: {platform, chatId}`. Not available for remote agents. You get the reply text later as activity context.
 - `notify(target, text)` — sends your text to `telegram:<chatId>`, `discord:<channelId>`, `slack:<channel>[:<threadTs>]` or `line:<id>`. The session that owns that chat sees "sent on your behalf" next turn.
 - `task_status(taskId)` — state/result of an ask or trigger you started (or received).
-- `cron_list()` / `cron_save(name, schedule, prompt, recurring?, target?, replyTo?, timezone?)` / `cron_delete(name)` — scheduled jobs (5-field cron, validated). `target` defaults to you; `replyTo` is a chat target for the output (default: your last chat). Prefer these over editing `.uniqlaw/jobs/*.md` by hand.
+- `worker_start(name, profile?, cwd?, task?, wait?)` — run another coding agent (a configured profile: Claude Code, Codex, …) in a directory on this machine and hand it a task. It becomes `worker:<name>` (`kind: "worker"` in `agents_list`, with `cwd` / `owner` / `heldBy`). `wait` defaults to false: you get a `taskId`, and its report arrives later as a new message. Follow up with `agent_ask` to `worker:<name>`; reusing the name continues its conversation. `cwd` must be inside the allowed worker directories (your system prompt lists them and the allowed profiles), and it is fixed per worker. Its permission prompts go to your human. While a human has taken it over (`/attach` in chat or `uniqlaw attach` in a terminal), it refuses your messages; you get a note when they leave.
+- `worker_stop(name, forget?)` — stop its process. The conversation is kept unless `forget: true`; files are never touched.
+- `cron_list()` / `cron_save(name, schedule, prompt, recurring?, target?, replyTo?, timezone?, model?, profile?)` / `cron_delete(name)` — scheduled jobs (5-field cron, validated). `target` defaults to you. Use `"own"` for a separate internal session `cron:<name>`, which gives the job a clean context and no chat. `replyTo` is a chat target for the final reply, or `"none"` if the job delivers with `notify` / `agent_trigger` itself. `model` runs the job on another model; `profile` pins its session to a configured profile. Prefer these over editing `.uniqlaw/jobs/*.md` by hand.
 
 ## Rules
 

@@ -6,7 +6,7 @@ import { z } from "zod";
 import type { ChannelManager } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
 
-export const GATEWAY_TOOL_NAMES = ["agents_list", "agent_ask", "agent_trigger", "notify", "task_status"];
+export const GATEWAY_TOOL_NAMES = ["agents_list", "agent_ask", "agent_trigger", "notify", "task_status", "worker_start", "worker_stop"];
 
 export class McpGateway {
   private extra: GatewayTool[] = [];
@@ -92,6 +92,28 @@ export class McpGateway {
         if (!t || (t.fromSession !== caller && t.toSession !== caller)) throw new Error("unknown task");
         return { state: t.state, result: t.result };
       }));
+
+    s.registerTool("worker_start", {
+      description: "Start (or reuse) a worker: another coding agent session (a profile, e.g. Claude Code or Codex) working in a directory on this machine. "
+        + "With a task, it works on it like agent_ask; wait=false (default) returns a taskId and its final report arrives later as a new message. "
+        + "Talk to it afterwards with agent_ask to \"worker:<name>\". A human can take it over (/attach in chat, `uniqlaw attach` in a terminal); while they do, it rejects your messages.",
+      inputSchema: {
+        name: z.string().describe("short id, lowercase (becomes worker:<name>); reusing a name continues that worker's conversation"),
+        profile: z.string().optional().describe("profile to run (which agent/model/permissions); required for a new worker"),
+        cwd: z.string().optional().describe("working directory (absolute, ~ or relative to the project); must be inside the allowed worker roots; fixed per worker"),
+        task: z.string().optional().describe("what to do; omit to just start it"),
+        wait: z.boolean().optional(),
+      } },
+      wrap(async (a) => {
+        const r = await mgr.startWorker(caller, a);
+        const { result, ...rest } = r;
+        return result ? { ...rest, result: result.ok ? result.text : `failed: ${result.text}` } : { ...rest, ...(r.taskId ? { status: "working" } : {}) };
+      }));
+
+    s.registerTool("worker_stop", {
+      description: "Stop a worker's agent process. Its conversation is kept (worker_start with the same name resumes it) unless forget=true. Files it changed are never touched.",
+      inputSchema: { name: z.string(), forget: z.boolean().optional() } },
+      wrap(async ({ name, forget }) => mgr.stopWorker(name, forget ?? false)));
 
     for (const t of this.extra) {
       s.registerTool(t.name, { description: t.description, inputSchema: t.inputSchema },

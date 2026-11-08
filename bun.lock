@@ -27,7 +27,6 @@
         "@uniqlaw/core": "workspace:*",
         "@uniqlaw/credentials": "workspace:*",
         "@uniqlaw/daemon": "workspace:*",
-        "@uniqlaw/migrate-v2": "workspace:*",
       },
       "devDependencies": {
         "@uniqlaw/testkit": "workspace:*",
@@ -70,13 +69,6 @@
       "devDependencies": {
         "@modelcontextprotocol/sdk": "^1.32.0",
         "zod": "^3.25.0",
-      },
-    },
-    "packages/migrate-v2": {
-      "name": "@uniqlaw/migrate-v2",
-      "version": "0.0.0",
-      "dependencies": {
-        "@uniqlaw/core": "workspace:*",
       },
     },
     "packages/platform-discord": {
@@ -526,8 +518,6 @@
     "@uniqlaw/credentials": ["@uniqlaw/credentials@workspace:packages/credentials"],
 
     "@uniqlaw/daemon": ["@uniqlaw/daemon@workspace:packages/daemon"],
-
-    "@uniqlaw/migrate-v2": ["@uniqlaw/migrate-v2@workspace:packages/migrate-v2"],
 
     "@uniqlaw/platform-discord": ["@uniqlaw/platform-discord@workspace:packages/platform-discord"],
 

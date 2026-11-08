@@ -9,7 +9,6 @@
   "dependencies": {
     "@uniqlaw/core": "workspace:*",
     "@uniqlaw/daemon": "workspace:*",
-    "@uniqlaw/migrate-v2": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.0",
     "@uniqlaw/credentials": "workspace:*"
   },

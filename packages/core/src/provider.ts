@@ -137,4 +137,9 @@ export interface AgentProvider {
   readonly name: string;
   capabilities(profile: Profile): ProviderCapabilities;
   open(spec: SessionSpec): Promise<AgentSession>;
+  /** Optional: how a human takes over this session in a terminal. live = attach to the running
+   *  process (core keeps watching); otherwise core closes the session first and the command
+   *  resumes the same conversation in the provider's own CLI. undefined = not possible. */
+  attachCommand?(o: { instanceId: string; sessionId: string; providerSessionId?: string; cwd: string; profile: Profile }):
+    { argv: string[]; live: boolean; env?: Record<string, string> } | undefined;
 }

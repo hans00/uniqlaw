@@ -12,7 +12,11 @@ export type Origin =
       deliverTo?: Target;
       /** Human target at the root of the delegation chain (for permission prompts). */
       rootTarget?: Target }
-  | { kind: "scheduler"; job: string; deliverTo?: Target }
+  | { kind: "scheduler"; job: string; deliverTo?: Target;
+      /** replyTo "none": the final reply is not posted anywhere (the agent uses notify/agent_trigger itself). */
+      silent?: boolean;
+      /** Run this turn on this model (live model switch), then switch back. */
+      model?: string }
   | { kind: "a2a"; remote: string; taskId: string; hop: number }
   | { kind: "system"; reason: "resume" | "background" | "deny-recovery" | "notify-echo" | "external" | "retry" };
 

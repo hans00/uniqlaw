@@ -27,8 +27,9 @@ export interface Sender {
 
 export interface InboundMessage {
   platform: string;
-  /** Session routing key, decided by the platform (v2 rules: Telegram DMs → "global",
-   *  groups → "telegram:<chatId>", Discord channel → "discord:<id>", …). */
+  /** Session routing key, decided by the platform: every chat is its own session, DMs included
+   *  ("telegram:<userId>", "discord:dm:<userId>", "slack:dm:<userId>", "line:<userId>"; groups
+   *  "telegram:<chatId>", "discord:<channelId>", …). Must round-trip: channelKeyForTarget(parseTarget(key)) === key. */
   channelKey: string;
   /** Where replies for this message go. */
   replyTarget: Target;

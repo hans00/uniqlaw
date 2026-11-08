@@ -155,6 +155,26 @@ export function startApi(o: ApiOptions) {
             const r = await manager.trigger(b.fromLabel ?? "api", b.target, b.prompt, replyTo);
             return json({ ok: true, dispatched: true, target: b.target, taskId: r.taskId });
           }
+          if (req.method === "GET" && path === "/api/workers") {
+            return json({ ok: true, workers: manager.listAgents().filter((a) => a.kind === "worker") });
+          }
+          if (req.method === "POST" && path === "/api/workers") {
+            const b = (await req.json()) as { action?: "start" | "stop"; name?: string; profile?: string; cwd?: string; task?: string; forget?: boolean; fromLabel?: string };
+            if (!b.name) return json({ ok: false, error: "name is required" }, 400);
+            if (b.action === "stop") return json({ ok: true, ...(await manager.stopWorker(b.name, !!b.forget)) });
+            const r = await manager.startWorker(b.fromLabel ?? "api", { name: b.name, profile: b.profile, cwd: b.cwd, task: b.task, wait: false });
+            return json({ ok: true, ...r });
+          }
+          if (req.method === "POST" && path === "/api/takeover") {
+            const b = (await req.json()) as { key?: string };
+            if (!b.key) return json({ ok: false, error: "key is required" }, 400);
+            return json({ ok: true, ...(await manager.takeover(b.key)) });
+          }
+          if (req.method === "POST" && path === "/api/release") {
+            const b = (await req.json()) as { key?: string };
+            if (!b.key) return json({ ok: false, error: "key is required" }, 400);
+            return json({ ok: true, released: manager.release(b.key) });
+          }
           return json({ ok: false, error: "not found" }, 404);
         } catch (e) {
           log.warn("api error", { path, e: String(e) });

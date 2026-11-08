@@ -16,15 +16,16 @@ Successor to ClaudeClaw v2 (Claude-only, tmux-only). Everything is a plugin; fea
 
 ## What you get
 
-- **Per-chat sessions** with v2's routing rules (all DMs share `global`; groups/channels/threads get their own), queue / steer / interrupt handling for messages that arrive mid-turn, `/stop`, `/new`, `/status`, `/model`.
+- **Per-chat sessions**: every DM is its own session (per user, per platform, like OpenClaw), and groups/channels/threads get their own too, queue / steer / interrupt handling for messages that arrive mid-turn, `/stop`, `/new`, `/status`, `/model`.
 - **Approvals on your phone**: permission prompts from any provider become buttons on the chat that triggered the work (or the operator).
-- **A provider-independent message bus** exposed to every agent as MCP tools: `agents_list`, `agent_ask`, `agent_trigger`, `notify`, `task_status`, plus `cron_list` / `cron_save` / `cron_delete`. Provider-native cross-session features are disabled so nothing bypasses routing.
+- **A provider-independent message bus** exposed to every agent as MCP tools: `agents_list`, `agent_ask`, `agent_trigger`, `notify`, `task_status`, `worker_start`, `worker_stop`, plus `cron_list` / `cron_save` / `cron_delete`. Provider-native cross-session features are disabled so nothing bypasses routing.
 - **A2A v1.0**: expose profiles as A2A agents; remote A2A agents show up in `agents_list` and answer `agent_ask`.
-- **Scheduling**: v2-format cron jobs (IANA time zones, optional catch-up) and a heartbeat with quiet hours.
+- **Workers**: a session can start another coding agent (any profile: Claude Code, Codex, OpenCode, …) in a chosen directory on the same machine with `worker_start`, and get its report back. A human can take a worker over: `/attach <worker>` from a chat (any provider) or `uniqlaw attach <worker>` in a terminal (live for `claude-tmux`; `claude-sdk` / `codex` are handed to their own CLI and handed back on exit). Allowed directories and profiles come from `workers` in settings (default: the project directory only).
+- **Scheduling**: v2-format cron jobs (IANA time zones, optional catch-up) and a heartbeat with quiet hours. By default each runs in its own internal session (`heartbeat`, `cron:<job>`). A job can pin a `profile` or switch the `model` for its turn, and can reach humans or other sessions through the bus (`notify`, `agent_trigger`, `agent_ask`), or set `replyTo: "none"` and decide for itself.
 - **Model routing**: per-turn model choice by keywords/phrases with hysteresis (v2 "agentic modes").
 - **Multiple instances per machine**: per-project lock, auto-assigned ports, per-instance tmux socket, bot-token claims so two instances never poll the same bot.
 - **Web dashboard** on 127.0.0.1: sessions with live transcripts, jobs, logs.
-- **Migration from ClaudeClaw v2** (`uniqlaw migrate`).
+- **Migration from ClaudeClaw v2**: an agent-readable guide ([`docs/MIGRATE.md`](docs/MIGRATE.md), `/uniqlaw:migrate` in Claude Code) instead of a fixed script.
 
 ## Providers
 
@@ -61,7 +62,7 @@ uniqlaw start
 uniqlaw status
 ```
 
-Coming from ClaudeClaw v2: see [`docs/MIGRATE.md`](docs/MIGRATE.md) (stop v2 first — two pollers on one bot token fight).
+Coming from ClaudeClaw v2: have your agent follow [`docs/MIGRATE.md`](docs/MIGRATE.md) (`/uniqlaw:migrate` in Claude Code). Stop v2 first, because two pollers on one bot token fight.
 
 As a Claude Code plugin: install this repo as a plugin and use `/uniqlaw:init`, `/uniqlaw:start`, `/uniqlaw:status`, … (`/uniqlaw:help` lists them). The `uniqlaw-agents` skill teaches agents the bus tools.
 
@@ -77,7 +78,8 @@ As a Claude Code plugin: install this repo as a plugin and use `/uniqlaw:init`, 
 | `uniqlaw status` / `logs [--lines N]` / `ls` | daemon + sessions / log tail / all instances on this machine |
 | `uniqlaw send <target> <text>` | post text to a chat, e.g. `telegram:<chatId>` |
 | `uniqlaw trigger <target> <prompt>` | make a session answer its own chat |
-| `uniqlaw migrate --from <v2 dir> [--dry-run] [--force]` | ClaudeClaw v2 → UniQlaw |
+| `uniqlaw workers` / `worker start <name> --profile P [--cwd DIR] [task]` / `worker stop <name> [--forget]` | list / start / stop worker sessions |
+| `uniqlaw attach <worker\|session>` / `release <…>` | take a session over in this terminal / end a takeover that didn't hand back |
 | `uniqlaw mcp-shim` | stdio⇄HTTP bridge to the MCP gateway (used by providers that only accept file-configured MCP) |
 
 All commands take `--project DIR` (default: current directory). The daemon's HTTP API keeps v2's `POST /api/send` and `/api/trigger`.
@@ -95,9 +97,10 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
   "credentials": { "gcp": { "kind": "gcp", "project": "my-proj", "location": "us-central1" } },
   "bindings": { "default": "main", "channels": { "discord:1234": "coder" } },
   "queue": { "mode": "steer" },
+  "workers": { "roots": ["~/Projects"], "profiles": ["main", "coder"] },
   "plugins": {
     "telegram": { "token": { "env": "TELEGRAM_BOT_TOKEN" }, "allowedUserIds": ["123456789"] },
-    "heartbeat": { "interval": 60, "excludeWindows": [{ "start": "23:00", "end": "07:00" }] },
+    "heartbeat": { "interval": 60, "profile": "cheap", "replyTo": "telegram:123456789", "excludeWindows": [{ "start": "23:00", "end": "07:00" }] },
     "a2a": { "expose": { "main": { "description": "My assistant" } } }
   }
 }
@@ -112,4 +115,4 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
 
 ## Repository layout
 
-`packages/core` (contracts, runtime, bus, MCP gateway), `daemon`, `cli`, `credentials`, `scheduler`, `migrate-v2`, `testkit`, `claude-common`, `provider-*`, `platform-*`, `transport-a2a`. Bun workspaces; `bun test` inside a package, `bun run typecheck` at the root. Real-provider contract tests are gated behind `UNIQLAW_E2E=1`.
+`packages/core` (contracts, runtime, bus, MCP gateway), `daemon`, `cli`, `credentials`, `scheduler`, `testkit`, `claude-common`, `provider-*`, `platform-*`, `transport-a2a`. Bun workspaces; `bun test` inside a package, `bun run typecheck` at the root. Real-provider contract tests are gated behind `UNIQLAW_E2E=1`.

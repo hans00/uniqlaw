@@ -50,10 +50,10 @@ afterEach(async () => {
 });
 
 describe("inbound routing", () => {
-  test("DM converges on global, single-party, trusted operator", async () => {
+  test("DM is its own session (telegram:<userId>), single-party, trusted operator", async () => {
     api.pushUpdate(dm(OWNER, "hello"));
     const m = await waitFor(() => inbox[0]);
-    expect(m.channelKey).toBe("global");
+    expect(m.channelKey).toBe(`telegram:${OWNER}`);
     expect(m.multiparty).toBe(false);
     expect(m.trusted).toBe(true);
     expect(m.addressed).toBe(true);
@@ -200,7 +200,7 @@ describe("outbound", () => {
     expect(adapter.operatorTargets()).toEqual([{ platform: "telegram", chatId: String(OWNER) }]);
     expect(adapter.parseTarget("telegram:-100500:7")).toEqual({ platform: "telegram", chatId: "-100500", threadId: "7" });
     expect(adapter.parseTarget("discord:1")).toBeUndefined();
-    expect(adapter.channelKeyForTarget({ platform: "telegram", chatId: "111" })).toBe("global");
+    expect(adapter.channelKeyForTarget({ platform: "telegram", chatId: "111" })).toBe("telegram:111");
     expect(adapter.channelKeyForTarget({ platform: "telegram", chatId: "-100500" })).toBe("telegram:-100500");
   });
 });

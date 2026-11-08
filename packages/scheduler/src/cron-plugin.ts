@@ -5,7 +5,7 @@ import { unlinkSync } from "node:fs";
 import { z } from "zod";
 import { definePlugin, type GatewayTool, type Logger, type Scheduler, type SchedulerApi } from "@uniqlaw/core";
 import { cronMatches, occurrencesBetween } from "./cron.ts";
-import { deleteJob, loadJobs, saveJob, type Job } from "./jobs.ts";
+import { defaultJobTarget, deleteJob, loadJobs, saveJob, type Job } from "./jobs.ts";
 import { isValidCron, nextMatch } from "./cron.ts";
 
 export const cronConfigSchema = z.object({
@@ -44,19 +44,23 @@ export class CronScheduler implements Scheduler {
   /** MCP tools so agents manage jobs with validation instead of hand-writing files. */
   tools(): GatewayTool[] {
     return [
-      { name: "cron_list", description: "List scheduled jobs (name, schedule, target, replyTo, next run).", inputSchema: {},
+      { name: "cron_list", description: "List scheduled jobs (name, schedule, target, replyTo, profile, model, next run).", inputSchema: {},
         handler: async () => this.jobs().map((j) => ({ name: j.name, schedule: j.schedule, recurring: j.recurring, target: j.target,
-          replyTo: j.replyTo, timezone: j.timezone ?? this.tz, next: nextMatch(j.schedule, this.now(), j.timezone ?? this.tz)?.toISOString(), prompt: j.body })) },
+          replyTo: j.replyTo, profile: j.profile, model: j.model, timezone: j.timezone ?? this.tz, next: nextMatch(j.schedule, this.now(), j.timezone ?? this.tz)?.toISOString(), prompt: j.body })) },
       { name: "cron_save",
-        description: "Create or replace a scheduled job. schedule = 5-field cron. target = session that runs it (default: you). replyTo = chat target for its output, e.g. \"telegram:<chatId>\" (default: background-notify policy).",
+        description: "Create or replace a scheduled job. schedule = 5-field cron. target = session that runs it: default you; \"own\" = a separate internal session \"cron:<name>\" (clean context, no chat). replyTo = chat target for its final reply, e.g. \"telegram:<chatId>\", or \"none\" (deliver with notify/agent_trigger yourself); default: background-notify policy. model = run the job on this model; profile = pin the job's session to a configured profile.",
         inputSchema: { name: z.string().regex(/^[a-zA-Z0-9._-]+$/), schedule: z.string(), prompt: z.string(), recurring: z.boolean().optional(),
-          target: z.string().optional(), replyTo: z.string().optional(), timezone: z.string().optional() },
+          target: z.string().optional(), replyTo: z.string().optional(), timezone: z.string().optional(),
+          model: z.string().optional(), profile: z.string().optional() },
         handler: async (a, caller) => {
           const schedule = String(a.schedule);
           if (!isValidCron(schedule)) throw new Error(`invalid cron "${schedule}" (need 5 fields: minute hour day month weekday)`);
           const tz = (a.timezone as string | undefined) ?? undefined;
-          saveJob(this.dir, String(a.name), { schedule, recurring: a.recurring !== false, target: (a.target as string | undefined) ?? caller,
-            replyTo: a.replyTo as string | undefined, timezone: tz, body: String(a.prompt) });
+          const name = String(a.name);
+          const t = a.target as string | undefined;
+          saveJob(this.dir, name, { schedule, recurring: a.recurring !== false, target: t === "own" ? defaultJobTarget(name) : t ?? caller,
+            replyTo: a.replyTo as string | undefined, timezone: tz, body: String(a.prompt),
+            model: a.model as string | undefined, profile: a.profile as string | undefined });
           return { saved: a.name, next: nextMatch(schedule, this.now(), tz ?? this.tz)?.toISOString() };
         } },
       { name: "cron_delete", description: "Delete a scheduled job by name.", inputSchema: { name: z.string() },
@@ -97,7 +101,8 @@ export class CronScheduler implements Scheduler {
     const tag = catchUp ? `catch-up · cron (missed ${missed}× while UniQlaw was down)` : "scheduled · cron";
     try {
       await this.api!.fire({ channelKey: job.target, job: job.name, text: job.body, deliverTo: job.replyTo,
-        sourceLine: `[${tag} · ${job.name} (${job.schedule})]` });
+        sourceLine: `[${tag} · ${job.name} (${job.schedule})]`,
+        ...(job.profile ? { profile: job.profile } : {}), ...(job.model ? { model: job.model } : {}) });
     } catch (e) { this.log.error("job fire failed", { job: job.name, e: String(e) }); }
     if (!job.recurring) { try { unlinkSync(job.filePath); this.log.info("one-shot job removed", { job: job.name }); } catch {} }
   }

@@ -40,11 +40,11 @@ const text = (r: unknown) => ((r as { content: { text: string }[] }).content[0]!
 test("tools are listed and identity comes from the token", async () => {
   const { gw, store, platform } = setup();
   const a = await client(gw.endpointFor("tg:-1")!.url);
-  expect((await a.listTools()).tools.map((t) => t.name).sort()).toEqual(["agent_ask", "agent_trigger", "agents_list", "notify", "task_status"]);
-  // notify from tg:-1 to the DM → echo lands on "global", attributed to tg:-1
+  expect((await a.listTools()).tools.map((t) => t.name).sort()).toEqual(["agent_ask", "agent_trigger", "agents_list", "notify", "task_status", "worker_start", "worker_stop"]);
+  // notify from tg:-1 to the DM → echo lands on the DM session "tg:100", attributed to tg:-1
   await a.callTool({ name: "notify", arguments: { target: "tg:100", text: "hello human" } });
   expect(platform.sent[0]!.text).toBe("hello human");
-  const pending = store.drainPending("global");
+  const pending = store.drainPending("tg:100");
   expect(JSON.parse(pending[0]!.payload).label).toContain("tg:-1");
 });
 

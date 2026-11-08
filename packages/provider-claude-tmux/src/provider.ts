@@ -49,6 +49,11 @@ export class ClaudeTmuxProvider implements AgentProvider {
     return `uq-${instanceId}-${slug(sessionId)}`;
   }
 
+  /** Live terminal takeover: attach to the agent's own tmux session (core keeps watching). */
+  attachCommand(o: { instanceId: string; sessionId: string }): { argv: string[]; live: boolean } {
+    return { argv: ["tmux", "-L", this.tmuxFor(o.instanceId).socket, "attach-session", "-t", this.sessionName(o.instanceId, o.sessionId)], live: true };
+  }
+
   async open(spec: SessionSpec): Promise<AgentSession> {
     const log = this.deps.log.child(spec.sessionId);
     const tmux = this.tmuxFor(spec.instanceId);

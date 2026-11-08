@@ -21,6 +21,14 @@ export interface QueuedInput {
   attachments: Attachment[];
 }
 
+/** What the system prompt builder knows about the session. */
+export interface SessionContext {
+  channelKey: string;
+  internal: boolean;
+  cwd?: string;
+  worker?: { owner?: string };
+}
+
 /** Services the runtime needs from the daemon (kept narrow for testability). */
 export interface RuntimeHost {
   log: Logger;
@@ -32,7 +40,15 @@ export interface RuntimeHost {
   /** All operator targets across platforms (fallback for approvals/background). */
   operatorTargets(): Target[];
   /** Build the system prompt for a session. */
-  systemPrompt(profile: Profile, multiparty: boolean, mcpToolNames: string[]): Promise<SystemPromptParts>;
+  systemPrompt(profile: Profile, multiparty: boolean, mcpToolNames: string[], session?: SessionContext): Promise<SystemPromptParts>;
+  /** True for sessions with no chat of their own (heartbeat, cron jobs, "global"…). Default: false. */
+  isInternal?(channelKey: string): boolean;
+  /** Working directory of a session (workers run elsewhere). Default: projectDir. */
+  cwdFor?(channelKey: string): string | undefined;
+  /** Worker sessions: who started it. */
+  workerOf?(channelKey: string): { owner?: string } | undefined;
+  /** Override where background output goes: a target, null = nowhere, undefined = backgroundNotify policy. */
+  backgroundTarget?(channelKey: string): Target | null | undefined;
   /** Issue an MCP Gateway token for this channel. */
   gatewayFor(channelKey: string): { url: string; token: string; toolNames: string[] } | undefined;
   /** Minimal isolated env for provider child processes. */
@@ -101,6 +117,10 @@ export class ChannelRuntime {
   private waitingForHuman = false;
   private readonly log: Logger;
   private router?: ModelRouter;
+  /** Model the session is on, as far as we know (profile → /model → router → provider "model" events). */
+  private activeModel?: string;
+  /** Set while a scheduled turn's model override is in effect: the model to switch back to. */
+  private modelRestore?: { model?: string };
 
   constructor(
     readonly channelKey: string,
@@ -111,6 +131,7 @@ export class ChannelRuntime {
   ) {
     this.log = host.log.child(channelKey);
     const agentic = agenticSchema.safeParse(profile.options.agentic ?? {});
+    this.activeModel = profile.model;
     if (agentic.success && agentic.data.enabled) this.router = new ModelRouter(agentic.data, profile.model);
     else if (!agentic.success) this.log.warn("invalid profile.options.agentic; model routing disabled");
   }
@@ -208,6 +229,8 @@ export class ChannelRuntime {
   async setModel(model: string): Promise<boolean> {
     if (!this.session?.setModel || this.capabilities.modelSwitch !== "live") return false;
     await this.session.setModel(model);
+    this.activeModel = model;
+    this.modelRestore = undefined; // a manual switch wins over a pending scheduled-turn restore
     this.router?.adopt(model);
     return true;
   }
@@ -272,13 +295,18 @@ export class ChannelRuntime {
     }
     const cur = this.host.store.getSession(this.channelKey)!;
     const gw = this.host.gatewayFor(this.channelKey);
+    const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
+    const worker = this.host.workerOf?.(this.channelKey);
     try {
       const session = await this.provider.open({
         sessionId: this.channelKey,
         providerSessionId: cur.providerSessionId ?? undefined,
-        cwd: this.host.projectDir,
+        cwd,
         profile: this.profile,
-        systemPrompt: await this.host.systemPrompt(this.profile, this.multiparty, gw?.toolNames ?? []),
+        systemPrompt: await this.host.systemPrompt(this.profile, this.multiparty, gw?.toolNames ?? [], {
+          channelKey: this.channelKey, internal: this.host.isInternal?.(this.channelKey) ?? false, cwd,
+          ...(worker ? { worker } : {}),
+        }),
         mcp: gw,
         env: await this.host.providerEnv(this.profile),
         instanceId: this.host.instanceId,
@@ -321,10 +349,33 @@ export class ChannelRuntime {
     while (this.queue.length && !(isPassthroughSlashCommand(this.queue[0]!.item.text) && this.queue[0]!.origin.kind === "human")) batch.push(this.queue.shift()!);
     const tz = this.host.settings.timezone;
     const pending = this.drainPendingNotes();
+    await this.scheduledModel(batch);
     await this.routeModel(batch);
     const body = mergeQueued(batch.map((b) => b.item), tz, this.dropped.splice(0));
     const text = [formatPendingForPrompt(pending, tz), body].filter(Boolean).join("\n\n");
     await this.startTurn(batch.map((b) => b.origin), { text, attachments: batch.flatMap((b) => b.attachments) });
+  }
+
+  /** Scheduled turns may run on their own model (job/heartbeat `model`); the next turn without
+   *  one switches back. Needs live model switching; otherwise use a profile for the job. */
+  private async scheduledModel(batch: QueuedInput[]) {
+    const human = batch.some((b) => b.origin.kind === "human");
+    const want = human ? undefined : [...batch].reverse().map((b) => b.origin).map((o) => (o.kind === "scheduler" ? o.model : undefined)).find(Boolean);
+    const live = this.capabilities.modelSwitch === "live" && !!this.session?.setModel;
+    if (want) {
+      if (want === this.activeModel) return;
+      if (!live) { this.log.warn("scheduled job asks for a model but this provider can't switch live; set a profile on the job instead", { model: want }); return; }
+      const restore = this.modelRestore ?? { model: this.activeModel };
+      try { await this.session!.setModel!(want); this.activeModel = want; this.modelRestore = restore; this.log.info("scheduled model", { model: want }); }
+      catch (e) { this.log.warn("setModel failed", { e: String(e) }); }
+      return;
+    }
+    if (!this.modelRestore || !live) return;
+    const back = this.modelRestore.model ?? this.profile.model;
+    this.modelRestore = undefined;
+    if (!back) { this.log.warn("can't switch back after a scheduled model: the base model is the provider default (set profile.model)"); return; }
+    if (back === this.activeModel) return;
+    try { await this.session!.setModel!(back); this.activeModel = back; } catch (e) { this.log.warn("setModel failed", { e: String(e) }); }
   }
 
   /** Per-turn model routing for human turns (scheduled/peer turns keep the current model). */
@@ -337,7 +388,7 @@ export class ChannelRuntime {
     if (!d) return;
     if ("skip" in d) { this.log.debug("model switch suppressed", { why: d.skip }); return; }
     this.log.info("model routing", { model: d.model, why: d.reasoning });
-    await this.session.setModel(d.model).catch((e) => this.log.warn("setModel failed", { e: String(e) }));
+    await this.session.setModel(d.model).then(() => { this.activeModel = d.model; }, (e) => this.log.warn("setModel failed", { e: String(e) }));
   }
 
   private drainPendingNotes(): PendingNote[] {
@@ -455,6 +506,7 @@ export class ChannelRuntime {
         return;
       case "model":
         this.log.info("model", { model: ev.model });
+        if (ev.model) this.activeModel = ev.model;
         return;
       case "error":
         this.log.error("agent error", { error: ev.error, fatal: ev.fatal });
@@ -568,7 +620,11 @@ export class ChannelRuntime {
     }
     // Only peer-ask / a2a origins → output is a task result, not platform output.
     if (origins.length && origins.every((o) => (o.kind === "peer" && o.mode === "ask") || o.kind === "a2a")) return undefined;
-    // background / peer result / system → backgroundNotify policy
+    // Scheduled turns with replyTo "none": the agent delivers with tools itself.
+    if (origins.length && origins.every((o) => o.kind === "scheduler" && o.silent)) return undefined;
+    // background / peer result / system → backgroundNotify policy (unless the host routes it)
+    const override = this.host.backgroundTarget?.(this.channelKey);
+    if (override !== undefined) return override ?? undefined;
     const mode = this.host.settings.backgroundNotify.mode;
     if (mode === "off") return undefined;
     if (mode === "last") return this.lastTarget() ?? this.host.operatorTargets()[0];
@@ -579,7 +635,8 @@ export class ChannelRuntime {
     if (this.turn?.external) markdown = `⚠️ **${this.channelKey}** received a message from outside UniQlaw (native Claude peer messaging). Its reply:\n\n${markdown}`;
     const target = this.visibleTarget();
     const targets = target ? [target]
-      : this.host.settings.backgroundNotify.mode === "all" && this.isBackgroundTurn() ? this.host.operatorTargets() : [];
+      : this.host.settings.backgroundNotify.mode === "all" && this.isBackgroundTurn() && this.host.backgroundTarget?.(this.channelKey) === undefined
+        ? this.host.operatorTargets() : [];
     for (const t of targets) {
       const p = this.host.platform(t.platform);
       if (!p) continue;
@@ -590,7 +647,7 @@ export class ChannelRuntime {
 
   private isBackgroundTurn() {
     const o = this.turn?.origins ?? [];
-    return o.length === 0 || o.every((x) => x.kind === "system" || (x.kind === "peer" && x.mode === "result") || (x.kind === "scheduler" && !x.deliverTo));
+    return o.length === 0 || o.every((x) => x.kind === "system" || (x.kind === "peer" && x.mode === "result") || (x.kind === "scheduler" && !x.deliverTo && !x.silent));
   }
 
   private async postToolStatus(line: string) {

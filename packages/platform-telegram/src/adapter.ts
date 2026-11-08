@@ -1,5 +1,5 @@
 // Telegram PlatformAdapter. Ported from claudeclaw-v2 platforms/telegram.ts and
-// the telegram-specific routing in daemon.ts (DM → "global", group → "telegram:<id>").
+// the telegram-specific routing in daemon.ts (UniQlaw: every chat is its own session, DM → "telegram:<userId>", group → "telegram:<id>").
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -12,8 +12,6 @@ import {
   chunkHtml, chunkText, escapeHtml, htmlToPlain, markdownToTelegramHtml, normalizeCommandName, normalizeEmoji,
   TG_HTML_LIMIT, TG_MSG_LIMIT, TG_REACTION_EMOJIS,
 } from "./format.ts";
-
-export const GLOBAL_KEY = "global";
 
 export interface TelegramAdapterOptions {
   token: string;
@@ -217,9 +215,9 @@ export class TelegramAdapter implements PlatformAdapter {
     return { platform: "telegram", chatId: m[1]!, ...(m[2] ? { threadId: m[2] } : {}) };
   }
 
-  /** Positive chat id = DM → "global" (all DMs share one session); negative = group. */
+  /** Every chat (DM or group) is its own session: "telegram:<chatId>". */
   channelKeyForTarget(t: Target): string {
-    return Number(t.chatId) > 0 ? GLOBAL_KEY : `telegram:${t.chatId}`;
+    return `telegram:${t.chatId}`;
   }
 
   // ── inbound ──────────────────────────────────────────────────────────────
@@ -281,7 +279,7 @@ export class TelegramAdapter implements PlatformAdapter {
     const threadId = msg.is_topic_message && msg.message_thread_id ? String(msg.message_thread_id) : undefined;
     const inbound: InboundMessage = {
       platform: "telegram",
-      channelKey: isDM ? GLOBAL_KEY : `telegram:${chatId}`,
+      channelKey: `telegram:${chatId}`,
       replyTarget: { platform: "telegram", chatId, replyToMessageId: String(msg.message_id), ...(threadId ? { threadId } : {}) },
       ref: { platform: "telegram", chatId, messageId: String(msg.message_id), ...(threadId ? { threadId } : {}) },
       sender: {

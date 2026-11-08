@@ -40,22 +40,22 @@ test("boots, writes runtime.json, routes a message end-to-end, serves the API", 
   expect(listInstances().some((i) => i.projectDir === dir)).toBe(true);
 
   const tg = instances.at(-1)!;
-  tg.sink!.message({ platform: "tg", channelKey: "global", replyTarget: { platform: "tg", chatId: "100" }, ref: { platform: "tg", chatId: "100", messageId: "1" },
+  tg.sink!.message({ platform: "tg", channelKey: "tg:100", replyTarget: { platform: "tg", chatId: "100" }, ref: { platform: "tg", chatId: "100", messageId: "1" },
     sender: { id: "7", name: "Hans" }, trusted: true, multiparty: false, text: "hello", attachments: [], receivedAt: Date.now() });
   for (let i = 0; i < 100 && !tg.sent.some((m) => m.text === "echo: Message: hello"); i++) await Bun.sleep(10);
   expect(tg.sent.map((m) => m.text)).toContain("echo: Message: hello");
 
   // system prompt: brand + prompt file + dir scope + bus tools; MCP endpoint issued
   const spec = lastSpecs.at(-1) as { systemPrompt: { fragments: { id: string; text: string }[] }; mcp: { url: string; toolNames: string[] }; env: Record<string, string> };
-  expect(spec.systemPrompt.fragments.map((f) => f.id)).toEqual(["brand", "file:prompts/IDENTITY.md", "dir-scope", "reactions", "bus-tools"]);
+  expect(spec.systemPrompt.fragments.map((f) => f.id)).toEqual(["brand", "file:prompts/IDENTITY.md", "dir-scope", "reactions", "bus-tools", "workers"]);
   expect(spec.mcp.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/[a-f0-9]+$/);
   expect(spec.env.UNIQLAW_INSTANCE).toBe(rt.instanceId);
   expect(Object.keys(spec.env).some((k) => k.includes("TOKEN") || k.includes("KEY"))).toBe(false);
 
   const status = await (await fetch(`http://127.0.0.1:${d.webPort}/api/status`)).json() as { agents: { name: string }[] };
-  expect(status.agents.map((a) => a.name)).toContain("global");
+  expect(status.agents.map((a) => a.name)).toContain("tg:100");
   const send = await (await fetch(`http://127.0.0.1:${d.webPort}/api/send`, { method: "POST", body: JSON.stringify({ target: "tg:100", text: "from api" }) })).json() as { ok: boolean; inboxOwner: string };
-  expect(send).toMatchObject({ ok: true, inboxOwner: "global" });
+  expect(send).toMatchObject({ ok: true, inboxOwner: "tg:100" });
 });
 
 test("a second daemon for the same project is refused", async () => {
@@ -93,7 +93,7 @@ test("cron is on by default and its MCP tools manage job files", async () => {
   const dir = project("bot-token-cron");
   await start(dir);
   lastSpecs.length = 0;
-  instances.at(-1)!.sink!.message({ platform: "tg", channelKey: "global", replyTarget: { platform: "tg", chatId: "100" }, ref: { platform: "tg", chatId: "100", messageId: "1" },
+  instances.at(-1)!.sink!.message({ platform: "tg", channelKey: "tg:100", replyTarget: { platform: "tg", chatId: "100" }, ref: { platform: "tg", chatId: "100", messageId: "1" },
     sender: { id: "7", name: "Hans" }, trusted: true, multiparty: false, text: "hi", attachments: [], receivedAt: Date.now() });
   for (let i = 0; i < 100 && !lastSpecs.length; i++) await Bun.sleep(10);
   const spec = lastSpecs.at(-1) as { mcp: { url: string; toolNames: string[] } };
@@ -108,6 +108,6 @@ test("cron is on by default and its MCP tools manage job files", async () => {
   const bad = await c.callTool({ name: "cron_save", arguments: { name: "x", schedule: "every day", prompt: "?" } }) as { isError?: boolean };
   expect(bad.isError).toBe(true);
   const list = await c.callTool({ name: "cron_list", arguments: {} }) as { content: { text: string }[] };
-  expect(JSON.parse(list.content[0]!.text)[0]).toMatchObject({ name: "standup", target: "global" });
+  expect(JSON.parse(list.content[0]!.text)[0]).toMatchObject({ name: "standup", target: "tg:100" });
   await c.close();
 });

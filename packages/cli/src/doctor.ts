@@ -5,7 +5,15 @@ import { join, resolve } from "node:path";
 import { resolveSecret, type Credential, type SecretRef } from "@uniqlaw/core";
 import { validateCredential } from "@uniqlaw/credentials";
 import { claimsDir, isAlive, loadSettings, readRuntime } from "@uniqlaw/daemon";
-import { detectRunningV2 } from "@uniqlaw/migrate-v2";
+
+/** ClaudeClaw v2 daemon liveness (its pid file), so doctor can flag two pollers on one bot. */
+export function detectRunningV2(dir: string): { running: boolean; pid?: number } {
+  const pidFile = join(resolve(dir), ".claude", "claudeclaw", "daemon.pid");
+  if (!existsSync(pidFile)) return { running: false };
+  const pid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+  if (!Number.isInteger(pid) || pid <= 0) return { running: false };
+  return isAlive(pid) ? { running: true, pid } : { running: false, pid };
+}
 
 export type Level = "ok" | "warn" | "fail";
 export interface Check { level: Level; area: string; message: string }

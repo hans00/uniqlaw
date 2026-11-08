@@ -6,7 +6,7 @@ import { LineAdapter } from "./adapter.ts";
 const secretRef = z.union([z.object({ env: z.string() }), z.object({ file: z.string() }), z.object({ command: z.string() })]);
 const secret = z.union([z.string(), secretRef]);
 
-/** Accepts the v2 `line` block that packages/migrate-v2 copies verbatim. */
+/** Accepts the v2 `line` block as copied over by docs/MIGRATE.md. */
 export const lineConfigSchema = z.object({
   enabled: z.boolean().default(true),
   channelAccessToken: secret,
@@ -50,5 +50,5 @@ export default definePlugin({
   },
 });
 
-export { LineAdapter, GLOBAL_KEY } from "./adapter.ts";
+export { LineAdapter } from "./adapter.ts";
 export { markdownToPlain } from "./format.ts";

@@ -1,5 +1,5 @@
 // Slack PlatformAdapter: Socket Mode (WebSocket) + Web API. Ported from claudeclaw-v2
-// platforms/slack.ts + daemon.ts routeSlack (IM → "global", channel → "slack:<ch>",
+// platforms/slack.ts + daemon.ts routeSlack (UniQlaw: IM → "slack:dm:<userId>", channel → "slack:<ch>",
 // thread-per-message → "slack:<ch>:<anchorTs>").
 import { randomBytes } from "node:crypto";
 import type {
@@ -8,7 +8,6 @@ import type {
 import { chunkText, downloadTo, extFromName, kindFromMime, sleep } from "./download.ts";
 import { markdownToMrkdwn, slackReactionName } from "./format.ts";
 
-export const GLOBAL_KEY = "global";
 export const SLACK_MSG_LIMIT = 3500;
 
 export type SlackChannelMode = "channel" | "thread-per-message";
@@ -155,7 +154,7 @@ export class SlackAdapter implements PlatformAdapter {
     const attachments = await this.collectAttachments(e, channel);
     if (!text && !attachments.length) return;
 
-    let channelKey = GLOBAL_KEY;
+    let channelKey = `slack:dm:${senderId}`;
     let threadId: string | undefined = e.thread_ts;
     if (!isDM) {
       if (this.modeFor(channel) === "thread-per-message") {
@@ -313,7 +312,9 @@ export class SlackAdapter implements PlatformAdapter {
   }
 
   channelKeyForTarget(t: Target): string {
-    if (t.chatId.startsWith("dm:") || t.chatId.startsWith("D")) return GLOBAL_KEY;
+    // DMs are keyed by user id so "slack:dm:<userId>" round-trips through parseTarget.
+    if (t.chatId.startsWith("dm:")) return `slack:${t.chatId}`;
+    for (const [user, ch] of this.dmByUser) if (ch === t.chatId) return `slack:dm:${user}`;
     if (t.threadId && this.modeFor(t.chatId) === "thread-per-message") return `slack:${t.chatId}:${t.threadId}`;
     return `slack:${t.chatId}`;
   }

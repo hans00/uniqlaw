@@ -2,7 +2,7 @@
 // thread per UniQlaw session. Per-thread MCP isolation holds (M0 S6 + contract S6b),
 // so sessions with the same credentials share a process.
 import { createHash } from "node:crypto";
-import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
+import { expandHome, type AgentProvider, type AgentSession, type Logger, type Profile, type ProviderCapabilities, type SessionSpec } from "@uniqlaw/core";
 import { AppServer } from "./rpc.ts";
 import { CODEX_CAPABILITIES, CodexSession } from "./session.ts";
 import { credentialSetup, policyFor, processArgs, threadConfig } from "./mapping.ts";
@@ -34,6 +34,15 @@ export class CodexProvider implements AgentProvider {
   constructor(private cfg: CodexProviderConfig, private deps: { log: Logger }) {}
 
   capabilities(_profile: Profile): ProviderCapabilities { return CODEX_CAPABILITIES; }
+
+  /** Terminal takeover: core closes the thread, the human resumes it with `codex resume`.
+   *  Only for the default login or a provider-login home (API-key profiles need a secret we don't hand out). */
+  attachCommand(o: { providerSessionId?: string; profile: Profile }) {
+    const c = o.profile.credentialResolved;
+    if (!o.providerSessionId || (c && c.kind !== "provider-login")) return undefined;
+    return { argv: [this.cfg.codexPath, "resume", o.providerSessionId], live: false,
+      ...(c?.kind === "provider-login" && c.home ? { env: { CODEX_HOME: expandHome(c.home) } } : {}) };
+  }
 
   async open(spec: SessionSpec): Promise<AgentSession> {
     const opts = spec.profile.options as { effort?: string; wireApi?: string };

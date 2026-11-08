@@ -21,10 +21,17 @@ export interface PluginContext {
   timezone: string;
 }
 
+export interface ScheduledFire {
+  channelKey: string; job: string; text: string; sourceLine: string;
+  deliverTo?: string; raw?: boolean; profile?: string; model?: string;
+}
+
 /** What a scheduler plugin may do (docs §3). */
 export interface SchedulerApi {
-  /** Run a prompt in a channel's session as a scheduled turn. */
-  fire(o: { channelKey: string; job: string; text: string; sourceLine: string; deliverTo?: string; raw?: boolean }): Promise<void>;
+  /** Run a prompt in a session as a scheduled turn. channelKey may be a chat ("telegram:<id>") or an
+   *  internal session name ("heartbeat", "cron:<job>"). deliverTo "none" = don't post the final reply.
+   *  profile pins the session to a profile (sticky); model switches model for this turn only. */
+  fire(o: ScheduledFire): Promise<void>;
   isBusy(channelKey: string): boolean;
   /** Durable per-plugin key/value (e.g. lastFiredAt for catch-up). */
   kvGet(key: string): string | undefined;

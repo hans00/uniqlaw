@@ -93,7 +93,8 @@ test("rate_limit gives up after 3 retries and tells the human", async () => {
 
 test("usage_limit tells the human and fails pending peer asks", async () => {
   const { mgr, platform } = setup((_i, s) => s.emit({ type: "turn_end", turnId: s.turnId(), reason: "error", error: "usage_limit" }));
-  const r = await mgr.ask("tg:-1", "global", "q", true);
+  mgr.runtime("helper"); // internal sessions are reachable once they exist
+  const r = await mgr.ask("tg:-1", "helper", "q", true);
   expect(r.result).toEqual({ ok: false, text: "usage limit reached" });
   void platform; void CAPS;
 });

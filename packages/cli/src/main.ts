@@ -1,9 +1,8 @@
 #!/usr/bin/env bun
-// uniqlaw CLI: init | doctor | start | stop | reload | status | logs | ls | send | trigger | migrate | run | mcp-shim
+// uniqlaw CLI: init | doctor | start | stop | reload | status | logs | ls | send | trigger | workers | worker | attach | run | mcp-shim
 import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { isAlive, listInstances, loadSettings, readRuntime, runForever, stateDirOf } from "@uniqlaw/daemon";
-import { applyMigration, detectRunningV2, planMigration } from "@uniqlaw/migrate-v2";
 
 const USAGE = `uniqlaw <command> [options]
 
@@ -18,11 +17,16 @@ const USAGE = `uniqlaw <command> [options]
   ls                                           list UniQlaw instances on this machine
   send     <target> <text...> [--project DIR]  post text to a chat (e.g. telegram:<chatId>)
   trigger  <target> <prompt...> [--project DIR] make a session answer its own chat
-  migrate  --from <v2 dir> [--project DIR] [--dry-run] [--force]
+  workers  [--project DIR]                     list worker sessions (other coding agents started by sessions)
+  worker   start <name> --profile P [--cwd DIR] [task...]   start a worker (and hand it a task)
+  worker   stop <name> [--forget]              stop a worker (--forget also drops its conversation)
+  attach   <worker|session> [--project DIR]    take over a session in this terminal (claude-tmux: live;
+                                               claude-sdk/codex: resumed in their own CLI, handed back on exit)
+  release  <worker|session> [--project DIR]   end a terminal takeover that didn't hand back (closed terminal, crash)
   mcp-shim                                     stdio⇄HTTP MCP bridge to the gateway (env UNIQLAW_MCP_URL, UNIQLAW_TOKEN)
 `;
 
-const BOOL_FLAGS = new Set(["dry-run", "force", "json", "yes", "no-web", "heartbeat", "allow-empty", "telegram", "discord", "slack", "line"]);
+const BOOL_FLAGS = new Set(["dry-run", "forget", "force", "json", "yes", "no-web", "heartbeat", "allow-empty", "telegram", "discord", "slack", "line"]);
 
 function parse(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
@@ -77,18 +81,14 @@ An empty platform allowlist is refused unless --allow-empty is given.`);
       const available = init.detectProviders();
       if (init.hasV2(projectDir) && !flags.force) {
         console.log(`Found ClaudeClaw v2 config in ${projectDir}.
-To carry it over instead: uniqlaw migrate --from ${projectDir} --project ${projectDir}  (see docs/MIGRATE.md)
+To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code: /uniqlaw:migrate).
 `);
       }
       let answers;
       if (flags.yes) answers = init.answersFromFlags(flags, available);
       else {
         const r = new init.LineReader(process.stdin);
-        if (init.hasV2(projectDir) && await r.yesNo("Migrate the ClaudeClaw v2 setup instead of starting fresh?", true)) {
-          const plan = await planMigration(projectDir);
-          console.log(JSON.stringify(await applyMigration(plan, projectDir, { dryRun: false, force: !!flags.force }), null, 2));
-          process.exit(0);
-        }
+        if (init.hasV2(projectDir) && !await r.yesNo("Set up a fresh UniQlaw config anyway (v2 files are not touched)?", false)) process.exit(0);
         answers = await init.interactiveAnswers(r, available);
       }
       const res = init.writeSettings(projectDir, answers, { force: !!flags.force });
@@ -184,19 +184,56 @@ To carry it over instead: uniqlaw migrate --from ${projectDir} --project ${proje
       console.log(JSON.stringify(await api(projectDir, "/api/trigger", { target, prompt: words.join(" "), fromLabel: "cli" })));
       return;
     }
+    case "workers": {
+      const r = await api(projectDir, "/api/workers");
+      if (!r.ok) throw new Error(String(r.error));
+      const ws = r.workers as { name: string; profile: string; provider: string; state: string; cwd?: string; owner?: string; heldBy?: string }[];
+      if (!ws.length) { console.log("no workers"); return; }
+      for (const w of ws) console.log(`  ${w.name.padEnd(24)} ${w.profile}/${w.provider}  ${w.state}${w.heldBy ? ` (held by ${w.heldBy})` : ""}  ${w.cwd ?? ""}${w.owner ? `  ← ${w.owner}` : ""}`);
+      return;
+    }
+    case "worker": {
+      const [action, name, ...words] = pos;
+      if ((action !== "start" && action !== "stop") || !name) throw new Error("usage: uniqlaw worker start <name> --profile P [--cwd DIR] [task...] | worker stop <name> [--forget]");
+      const cwd = typeof flags.cwd === "string" ? resolve(flags.cwd) : undefined;
+      const r = await api(projectDir, "/api/workers", { action, name, profile: flags.profile, cwd, task: words.join(" ") || undefined, forget: !!flags.forget, fromLabel: "cli" });
+      if (!r.ok) throw new Error(String(r.error));
+      console.log(JSON.stringify(r));
+      return;
+    }
+    case "attach": {
+      const [key] = pos;
+      if (!key) throw new Error("usage: uniqlaw attach <worker|session>");
+      const t = await api(projectDir, "/api/takeover", { key });
+      if (!t.ok) throw new Error(String(t.error));
+      const { argv, cwd, live, env } = t as unknown as { key: string; argv: string[]; cwd: string; live: boolean; env?: Record<string, string> };
+      console.error(live
+        ? `Attaching to ${t.key} (detach with Ctrl-b d; the agent keeps running and the daemon keeps watching).`
+        : `${t.key} is handed to you in ${cwd}. Exit the agent to hand it back to UniQlaw.`);
+      // Our own tmux client must not think it's nested inside the user's tmux.
+      const childEnv: Record<string, string | undefined> = { ...process.env, ...env };
+      delete childEnv.TMUX;
+      process.on("SIGINT", () => {}); // Ctrl-C belongs to the agent; we must survive to release
+      try {
+        const p = Bun.spawn(argv, { cwd, env: childEnv, stdio: ["inherit", "inherit", "inherit"] });
+        await p.exited;
+      } finally {
+        const r = await api(projectDir, "/api/release", { key: t.key }).catch((e) => ({ ok: false, error: String(e) }));
+        console.error(r.ok ? `Released ${t.key} back to UniQlaw.` : `warning: release failed (${String(r.error)}); run \`uniqlaw release ${t.key}\` when the daemon is reachable`);
+      }
+      return;
+    }
+    case "release": {
+      const [key] = pos;
+      if (!key) throw new Error("usage: uniqlaw release <worker|session>");
+      const r = await api(projectDir, "/api/release", { key });
+      if (!r.ok) throw new Error(String(r.error));
+      console.log(r.released ? `Released ${key}.` : `${key} was not held from a terminal.`);
+      return;
+    }
     case "mcp-shim": {
       const { runMcpShim } = await import("./mcp-shim.ts");
       await runMcpShim();
-      return;
-    }
-    case "migrate": {
-      const from = flags.from ? resolve(String(flags.from)) : undefined;
-      if (!from || !existsSync(from)) throw new Error("usage: uniqlaw migrate --from <v2 project dir> [--project DIR] [--dry-run] [--force]");
-      const running = detectRunningV2(from);
-      if (running.running && !flags["dry-run"]) throw new Error(`ClaudeClaw v2 is still running (pid ${running.pid}). Stop it first (/claudeclaw2:stop or kill -TERM ${running.pid}).`);
-      const plan = await planMigration(from);
-      const report = await applyMigration(plan, projectDir, { dryRun: !!flags["dry-run"], force: !!flags.force });
-      console.log(JSON.stringify(report, null, 2));
       return;
     }
     default:

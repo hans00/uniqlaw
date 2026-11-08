@@ -24,7 +24,7 @@ function project(extra: Record<string, unknown> = {}, token = `web-${Math.random
   return dir;
 }
 async function start(dir: string): Promise<Daemon> { const d = await startDaemon(dir); cleanups.push(() => d.stop()); return d; }
-const sendHi = (text = "hello") => instances.at(-1)!.sink!.message({ platform: "tg", channelKey: "global", replyTarget: { platform: "tg", chatId: "100" },
+const sendHi = (text = "hello") => instances.at(-1)!.sink!.message({ platform: "tg", channelKey: "tg:100", replyTarget: { platform: "tg", chatId: "100" },
   ref: { platform: "tg", chatId: "100", messageId: "1" }, sender: { id: "7", name: "Hans" }, trusted: true, multiparty: false, text, attachments: [], receivedAt: Date.now() });
 const until = async (c: () => boolean | Promise<boolean>, ms = 3000) => { const e = Date.now() + ms; while (!(await c())) { if (Date.now() > e) throw new Error("timeout"); await Bun.sleep(20); } };
 
@@ -46,7 +46,7 @@ test("agents, transcript, jobs, logs, stop/reset; v2 endpoints still work", asyn
   sendHi("what's up");
   let entries: { kind: string; text: string }[] = [];
   await until(async () => {
-    entries = ((await (await fetch(`${base}/api/sessions/global/transcript`)).json()) as { entries: typeof entries }).entries;
+    entries = ((await (await fetch(`${base}/api/sessions/tg%3A100/transcript`)).json()) as { entries: typeof entries }).entries;
     return entries.some((e) => e.kind === "turn_end");
   });
   expect(entries.map((e) => e.kind)).toEqual(["prompt", "assistant", "turn_end"]);
@@ -54,7 +54,7 @@ test("agents, transcript, jobs, logs, stop/reset; v2 endpoints still work", asyn
   expect(entries[1]!.text).toBe("echo: Message: what's up");
 
   const agents = (await (await fetch(`${base}/api/agents`)).json()) as { agents: { name: string; providerSessionId: string; lastTarget: { chatId: string }; pending: number }[] };
-  expect(agents.agents.find((a) => a.name === "global")).toMatchObject({ providerSessionId: "p-global", lastTarget: { chatId: "100" }, pending: 0 });
+  expect(agents.agents.find((a) => a.name === "tg:100")).toMatchObject({ providerSessionId: "p-tg:100", lastTarget: { chatId: "100" }, pending: 0 });
 
   const jobs = (await (await fetch(`${base}/api/jobs`)).json()) as { jobs: { name: string; replyTo: string; next: string }[] };
   expect(jobs.jobs[0]).toMatchObject({ name: "standup", replyTo: "tg:100" });
@@ -64,12 +64,12 @@ test("agents, transcript, jobs, logs, stop/reset; v2 endpoints still work", asyn
   expect(logs.lines.length).toBeGreaterThan(0);
   expect(logs.lines.length).toBeLessThanOrEqual(5);
 
-  expect(await (await fetch(`${base}/api/sessions/global/stop`, { method: "POST" })).json()).toMatchObject({ ok: true, stopped: false });
-  expect(await (await fetch(`${base}/api/sessions/global/reset`, { method: "POST" })).json()).toMatchObject({ ok: true });
+  expect(await (await fetch(`${base}/api/sessions/tg%3A100/stop`, { method: "POST" })).json()).toMatchObject({ ok: true, stopped: false });
+  expect(await (await fetch(`${base}/api/sessions/tg%3A100/reset`, { method: "POST" })).json()).toMatchObject({ ok: true });
   expect((await fetch(`${base}/api/sessions/nope/reset`, { method: "POST" })).status).toBe(404);
 
   expect(await (await fetch(`${base}/api/status`)).json()).toMatchObject({ ok: true });
-  expect(await (await fetch(`${base}/api/send`, { method: "POST", body: JSON.stringify({ target: "tg:100", text: "x" }) })).json()).toMatchObject({ ok: true, inboxOwner: "global" });
+  expect(await (await fetch(`${base}/api/send`, { method: "POST", body: JSON.stringify({ target: "tg:100", text: "x" }) })).json()).toMatchObject({ ok: true, inboxOwner: "tg:100" });
 });
 
 test("SSE stream emits state, turn and transcript events", async () => {

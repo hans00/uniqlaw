@@ -46,7 +46,7 @@ describe("webhook + routing", () => {
     expect((await post([textEv(userSrc(OWNER), "x")], "wrong")).status).toBe(401);
     expect((await post([textEv(userSrc(OWNER), "hello")])).status).toBe(200);
     await waitFor(() => inbox.length === 1);
-    expect(inbox[0]).toMatchObject({ channelKey: "global", multiparty: false, trusted: true, addressed: true, text: "hello",
+    expect(inbox[0]).toMatchObject({ channelKey: `line:${OWNER}`, multiparty: false, trusted: true, addressed: true, text: "hello",
       sender: { id: OWNER, name: `Name ${OWNER}` }, replyTarget: { platform: "line", chatId: OWNER } });
   });
 
@@ -60,7 +60,7 @@ describe("webhook + routing", () => {
     ]);
     await waitFor(() => inbox.length === 3);
     expect(inbox.map((m) => [m.channelKey, m.addressed, m.text])).toEqual([
-      [`line:${GROUP}`, false, "hi all"], [`line:${OPEN_GROUP}`, true, "@bot hey"], ["global", true, "[sticker pkg=1 id=2 (happy)]"]]);
+      [`line:${GROUP}`, false, "hi all"], [`line:${OPEN_GROUP}`, true, "@bot hey"], [`line:${OWNER}`, true, "[sticker pkg=1 id=2 (happy)]"]]);
     expect(fake.callsTo(`/v2/bot/group/${GROUP}/member/${FRIEND}`)).toHaveLength(1);
   });
 
@@ -96,7 +96,7 @@ describe("outbound", () => {
     expect(adapter.capabilities.reactions).toBe(false);
     expect(adapter.operatorTargets()).toEqual([{ platform: "line", chatId: OWNER }]);
     expect(adapter.parseTarget(`line:${GROUP}`)).toEqual({ platform: "line", chatId: GROUP });
-    expect(adapter.channelKeyForTarget({ platform: "line", chatId: OWNER })).toBe("global");
+    expect(adapter.channelKeyForTarget({ platform: "line", chatId: OWNER })).toBe(`line:${OWNER}`);
     expect(adapter.channelKeyForTarget({ platform: "line", chatId: GROUP })).toBe(`line:${GROUP}`);
     expect(markdownToPlain("# T\n- a\n```js\ncode\n```")).toBe("T\n• a\ncode");
   });

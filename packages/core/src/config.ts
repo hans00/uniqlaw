@@ -87,6 +87,15 @@ export const settingsSchema = z.object({
     maxHops: z.number().int().positive().default(4),
     askTimeoutSec: z.number().int().positive().default(600),
   }).default({}),
+  /** Worker sessions: other coding agents a session can start in a chosen directory (worker_start). */
+  workers: z.object({
+    /** Directories a worker may run in (it may also use any subdirectory). `~` is expanded.
+     *  Empty = the project directory only. */
+    roots: z.array(z.string()).default([]),
+    /** Profiles a worker may use. Empty = any profile. */
+    profiles: z.array(z.string()).default([]),
+    max: z.number().int().positive().default(8),
+  }).default({}),
   mcpGateway: z.object({ host: z.string().default("127.0.0.1"), port: z.number().int().nonnegative().default(0) }).default({}),
   web: z.object({
     enabled: z.boolean().default(true),

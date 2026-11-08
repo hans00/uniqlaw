@@ -1,15 +1,18 @@
 // Owns all ChannelRuntimes: inbound routing, core slash commands, the message
 // bus (agents_list / agent_ask / agent_trigger / notify) and idle cleanup.
 import type { AgentProvider, Profile } from "./provider.ts";
-import type { RemoteAgent } from "./plugin.ts";
+import type { RemoteAgent, ScheduledFire } from "./plugin.ts";
 import type { InboundMessage, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
 import { ChannelRuntime, type RuntimeHost } from "./runtime.ts";
 import { renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
+import { realpathSync, statSync } from "node:fs";
+import { expandHome } from "./credentials.ts";
+import { isAbsolute, resolve, sep } from "node:path";
 
-export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "platform" | "operatorTargets" | "emit"> {
+export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget"> {
   providers: Map<string, AgentProvider>;
   platforms: Map<string, PlatformAdapter>;
   profiles: Map<string, Profile>;
@@ -17,13 +20,31 @@ export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "platfor
 
 export interface AgentInfo {
   name: string;
+  /** chat: bound to a chat (name is also its notify/trigger target); internal: no chat (heartbeat,
+   *  cron jobs, "global"); a2a: serving a remote A2A caller; remote: a remote A2A agent. */
+  kind: "chat" | "internal" | "a2a" | "remote" | "worker";
   profile: string;
   provider: string;
   state: string;
   multiparty: boolean;
   lastActivityAt: number;
   queue: number;
+  /** Workers: working directory, the session that started it, and who holds it (a human attached). */
+  cwd?: string;
+  owner?: string;
+  heldBy?: string;
 }
+
+/** A worker: a session running some coding agent (profile) in some directory, started by another session. */
+export interface WorkerMeta { cwd: string; profile: string; owner?: string; createdAt: number }
+
+export const WORKER_PREFIX = "worker:";
+const WORKER_NAME = /^[a-z0-9][a-z0-9._-]{0,47}$/;
+
+/** How a human takes over a session in a terminal (provider-specific). */
+export interface TakeoverInfo { key: string; argv: string[]; cwd: string; live: boolean;
+  /** Non-secret env the command needs (e.g. CLAUDE_CONFIG_DIR for an alternate login). */
+  env?: Record<string, string> }
 
 type TaskWaiter = { resolve: (r: { ok: boolean; text: string }) => void };
 
@@ -45,6 +66,16 @@ export class ChannelManager {
       operatorTargets: () => [...deps.platforms.values()].flatMap((p) => p.operatorTargets()),
       onTaskResult: (id, ok, text) => this.completeTask(id, ok, text),
       emit: (ev: RuntimeEvent) => { this.events.emit("event", ev); },
+      isInternal: (k) => this.kindOf(k) === "internal",
+      cwdFor: (k) => deps.store.get(`session-cwd:${k}`),
+      workerOf: (k) => { const m = this.workerMeta(k); return m ? { owner: m.owner } : undefined; },
+      backgroundTarget: (k) => {
+        if (!k.startsWith(WORKER_PREFIX)) return undefined;
+        // Workers have no chat: background output (e.g. a human typing in its terminal) goes to the
+        // chat attached to it, else nowhere (it stays in the transcript).
+        const chat = this.attachedChat(k);
+        return (chat ? this.targetForChannel(chat) : undefined) ?? null;
+      },
     };
     this.events.setMaxListeners(100);
   }
@@ -64,8 +95,18 @@ export class ChannelManager {
 
   addRemoteAgents(list: RemoteAgent[]) { for (const r of list) this.remotes.set(r.name, r); }
 
+  /** Sessions pinned to a profile by a scheduled job/heartbeat (`profile:` option), persisted across restarts. */
+  private pinnedProfile(channelKey: string): string | undefined { return this.deps.store.get(`session-profile:${channelKey}`); }
+
+  kindOf(channelKey: string): AgentInfo["kind"] {
+    if (channelKey.startsWith("a2a:")) return "a2a";
+    if (channelKey.startsWith(WORKER_PREFIX)) return "worker";
+    return this.targetForChannel(channelKey) ? "chat" : "internal";
+  }
+
   profileFor(channelKey: string): Profile {
-    const name = this.profileOverride.get(channelKey) ?? this.deps.settings.bindings.channels[channelKey] ?? this.deps.settings.bindings.default;
+    const name = this.profileOverride.get(channelKey) ?? this.pinnedProfile(channelKey)
+      ?? this.deps.settings.bindings.channels[channelKey] ?? this.deps.settings.bindings.default;
     const p = this.deps.profiles.get(name);
     if (!p) throw new Error(`channel ${channelKey} is bound to unknown profile "${name}"`);
     return p;
@@ -87,6 +128,8 @@ export class ChannelManager {
   async restore() {
     for (const row of this.deps.store.listSessions()) {
       if (!row.providerSessionId || this.runtimes.has(row.channelKey)) continue;
+      // A handoff takeover is still in progress: the human's own CLI owns the conversation.
+      if (this.terminalHold(row.channelKey)?.live === false) continue;
       try { this.runtime(row.channelKey, row.multiparty); } catch (e) { this.deps.log.warn("restore skipped", { key: row.channelKey, e: String(e) }); }
     }
   }
@@ -94,9 +137,14 @@ export class ChannelManager {
   // ── inbound ──────────────────────────────────────────────────────────────
 
   async handleInbound(msg: InboundMessage): Promise<void> {
-    const rt = this.runtime(msg.channelKey, msg.multiparty);
     const platform = this.deps.platforms.get(msg.platform);
     const reply = (t: string) => platform?.send({ ...msg.replyTarget, replyToMessageId: msg.ref.messageId }, t);
+    const att = msg.text.trim().match(/^\/(attach|detach)(?:@\S+)?(?:\s+(\S+))?\s*$/i);
+    if (att && msg.trusted) { await reply(this.chatAttachCommand(msg.channelKey, att[1]!.toLowerCase(), att[2])); return; }
+    // A chat attached to a worker talks to the worker instead of its own session.
+    const attached = this.deps.store.get(`chat-attach:${msg.channelKey}`);
+    const sessionKey = attached && this.workerMeta(attached) ? attached : msg.channelKey;
+    const rt = this.runtime(sessionKey, sessionKey === msg.channelKey ? msg.multiparty : false);
     if (msg.trusted && rt.tryConsumeAwaitedInput(msg.text)) { await reply("✅ Sent to the agent."); return; }
 
     const cmd = msg.text.trim().match(/^\/(stop|new|status|model)(?:@\S+)?(?:\s+(.+))?$/i);
@@ -105,7 +153,7 @@ export class ChannelManager {
       switch (name!.toLowerCase()) {
         case "stop": await reply((await rt.stop()) ? "⏹ Stopped." : "Nothing running."); return;
         case "new": await rt.reset(); await reply("🆕 Started a new session."); return;
-        case "status": await reply(this.statusText(msg.channelKey)); return;
+        case "status": await reply(this.statusText(sessionKey)); return;
         case "model":
           if (!arg) { await reply(`Model: ${rt.profile.model ?? "(provider default)"}`); return; }
           await reply((await rt.setModel(arg.trim())) ? `Model → ${arg.trim()}` : "This provider can't switch models live.");
@@ -129,20 +177,27 @@ export class ChannelManager {
       `profile: ${rt?.profile.name ?? row?.profile ?? "-"} (${rt?.profile.provider ?? row?.provider ?? "-"})`,
       `state: ${rt?.state ?? "closed"} · queue: ${rt?.queueLength ?? 0}`,
       `session: ${row?.providerSessionId ?? "(new)"}`,
+      ...(this.workerMeta(channelKey) ? [`cwd: ${this.workerMeta(channelKey)!.cwd}`, `owner: ${this.workerMeta(channelKey)!.owner ?? "-"}`,
+        `held by: ${this.heldBy(channelKey) ?? "-"}`] : []),
     ].join("\n");
   }
 
   // ── bus ──────────────────────────────────────────────────────────────────
 
   listAgents(): AgentInfo[] {
-    const keys = new Set([...this.deps.store.listSessions().map((s) => s.channelKey), ...this.runtimes.keys()]);
+    const keys = new Set([...this.deps.store.listSessions().map((s) => s.channelKey), ...this.runtimes.keys(),
+      ...this.listWorkers().map((w) => w.key)]);
     return [...keys].map((k): AgentInfo => {
       const rt = this.runtimes.get(k);
       const row = this.deps.store.getSession(k);
-      return { name: k, profile: rt?.profile.name ?? row?.profile ?? "?", provider: rt?.profile.provider ?? row?.provider ?? "?",
+      const w = this.workerMeta(k);
+      const held = w ? this.heldBy(k) : undefined;
+      return { name: k, kind: this.kindOf(k), profile: rt?.profile.name ?? row?.profile ?? w?.profile ?? "?",
+        provider: rt?.profile.provider ?? row?.provider ?? (w ? this.deps.profiles.get(w.profile)?.provider : undefined) ?? "?",
         state: rt?.state ?? "closed", multiparty: rt?.multiparty ?? row?.multiparty ?? false,
-        lastActivityAt: row?.lastActivityAt ?? 0, queue: rt?.queueLength ?? 0 };
-    }).concat([...this.remotes.values()].map((r): AgentInfo => ({ name: r.name, profile: r.description ?? "remote", provider: r.name.split(":")[0] ?? "remote",
+        lastActivityAt: row?.lastActivityAt ?? 0, queue: rt?.queueLength ?? 0,
+        ...(w ? { cwd: w.cwd, ...(w.owner ? { owner: w.owner } : {}), ...(held ? { heldBy: held } : {}) } : {}) };
+    }).concat([...this.remotes.values()].map((r): AgentInfo => ({ name: r.name, kind: "remote", profile: r.description ?? "remote", provider: r.name.split(":")[0] ?? "remote",
       state: "remote", multiparty: false, lastActivityAt: 0, queue: 0 })));
   }
 
@@ -153,14 +208,15 @@ export class ChannelManager {
   }
 
   private resolveAgent(to: string): string {
-    if (this.runtimes.has(to) || this.deps.store.getSession(to)) return to;
+    // Existing sessions: chats, internal sessions (heartbeat, cron:<job>, …), A2A contexts, workers.
+    if (this.runtimes.has(to) || this.deps.store.getSession(to) || this.workerMeta(to)) return to;
+    if (this.workerMeta(WORKER_PREFIX + to)) return WORKER_PREFIX + to;
     // Accept v2 peer names (claudeclaw-discord-123) and "uniqlaw-<key>" forms.
     const m = to.match(/^(?:claudeclaw|uniqlaw)-(.+)$/);
     if (m) {
       const k = m[1]!.replace(/^(telegram|discord|slack|line)-/, "$1:");
-      if (this.runtimes.has(k) || this.deps.store.getSession(k) || k === "global") return k;
+      if (this.runtimes.has(k) || this.deps.store.getSession(k)) return k;
     }
-    if (to === "global") return to;
     // A channel key a platform can address may start a session on demand (v2 trigger semantics).
     if (this.targetForChannel(to)) return to;
     throw new Error(`unknown agent "${to}" — call agents_list`);
@@ -172,6 +228,7 @@ export class ChannelManager {
     if (remote) return this.askRemote(from, remote, message, wait);
     const target = this.resolveAgent(to);
     if (target === from) throw new Error("cannot ask yourself");
+    this.checkNotHeld(target);
     const hop = this.checkHop(from);
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: target, mode: "ask", request: message });
@@ -222,6 +279,7 @@ export class ChannelManager {
   async trigger(from: string, to: string, prompt: string, replyTo?: Target): Promise<{ taskId: string }> {
     if (this.remotes.has(to)) throw new Error(`"${to}" is a remote agent; use agent_ask (remote agents have no chat here to answer on)`);
     const target = this.resolveAgent(to);
+    this.checkNotHeld(target);
     const hop = this.checkHop(from);
     const rt = this.runtime(target);
     const deliverTo = replyTo ?? rt.lastTarget() ?? this.targetForChannel(target);
@@ -256,15 +314,210 @@ export class ChannelManager {
 
   get transcript(): TranscriptStore | undefined { return this.deps.transcript; }
 
-  /** Scheduled turn (cron / heartbeat). deliverTo is a target string like "telegram:<chatId>". */
-  async fireScheduled(o: { channelKey: string; job: string; text: string; sourceLine: string; deliverTo?: string; raw?: boolean }) {
-    const deliverTo = o.deliverTo ? this.parseTargetString(o.deliverTo) : undefined;
-    if (o.deliverTo && !deliverTo) this.deps.log.warn("scheduled job has an unresolvable replyTo; output follows backgroundNotify", { job: o.job, replyTo: o.deliverTo });
+  /** Scheduled turn (cron / heartbeat). deliverTo is a target string like "telegram:<chatId>", or "none". */
+  async fireScheduled(o: ScheduledFire) {
+    if (this.workerMeta(o.channelKey) && this.heldBy(o.channelKey)) {
+      this.deps.log.warn("scheduled job skipped: a human is driving this worker", { job: o.job, key: o.channelKey, by: this.heldBy(o.channelKey) });
+      return;
+    }
+    const silent = o.deliverTo?.trim().toLowerCase() === "none";
+    const deliverTo = o.deliverTo && !silent ? this.parseTargetString(o.deliverTo) : undefined;
+    if (o.deliverTo && !silent && !deliverTo) this.deps.log.warn("scheduled job has an unresolvable replyTo; output follows backgroundNotify", { job: o.job, replyTo: o.deliverTo });
+    if (o.profile) await this.pinProfile(o.channelKey, o.profile, o.job);
     await this.runtime(o.channelKey).enqueue({
-      origin: { kind: "scheduler", job: o.job, deliverTo },
+      origin: { kind: "scheduler", job: o.job, deliverTo, ...(silent ? { silent } : {}), ...(o.model ? { model: o.model } : {}) },
       item: { text: o.text, receivedAt: Date.now(), sourceLine: o.sourceLine, raw: o.raw },
       attachments: [],
     });
+  }
+
+  /** Pin a session to a profile (sticky in state.db). An idle runtime on another profile is
+   *  reopened; a busy one keeps its profile until it is next idle-closed or restarted. */
+  private async pinProfile(channelKey: string, profile: string, job: string) {
+    if (!this.deps.profiles.has(profile)) { this.deps.log.warn("scheduled job names an unknown profile; ignored", { job, profile }); return; }
+    if (this.pinnedProfile(channelKey) !== profile) this.deps.store.set(`session-profile:${channelKey}`, profile);
+    const rt = this.runtimes.get(channelKey);
+    if (!rt || rt.profile.name === profile) return;
+    if (rt.state === "running" || rt.state === "interrupting" || rt.queueLength > 0) {
+      this.deps.log.warn("session is busy; profile change applies after it closes", { key: channelKey, profile });
+      return;
+    }
+    await rt.close();
+    this.runtimes.delete(channelKey);
+  }
+
+  // ── workers ──────────────────────────────────────────────────────────────
+
+  workerMeta(key: string): WorkerMeta | undefined {
+    if (!key.startsWith(WORKER_PREFIX)) return undefined;
+    const v = this.deps.store.get(`worker-meta:${key}`);
+    return v ? (JSON.parse(v) as WorkerMeta) : undefined;
+  }
+
+  listWorkers(): (WorkerMeta & { key: string })[] {
+    return this.deps.store.entries("worker-meta:").map(([k, v]) => ({ key: k.slice("worker-meta:".length), ...(JSON.parse(v) as WorkerMeta) }));
+  }
+
+  private workerKey(name: string): string {
+    const n = name.startsWith(WORKER_PREFIX) ? name.slice(WORKER_PREFIX.length) : name;
+    if (!WORKER_NAME.test(n)) throw new Error(`invalid worker name "${name}" (lowercase letters, digits, . _ -; max 48)`);
+    return WORKER_PREFIX + n;
+  }
+
+  /** Directories workers may use: settings.workers.roots (realpath), default the project dir. */
+  private workerRoots(): string[] {
+    const roots = this.deps.settings.workers.roots.length ? this.deps.settings.workers.roots : [this.deps.projectDir];
+    return roots.flatMap((r) => {
+      try { return [realpathSync(absPath(r, this.deps.projectDir))]; } catch { return []; }
+    });
+  }
+
+  private resolveWorkerCwd(cwd: string): string {
+    let real: string;
+    try { real = realpathSync(absPath(cwd, this.deps.projectDir)); } catch { throw new Error(`directory not found: ${cwd}`); }
+    if (!statSync(real).isDirectory()) throw new Error(`not a directory: ${cwd}`);
+    const roots = this.workerRoots();
+    if (!roots.some((r) => real === r || real.startsWith(r.endsWith(sep) ? r : r + sep))) {
+      throw new Error(`${real} is outside the allowed worker directories (${roots.join(", ") || "none"}); the operator can add it to settings workers.roots`);
+    }
+    return real;
+  }
+
+  /** worker_start: create (or reuse) a worker and optionally hand it a task (agent_ask semantics). */
+  async startWorker(from: string, o: { name: string; profile?: string; cwd?: string; task?: string; wait?: boolean }):
+    Promise<{ worker: string; cwd: string; profile: string; created: boolean; taskId?: string; result?: { ok: boolean; text: string } }> {
+    const key = this.workerKey(o.name);
+    let meta = this.workerMeta(key);
+    let created = false;
+    if (meta) {
+      if (o.profile && o.profile !== meta.profile) throw new Error(`${key} already exists with profile "${meta.profile}"; stop it with forget=true or pick another name`);
+      if (o.cwd && this.resolveWorkerCwd(o.cwd) !== meta.cwd) throw new Error(`${key} already exists in ${meta.cwd}; a worker's directory is fixed — pick another name`);
+    } else {
+      const cfg = this.deps.settings.workers;
+      if (this.listWorkers().length >= cfg.max) throw new Error(`worker limit reached (${cfg.max}); stop one with worker_stop forget=true`);
+      if (!o.profile) throw new Error("profile is required for a new worker");
+      if (!this.deps.profiles.has(o.profile)) throw new Error(`unknown profile "${o.profile}" (have: ${[...this.deps.profiles.keys()].join(", ")})`);
+      if (cfg.profiles.length && !cfg.profiles.includes(o.profile)) throw new Error(`profile "${o.profile}" is not allowed for workers (allowed: ${cfg.profiles.join(", ")})`);
+      const cwd = this.resolveWorkerCwd(o.cwd ?? this.deps.projectDir);
+      meta = { cwd, profile: o.profile, owner: from, createdAt: Date.now() };
+      this.deps.store.set(`worker-meta:${key}`, JSON.stringify(meta));
+      this.deps.store.set(`session-cwd:${key}`, cwd);
+      this.deps.store.set(`session-profile:${key}`, o.profile);
+      created = true;
+      this.deps.log.info("worker created", { key, cwd, profile: o.profile, owner: from });
+    }
+    const base = { worker: key, cwd: meta.cwd, profile: meta.profile, created };
+    if (!o.task) {
+      // Start the agent so a human can attach right away (not while a human holds it).
+      if (!this.heldBy(key)) await this.runtime(key).ensureOpen();
+      return base;
+    }
+    const r = await this.ask(from, key, o.task, o.wait ?? false);
+    return { ...base, ...r };
+  }
+
+  /** worker_stop: close the worker's agent. forget=true also deletes its conversation and record (files are untouched). */
+  async stopWorker(name: string, forget = false): Promise<{ worker: string; forgotten: boolean }> {
+    const key = this.workerKey(name);
+    if (!this.workerMeta(key)) throw new Error(`unknown worker "${name}"`);
+    const by = this.heldBy(key);
+    if (by) throw new Error(`${key} is held by ${by}; wait until the human detaches`);
+    const rt = this.runtimes.get(key);
+    if (rt) { await rt.close(); this.runtimes.delete(key); }
+    if (forget) {
+      for (const k of ["worker-meta", "session-cwd", "session-profile", "hold"]) this.deps.store.del(`${k}:${key}`);
+      for (const [k, v] of this.deps.store.entries("chat-attach:")) if (v === key) this.deps.store.del(k);
+      this.deps.store.deleteSession(key);
+    }
+    return { worker: key, forgotten: forget };
+  }
+
+  private attachedChat(workerKey: string): string | undefined {
+    for (const [k, v] of this.deps.store.entries("chat-attach:")) if (v === workerKey) return k.slice("chat-attach:".length);
+    return undefined;
+  }
+
+  /** Who is driving the worker right now, if a human is (chat key or "terminal"). */
+  heldBy(key: string): string | undefined {
+    return this.terminalHold(key)?.by ?? this.attachedChat(key);
+  }
+
+  /** Terminal takeover in progress (kv, so a daemon restart doesn't reopen a handed-off session). */
+  private terminalHold(key: string): { by: string; live: boolean } | undefined {
+    const v = this.deps.store.get(`hold:${key}`);
+    return v ? (JSON.parse(v) as { by: string; live: boolean }) : undefined;
+  }
+
+  private checkNotHeld(key: string) {
+    const by = this.workerMeta(key) ? this.heldBy(key) : undefined;
+    if (by) throw new Error(`${key} is being driven by a human (${by}); try again after they detach`);
+  }
+
+  private chatAttachCommand(chatKey: string, cmd: string, arg?: string): string {
+    const cur = this.deps.store.get(`chat-attach:${chatKey}`);
+    if (cmd === "detach") {
+      if (!cur) return "This chat is not attached to a worker.";
+      this.deps.store.del(`chat-attach:${chatKey}`);
+      this.noteHumanDone(cur);
+      return `Detached from ${cur}. Messages here go to this chat's own session again.`;
+    }
+    if (!arg) {
+      const ws = this.listWorkers();
+      const lines = ws.map((w) => `• ${w.key} — ${w.profile} in ${w.cwd}${this.heldBy(w.key) ? ` (held by ${this.heldBy(w.key)})` : ""}`);
+      return [cur ? `Attached to ${cur}. /detach to return.` : "Not attached.", ws.length ? "Workers:" : "No workers.", ...lines, "Usage: /attach <worker>"].join("\n");
+    }
+    const key = this.workerKey(arg);
+    if (!this.workerMeta(key)) return `Unknown worker "${arg}". /attach lists them.`;
+    const by = this.heldBy(key);
+    if (by && by !== chatKey) return `${key} is already held by ${by}.`;
+    if (cur && cur !== key) { this.deps.store.del(`chat-attach:${chatKey}`); this.noteHumanDone(cur); }
+    this.deps.store.set(`chat-attach:${chatKey}`, key);
+    const m = this.workerMeta(key)!;
+    return `Attached to ${key} (${m.profile} in ${m.cwd}). Your messages now go to it and its replies come here; /stop, /new, /model, /status apply to it. /detach to return.`;
+  }
+
+  /** Tell the worker's owner a human was driving it (so it doesn't assume nothing changed). */
+  private noteHumanDone(key: string) {
+    const owner = this.workerMeta(key)?.owner;
+    if (owner && this.deps.store.getSession(owner)) {
+      this.deps.store.pushPending(owner, "peer-result", { label: `a human was driving ${key} and has detached`,
+        text: "They may have changed files or given it new instructions; ask it for a summary before relying on earlier results." });
+    }
+  }
+
+  /** `uniqlaw attach`: hold the worker for a human in a terminal and say how to get in.
+   *  live (claude-tmux): attach to the running process. Otherwise the session is closed and the
+   *  provider's own CLI resumes the same conversation; the daemon resumes it after release(). */
+  async takeover(key: string, by = "terminal"): Promise<TakeoverInfo> {
+    const k = this.workerMeta(key) || this.runtimes.has(key) || this.deps.store.getSession(key) ? key
+      : this.workerMeta(WORKER_PREFIX + key) ? WORKER_PREFIX + key : undefined;
+    if (!k) throw new Error(`unknown session or worker "${key}" (see uniqlaw workers / uniqlaw status)`);
+    const held = this.heldBy(k);
+    if (held) throw new Error(`${k} is already held by ${held}`);
+    const rt = this.runtime(k);
+    const provider = this.deps.providers.get(rt.profile.provider)!;
+    const cwd = this.deps.store.get(`session-cwd:${k}`) ?? this.deps.projectDir;
+    if (provider.attachCommand && !this.deps.store.getSession(k)?.providerSessionId) await rt.ensureOpen();
+    const row = this.deps.store.getSession(k);
+    const cmd = provider.attachCommand?.({ instanceId: this.deps.instanceId, sessionId: k, providerSessionId: row?.providerSessionId ?? undefined, cwd, profile: rt.profile });
+    if (!cmd) throw new Error(`${k} (${rt.profile.provider}) can't be taken over in a terminal${provider.attachCommand ? " yet (no conversation to resume — give it a task first)" : ""}; attach from a chat with /attach ${k} instead`);
+    if (!cmd.live) {
+      if (!this.workerMeta(k)) throw new Error(`${k} is a chat session; only workers can be handed to a terminal (claude-tmux sessions can be attached live)`);
+      if (rt.state === "running" || rt.state === "interrupting" || rt.queueLength > 0) throw new Error(`${k} is busy; wait for its turn to finish (or /stop it) before taking over`);
+      await rt.close();
+    }
+    this.deps.store.set(`hold:${k}`, JSON.stringify({ by, live: cmd.live }));
+    this.deps.log.info("takeover", { key: k, by, live: cmd.live });
+    return { key: k, argv: cmd.argv, cwd, live: cmd.live, ...(cmd.env ? { env: cmd.env } : {}) };
+  }
+
+  release(key: string): boolean {
+    const k = this.terminalHold(key) ? key : WORKER_PREFIX + key;
+    if (!this.terminalHold(k)) return false;
+    this.deps.store.del(`hold:${k}`);
+    this.noteHumanDone(k);
+    this.deps.log.info("takeover released", { key: k });
+    return true;
   }
 
   isBusy(channelKey: string): boolean {
@@ -294,6 +547,13 @@ export class ChannelManager {
   }
 
   private deliverAsyncResult(asker: string, answerer: string, taskId: string, hop: number, r: { ok: boolean; text: string }) {
+    // CLI / API callers ("cli", "api") are not sessions: the result stays in the task (task_status).
+    if (!this.runtimes.has(asker) && !this.deps.store.getSession(asker)) return;
+    if (this.workerMeta(asker) && this.heldBy(asker)) {
+      // Don't reopen / interrupt a worker a human is driving: it reads the result on its next turn.
+      this.deps.store.pushPending(asker, "peer-result", { label: `result of your agent_ask ${taskId} to ${answerer}${r.ok ? "" : " (failed)"}`, text: r.text });
+      return;
+    }
     // The result turn keeps the ask's hop, so ask → result → ask ping-pong still hits maxHops.
     void this.runtime(asker).enqueue({
       origin: { kind: "peer", fromSession: answerer, hop, mode: "result", taskId },
@@ -311,4 +571,10 @@ export class ChannelManager {
       }
     }
   }
+}
+
+/** `~` expansion, then relative paths against base. */
+function absPath(p: string, base: string): string {
+  const e = p === "~" ? process.env.HOME ?? p : expandHome(p);
+  return isAbsolute(e) ? e : resolve(base, e);
 }

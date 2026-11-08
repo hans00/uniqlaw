@@ -188,7 +188,7 @@ describe("ChannelRuntime", () => {
     const { mgr, platform } = setup(reply("x"));
     await mgr.notify("tg:-5", "tg:100", "build done");
     expect(platform.sent[0]).toEqual({ target: { platform: "tg", chatId: "100" }, text: "build done" });
-    expect(store.countPending("global")).toBe(1);
+    expect(store.countPending("tg:100")).toBe(1);
   });
 
   test("background output (no origin) goes to the last target", async () => {

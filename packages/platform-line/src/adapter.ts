@@ -1,5 +1,5 @@
 // LINE PlatformAdapter: webhook (signature-verified) + Messaging API. Ported from
-// claudeclaw-v2 platforms/line.ts + daemon.ts routeLine (user → "global",
+// claudeclaw-v2 platforms/line.ts + daemon.ts routeLine (UniQlaw: user → "line:<userId>",
 // group/room → "line:<id>"). Uses the free reply API while a replyToken is fresh,
 // push otherwise. LINE has no edit/delete.
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -9,7 +9,6 @@ import type {
 import { chunkText, downloadTo } from "./download.ts";
 import { markdownToPlain } from "./format.ts";
 
-export const GLOBAL_KEY = "global";
 export const LINE_MSG_LIMIT = 4500;
 /** replyTokens are valid ~1 minute; stay well inside that. */
 const REPLY_TOKEN_TTL_MS = 50_000;
@@ -167,7 +166,7 @@ export class LineAdapter implements PlatformAdapter {
     const fromId = src.userId ?? src.id;
     const inbound: InboundMessage = {
       platform: "line",
-      channelKey: isDM ? GLOBAL_KEY : `line:${src.id}`,
+      channelKey: `line:${src.id}`,
       replyTarget: { platform: "line", chatId: src.id, replyToMessageId: messageId },
       ref: { platform: "line", chatId: src.id, messageId },
       sender: { id: fromId, name: await this.displayName(src, fromId) },
@@ -288,9 +287,9 @@ export class LineAdapter implements PlatformAdapter {
     return m ? { platform: "line", chatId: m[1]! } : undefined;
   }
 
-  /** User ids (U…) are DMs → "global"; groups (C…) and rooms (R…) get their own session. */
+  /** Every source is its own session: users (U…), groups (C…), rooms (R…).*/
   channelKeyForTarget(t: Target): string {
-    return t.chatId.startsWith("U") ? GLOBAL_KEY : `line:${t.chatId}`;
+    return `line:${t.chatId}`;
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────

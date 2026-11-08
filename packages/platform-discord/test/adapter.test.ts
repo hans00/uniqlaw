@@ -44,14 +44,15 @@ describe("gateway + routing", () => {
     expect(adapter.botUser).toBe(fake.botId);
   });
 
-  test("DM → global; guild channel → discord:<id>; multiparty/trusted/addressed", async () => {
+  test("DM → discord:dm:<userId>; guild channel → discord:<id>; multiparty/trusted/addressed", async () => {
     fake.dispatch("MESSAGE_CREATE", { ...msg(OWNER, "hello dm"), guild_id: undefined, channel_id: "555" });
     fake.dispatch("MESSAGE_CREATE", msg(FRIEND, "hi channel"));
     await waitFor(() => inbox.length === 2);
-    expect(inbox[0]).toMatchObject({ channelKey: "global", multiparty: false, trusted: true, addressed: true, text: "hello dm",
+    expect(inbox[0]).toMatchObject({ channelKey: `discord:dm:${OWNER}`, multiparty: false, trusted: true, addressed: true, text: "hello dm",
       replyTarget: { platform: "discord", chatId: "555" }, sender: { id: OWNER, name: "User 111", username: "u111" } });
     expect(inbox[1]).toMatchObject({ channelKey: `discord:${CH}`, multiparty: true, trusted: false, addressed: false });
-    expect(adapter.channelKeyForTarget({ platform: "discord", chatId: "555" })).toBe("global");
+    expect(adapter.channelKeyForTarget({ platform: "discord", chatId: "555" })).toBe(`discord:dm:${OWNER}`);
+    expect(adapter.channelKeyForTarget(adapter.parseTarget(`discord:dm:${OWNER}`)!)).toBe(`discord:dm:${OWNER}`);
     expect(adapter.channelKeyForTarget({ platform: "discord", chatId: CH })).toBe(`discord:${CH}`);
   });
 
@@ -110,7 +111,7 @@ describe("outbound", () => {
     expect(fake.callsTo("POST", new RegExp(`/channels/77${OWNER}/messages`))).toHaveLength(1);
     expect(adapter.parseTarget("discord:123")).toEqual({ platform: "discord", chatId: "123" });
     expect(adapter.parseTarget("telegram:1")).toBeUndefined();
-    expect(adapter.channelKeyForTarget(t!)).toBe("global");
+    expect(adapter.channelKeyForTarget(t!)).toBe(`discord:dm:${OWNER}`);
   });
 
   test("setCommands registers global commands with an args option", async () => {

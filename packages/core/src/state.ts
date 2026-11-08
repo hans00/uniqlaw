@@ -140,6 +140,12 @@ export class StateStore {
   // ── kv ──
   get(k: string): string | undefined { return (this.db.query("SELECT v FROM kv WHERE k = ?").get(k) as { v: string } | null)?.v; }
   set(k: string, v: string) { this.db.query("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(k, v); }
+  del(k: string) { this.db.query("DELETE FROM kv WHERE k = ?").run(k); }
+  /** kv entries whose key starts with prefix (literal match, no LIKE wildcards). */
+  entries(prefix: string): [string, string][] {
+    return (this.db.query("SELECT k, v FROM kv WHERE substr(k, 1, ?) = ? ORDER BY k").all(prefix.length, prefix) as { k: string; v: string }[])
+      .map((r) => [r.k, r.v]);
+  }
 }
 
 function rowToSession(r: Record<string, unknown>): SessionRow {

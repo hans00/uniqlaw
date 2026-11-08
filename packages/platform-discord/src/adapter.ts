@@ -1,5 +1,5 @@
 // Discord PlatformAdapter: Gateway WebSocket + REST. Ported from claudeclaw-v2
-// platforms/discord.ts + daemon.ts routeDiscord (DM → "global", guild → "discord:<id>").
+// platforms/discord.ts + daemon.ts routeDiscord (UniQlaw: DM → "discord:dm:<userId>", guild channel → "discord:<id>").
 import { randomBytes } from "node:crypto";
 import type {
   Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, PlatformAdapter,
@@ -7,7 +7,6 @@ import type {
 } from "@uniqlaw/core";
 import { chunkText, downloadTo, extFromName, kindFromMime, sleep } from "./download.ts";
 
-export const GLOBAL_KEY = "global";
 export const DISCORD_MSG_LIMIT = 1900;
 
 const INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15); // GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT
@@ -61,9 +60,7 @@ export class DiscordAdapter implements PlatformAdapter {
   private pendingCommands: PlatformCommand[] | null = null;
   private readyResolve: (() => void) | null = null;
   private readonly pending = new Map<string, PendingChoice>();
-  /** DM channel ids seen inbound (their inbox owner is "global"). */
-  private readonly dmChannels = new Set<string>();
-  /** user id → DM channel id (for operator targets). */
+  /** user id → DM channel id (operator targets; DM session key "discord:dm:<userId>"). */
   private readonly dmByUser = new Map<string, string>();
 
   constructor(private readonly opts: DiscordAdapterOptions) {
@@ -224,7 +221,6 @@ export class DiscordAdapter implements PlatformAdapter {
       if (ch.requireMention && !mentionsBot && !repliesToBot) return;
       if (ch.ignoreOtherMentions && !mentionsBot && mentions.length > 0) return;
     } else {
-      this.dmChannels.add(channelId);
       this.dmByUser.set(author.id, channelId);
     }
 
@@ -235,7 +231,7 @@ export class DiscordAdapter implements PlatformAdapter {
 
     const inbound: InboundMessage = {
       platform: "discord",
-      channelKey: isDM ? GLOBAL_KEY : `discord:${channelId}`,
+      channelKey: isDM ? `discord:dm:${author.id}` : `discord:${channelId}`,
       replyTarget: { platform: "discord", chatId: channelId, replyToMessageId: String(m.id) },
       ref: { platform: "discord", chatId: channelId, messageId: String(m.id) },
       sender: { id: author.id, name: String(author.global_name ?? author.username ?? author.id),
@@ -265,13 +261,13 @@ export class DiscordAdapter implements PlatformAdapter {
       await this.respondInteraction(i, { type: 4, data: { content: "This channel is not enabled for the bot.", flags: 64 } });
       return;
     }
-    if (isDM) { this.dmChannels.add(channelId); this.dmByUser.set(user.id, channelId); }
+    if (isDM) this.dmByUser.set(user.id, channelId);
     const args = (i.data?.options ?? []).map((o: { value: unknown }) => String(o.value)).join(" ").trim();
     const text = `/${i.data?.name ?? ""}${args ? ` ${args}` : ""}`;
     await this.respondInteraction(i, { type: 4, data: { content: `\`${text}\`` } });
     this.sink?.message({
       platform: "discord",
-      channelKey: isDM ? GLOBAL_KEY : `discord:${channelId}`,
+      channelKey: isDM ? `discord:dm:${user.id}` : `discord:${channelId}`,
       replyTarget: { platform: "discord", chatId: channelId },
       ref: { platform: "discord", chatId: channelId, messageId: String(i.id) },
       sender: { id: user.id, name: String(user.global_name ?? user.username ?? user.id), ...(user.username ? { username: user.username } : {}) },
@@ -435,7 +431,10 @@ export class DiscordAdapter implements PlatformAdapter {
   }
 
   channelKeyForTarget(t: Target): string {
-    return t.chatId.startsWith("dm:") || this.dmChannels.has(t.chatId) ? GLOBAL_KEY : `discord:${t.chatId}`;
+    // DMs are keyed by user id so "discord:dm:<userId>" round-trips through parseTarget.
+    if (t.chatId.startsWith("dm:")) return `discord:${t.chatId}`;
+    for (const [user, ch] of this.dmByUser) if (ch === t.chatId) return `discord:dm:${user}`;
+    return `discord:${t.chatId}`;
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────
@@ -450,7 +449,6 @@ export class DiscordAdapter implements PlatformAdapter {
     if (!r.ok || !r.json?.id) { this.log.error(`discord: could not open DM with ${userId} (${r.status})`); return undefined; }
     const id = String(r.json.id);
     this.dmByUser.set(userId, id);
-    this.dmChannels.add(id);
     return id;
   }
 
