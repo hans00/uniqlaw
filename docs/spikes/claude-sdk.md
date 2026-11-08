@@ -1,5 +1,7 @@
 # claude-sdk spike notes
 
+> The PoC code (`spikes/claude-sdk/`: `poc.ts`, `slash.ts`, `out/`) was removed from the tree; it is in git history (the commit before "chore: prepare for open source").
+
 `poc.ts` drives `query()` in streaming-input mode (an `AsyncIterable<SDKUserMessage>` queue) with
 `settingSources: ["user","project","local"]`, `disallowedTools: ["ListAgents","SendMessage"]`, model haiku.
 `slash.ts` checks slash commands sent as prompts. Results are in `out/result.md`.
@@ -39,4 +41,4 @@
 6. **The MCP bus tools get deferred.** The gateway tool sat behind `ToolSearch` (an extra model hop and an extra token cost). For bus tools, look for an always-load option (the server manifest / `alwaysLoad`) or tell the model the tool names in the system prompt.
 7. **`disallowedTools` works** (35 → 33 tools). But init still exposes `messaging_socket_path`: the native messaging socket is open for **inbound** messages from other Claude sessions on the machine. Peers outside uniqlaw could still `SendMessage` into a uniqlaw session. Investigate disabling it (env/setting) in M1.
 8. **User hooks leak context between sessions.** The user's claude-mem hooks inject "Resumed context from previous session" into any new session in the same cwd, so separate uniqlaw channels sharing one cwd can see each other's history through user hooks. Options: per-profile `settingSources` (drop `user`), per-channel cwd, or accept it and document it.
-9. **Session jsonl is identical** to the TUI's (same `~/.claude/projects/<cwd-hash>/<id>.jsonl`). `setModel` shows up as a `/model` local-command entry. See `../claude-SUMMARY.md` for interop.
+9. **Session jsonl is identical** to the TUI's (same `~/.claude/projects/<cwd-hash>/<id>.jsonl`). `setModel` shows up as a `/model` local-command entry. See `docs/spikes/claude-summary.md` for interop.

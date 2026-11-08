@@ -1,4 +1,4 @@
-// Ported from claudeclaw-v2 src/approval.ts (via spikes/claude-tmux). Pane-snapshot parsers for Claude Code TUI dialogs.
+// Ported from claudeclaw-v2 src/approval.ts (via the M0 claude-tmux spike). Pane-snapshot parsers for Claude Code TUI dialogs.
 /**
  * Detect Claude Code TUI dialogs in a tmux pane snapshot and classify them
  * so the daemon can either auto-handle them or surface them to a trusted

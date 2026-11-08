@@ -1,5 +1,5 @@
 // provider-pi: UniQlaw's own harness for raw LLM APIs, built on the in-process
-// @earendil-works/pi-coding-agent SDK (docs §5.1). Findings: spikes/pi/NOTES.md.
+// @earendil-works/pi-coding-agent SDK (docs §5.1). Findings: docs/spikes/pi.md.
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";

@@ -1,4 +1,4 @@
-// Test MCP gateway (moved from spikes/common). Stand-in for the real gateway (docs §8.3): Streamable HTTP,
+// Test MCP gateway (originally the M0 spike gateway). Stand-in for the real gateway (docs §8.3): Streamable HTTP,
 // per-session token in the URL path, caller identity derived from the token.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";

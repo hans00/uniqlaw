@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      # Unit and contract tests use fake providers and platforms. Tests that drive real
+      # agent CLIs or model APIs are skipped unless UNIQLAW_E2E=1 (never set in CI).
+      - run: bun run test

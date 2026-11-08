@@ -11,14 +11,14 @@
     },
     "packages/claude-common": {
       "name": "@uniqlaw/claude-common",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
       },
     },
     "packages/cli": {
       "name": "@uniqlaw/cli",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "bin": {
         "uniqlaw": "./src/main.ts",
       },
@@ -34,7 +34,7 @@
     },
     "packages/core": {
       "name": "@uniqlaw/core",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.32.0",
         "zod": "^3.25.0",
@@ -42,14 +42,14 @@
     },
     "packages/credentials": {
       "name": "@uniqlaw/credentials",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
       },
     },
     "packages/daemon": {
       "name": "@uniqlaw/daemon",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "@uniqlaw/platform-discord": "workspace:*",
@@ -73,6 +73,7 @@
     },
     "packages/platform-discord": {
       "name": "@uniqlaw/platform-discord",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "zod": "^3.25.0",
@@ -85,6 +86,7 @@
     },
     "packages/platform-line": {
       "name": "@uniqlaw/platform-line",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "zod": "^3.25.0",
@@ -96,6 +98,7 @@
     },
     "packages/platform-slack": {
       "name": "@uniqlaw/platform-slack",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "zod": "^3.25.0",
@@ -109,7 +112,7 @@
     },
     "packages/platform-telegram": {
       "name": "@uniqlaw/platform-telegram",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "zod": "^3.25.0",
@@ -122,7 +125,7 @@
     },
     "packages/provider-acp": {
       "name": "@uniqlaw/provider-acp",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@agentclientprotocol/sdk": "2.2.0",
         "@uniqlaw/core": "workspace:*",
@@ -136,7 +139,7 @@
     },
     "packages/provider-agy": {
       "name": "@uniqlaw/provider-agy",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "@uniqlaw/credentials": "workspace:*",
@@ -148,7 +151,7 @@
     },
     "packages/provider-claude-sdk": {
       "name": "@uniqlaw/provider-claude-sdk",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@anthropic-ai/claude-agent-sdk": "0.3.316",
         "@uniqlaw/claude-common": "workspace:*",
@@ -162,7 +165,7 @@
     },
     "packages/provider-claude-tmux": {
       "name": "@uniqlaw/provider-claude-tmux",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/claude-common": "workspace:*",
         "@uniqlaw/core": "workspace:*",
@@ -174,7 +177,7 @@
     },
     "packages/provider-codex": {
       "name": "@uniqlaw/provider-codex",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "zod": "^3.25.0",
@@ -185,7 +188,7 @@
     },
     "packages/provider-opencode": {
       "name": "@uniqlaw/provider-opencode",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "@uniqlaw/credentials": "workspace:*",
@@ -197,7 +200,7 @@
     },
     "packages/provider-pi": {
       "name": "@uniqlaw/provider-pi",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@earendil-works/pi-ai": "~1.4.0",
         "@earendil-works/pi-coding-agent": "~1.4.0",
@@ -212,7 +215,7 @@
     },
     "packages/scheduler": {
       "name": "@uniqlaw/scheduler",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
         "zod": "^3.25.0",
@@ -220,7 +223,7 @@
     },
     "packages/testkit": {
       "name": "@uniqlaw/testkit",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.32.0",
         "@uniqlaw/core": "workspace:*",
@@ -229,66 +232,13 @@
     },
     "packages/transport-a2a": {
       "name": "@uniqlaw/transport-a2a",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@a2a-js/sdk": "1.3.0",
         "@bufbuild/protobuf": "^2.10.0",
         "@grpc/grpc-js": "^1.14.0",
         "@uniqlaw/core": "workspace:*",
         "zod": "^3.25.0",
-      },
-    },
-    "spikes/acp": {
-      "name": "@uniqlaw-spike/acp",
-      "dependencies": {
-        "@agentclientprotocol/sdk": "2.2.0",
-      },
-    },
-    "spikes/agy": {
-      "name": "@uniqlaw-spike/agy",
-      "dependencies": {
-        "@modelcontextprotocol/sdk": "1.32.2",
-        "zod": "^3",
-      },
-    },
-    "spikes/claude-sdk": {
-      "name": "@uniqlaw-spike/claude-sdk",
-      "dependencies": {
-        "@anthropic-ai/claude-agent-sdk": "0.3.316",
-        "@modelcontextprotocol/sdk": "1.32.2",
-        "zod": "^3",
-      },
-    },
-    "spikes/claude-tmux": {
-      "name": "@uniqlaw-spike/claude-tmux",
-      "dependencies": {
-        "@anthropic-ai/claude-agent-sdk": "0.3.316",
-        "@modelcontextprotocol/sdk": "1.32.2",
-        "zod": "^3",
-      },
-    },
-    "spikes/codex": {
-      "name": "@uniqlaw-spike/codex",
-    },
-    "spikes/common": {
-      "name": "@uniqlaw-spike/common",
-      "dependencies": {
-        "@modelcontextprotocol/sdk": "latest",
-        "zod": "^3",
-      },
-    },
-    "spikes/opencode": {
-      "name": "@uniqlaw-spike/opencode",
-      "dependencies": {
-        "@opencode-ai/sdk": "1.19.5",
-      },
-    },
-    "spikes/pi": {
-      "name": "@uniqlaw-spike/pi",
-      "dependencies": {
-        "@earendil-works/pi-ai": "1.4.0",
-        "@earendil-works/pi-coding-agent": "1.4.0",
-        "typebox": "1.3.27",
       },
     },
   },
@@ -397,8 +347,6 @@
 
     "@modelcontextprotocol/sdk": ["@modelcontextprotocol/sdk@1.32.2", "", { "dependencies": { "@hono/node-server": "^1.19.9 || ^2.0.5", "ajv": "^8.17.1", "ajv-formats": "^3.0.1", "content-type": "^1.0.5", "cors": "^2.8.5", "cross-spawn": "^7.0.5", "eventsource": "^3.0.2", "eventsource-parser": "^3.0.0", "express": "^5.2.1", "express-rate-limit": "^8.2.1", "hono": "^4.11.4", "jose": "^6.1.3", "json-schema-typed": "^8.0.2", "pkce-challenge": "^5.0.0", "raw-body": "^3.0.0", "zod": "^3.25 || ^4.0", "zod-to-json-schema": "^3.25.1" }, "peerDependencies": { "@cfworker/json-schema": "^4.1.1" }, "optionalPeers": ["@cfworker/json-schema"] }, "sha512-SWsVtH/0vULSQStoZ6xxH2K09Li8fXYTMC64ZeogCdpZ3XSi1eCPOByV1OpuJxuI3OcmHhosDWYyii07tpPsLw=="],
 
-    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.19.5", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-+bqu8gHiwmq96T9q5G34uLNHWCInIMsrE3hytCNHj1cVaxjY0AGJyNCT1rkeeZwgPU7A5TMTNwN+0XxCO2vqDg=="],
-
     "@protobufjs/aspromise": ["@protobufjs/aspromise@1.1.2", "", {}, "sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ=="],
 
     "@protobufjs/base64": ["@protobufjs/base64@1.1.2", "", {}, "sha512-AZkcAA5vnN/v4PDqKyMR5lx7hZttPDgClv83E//FMNhR2TMcLUhfRUBHCmSl0oi9zMgDDqRUJkSxO3wm85+XLg=="],
@@ -492,22 +440,6 @@
     "@typescript/typescript-win32-arm64": ["@typescript/typescript-win32-arm64@7.0.2", "", { "os": "win32", "cpu": "arm64" }, "sha512-Gyl1Vy6OsWesLzmq+EP0Fb7b4Nid5232AvcA2SFcdYreldpNtYFFofPjnt62y9hQy7VTaZp65ICJjuAQRaVcIQ=="],
 
     "@typescript/typescript-win32-x64": ["@typescript/typescript-win32-x64@7.0.2", "", { "os": "win32", "cpu": "x64" }, "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="],
-
-    "@uniqlaw-spike/acp": ["@uniqlaw-spike/acp@workspace:spikes/acp"],
-
-    "@uniqlaw-spike/agy": ["@uniqlaw-spike/agy@workspace:spikes/agy"],
-
-    "@uniqlaw-spike/claude-sdk": ["@uniqlaw-spike/claude-sdk@workspace:spikes/claude-sdk"],
-
-    "@uniqlaw-spike/claude-tmux": ["@uniqlaw-spike/claude-tmux@workspace:spikes/claude-tmux"],
-
-    "@uniqlaw-spike/codex": ["@uniqlaw-spike/codex@workspace:spikes/codex"],
-
-    "@uniqlaw-spike/common": ["@uniqlaw-spike/common@workspace:spikes/common"],
-
-    "@uniqlaw-spike/opencode": ["@uniqlaw-spike/opencode@workspace:spikes/opencode"],
-
-    "@uniqlaw-spike/pi": ["@uniqlaw-spike/pi@workspace:spikes/pi"],
 
     "@uniqlaw/claude-common": ["@uniqlaw/claude-common@workspace:packages/claude-common"],
 

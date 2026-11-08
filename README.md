@@ -1,8 +1,12 @@
 # UniQlaw
 
+[![CI](https://github.com/hans00/uniqlaw/actions/workflows/ci.yml/badge.svg)](https://github.com/hans00/uniqlaw/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A multi-channel agent daemon. Each chat — a Telegram DM, a Discord channel, a Slack thread, a LINE group — gets its own long-lived agent session. The agent behind it can be **Claude Code, Codex, OpenCode, Antigravity, any ACP agent, or a plain LLM API** (OpenAI, Anthropic, Gemini, Bedrock, Vertex AI, Azure OpenAI, any OpenAI-compatible endpoint), chosen per profile and per channel.
 
-Successor to ClaudeClaw v2 (Claude-only, tmux-only). Everything is a plugin; features don't disappear when you switch provider.
+Successor to [ClaudeClaw v2](https://github.com/hans00/claudeclaw2) (Claude-only, tmux-only). Everything is a plugin; features don't disappear when you switch provider.
+
+> **Status: early (0.1).** Core features are covered by unit and contract tests and have been run end to end with real Claude Code sessions. Some adapters are less proven; see [Known gaps](#known-gaps). Expect breaking changes to settings before 1.0.
 
 ```
  Telegram ─┐                                              ┌─ claude-tmux / claude-sdk
@@ -39,7 +43,7 @@ Successor to ClaudeClaw v2 (Claude-only, tmux-only). Everything is a plugin; fea
 | `agy` | Antigravity CLI headless | per token | ❌ (queued) | ❌ — pre-allowed commands only | respawn | login lives in the system keyring: all instances share one Google account |
 | `pi` | pi-coding-agent SDK in-process | per token | ✅ | ✅ | live | OpenAI, Anthropic, Gemini, Bedrock, Vertex, Azure, OpenAI-compatible |
 
-Missing capabilities are filled in by the core (e.g. turn-boundary queueing when a provider can't steer) or rejected at startup with a clear message — never silently degraded. Details: [`docs/architecture.md`](docs/architecture.md) §5–§6, §15 (Chinese).
+Missing capabilities are filled in by the core (e.g. turn-boundary queueing when a provider can't steer) or rejected at startup with a clear message — never silently degraded. Details: [`docs/architecture.md`](docs/architecture.md) §5–§6, §15.
 
 ## Platforms
 
@@ -50,7 +54,7 @@ Telegram (long-poll), Discord (Gateway), Slack (Socket Mode), LINE (webhook), pl
 Requirements: [Bun](https://bun.sh) ≥ 1.3, plus the CLI of the provider you pick (`claude` + `tmux`, `codex`, `opencode`, `agy`; `pi` needs nothing extra).
 
 ```bash
-git clone <this repo> ~/Projects/uniqlaw && cd ~/Projects/uniqlaw
+git clone https://github.com/hans00/uniqlaw.git ~/Projects/uniqlaw && cd ~/Projects/uniqlaw
 bun install
 bun link                      # exposes `uniqlaw` on PATH (or use: bun packages/cli/src/main.ts)
 
@@ -64,7 +68,7 @@ uniqlaw status
 
 Coming from ClaudeClaw v2: have your agent follow [`docs/MIGRATE.md`](docs/MIGRATE.md) (`/uniqlaw:migrate` in Claude Code). Stop v2 first, because two pollers on one bot token fight.
 
-As a Claude Code plugin: install this repo as a plugin and use `/uniqlaw:init`, `/uniqlaw:start`, `/uniqlaw:status`, … (`/uniqlaw:help` lists them). The `uniqlaw-agents` skill teaches agents the bus tools.
+As a Claude Code plugin: `/plugin marketplace add hans00/uniqlaw`, then `/plugin install uniqlaw@uniqlaw`, and use `/uniqlaw:init`, `/uniqlaw:start`, `/uniqlaw:status`, … (`/uniqlaw:help` lists them). The `uniqlaw-agents` skill teaches agents the bus tools.
 
 ## CLI
 
@@ -109,10 +113,26 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
 ## Docs
 
 - [`docs/INSTALL.md`](docs/INSTALL.md) — per-provider auth and per-platform bot setup
-- [`docs/MIGRATE.md`](docs/MIGRATE.md) — ClaudeClaw v2 → UniQlaw (Chinese)
-- [`docs/architecture.md`](docs/architecture.md) — design, capability matrix, decisions, milestone status (Chinese)
-- [`docs/spikes/M0-results.md`](docs/spikes/M0-results.md) — provider spike findings (Chinese)
+- [`docs/MIGRATE.md`](docs/MIGRATE.md) — ClaudeClaw v2 → UniQlaw, written for an agent to follow
+- [`docs/architecture.md`](docs/architecture.md) — design, capability matrix, decisions, milestone status
+- [`docs/spikes/M0-results.md`](docs/spikes/M0-results.md) — provider spike findings (historical)
 
 ## Repository layout
 
 `packages/core` (contracts, runtime, bus, MCP gateway), `daemon`, `cli`, `credentials`, `scheduler`, `testkit`, `claude-common`, `provider-*`, `platform-*`, `transport-a2a`. Bun workspaces; `bun test` inside a package, `bun run typecheck` at the root. Real-provider contract tests are gated behind `UNIQLAW_E2E=1`.
+
+## Known gaps
+
+- Telegram, Discord, Slack and LINE are tested against local fakes of their APIs (the end-to-end tests use real agents with a fake Telegram); none has been run against the real service yet.
+- `agy` and `pi` with real models, and ACP agents other than `opencode acp`, have had little live testing.
+- Terminal takeover (`uniqlaw attach`) of a `codex` worker is tested with fakes only; other providers besides `claude-tmux`, `claude-sdk` and `codex` support chat `/attach` only.
+
+Reports and fixes are welcome.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.md), please report privately.
+
+## License
+
+[MIT](LICENSE). Some generated and vendored files carry their own licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

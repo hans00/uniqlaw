@@ -5,3 +5,8 @@ spikes/**/out/
 spikes/*/work/
 packages/*/.work/
 spikes/codex/schema/
+CLAUDE.local.md
+.claude/settings.local.json
+.env
+.env.*
+.DS_Store

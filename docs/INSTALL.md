@@ -4,7 +4,7 @@
 
 ```bash
 curl -fsSL https://bun.sh/install | bash        # Bun ≥ 1.3
-git clone <this repo> ~/Projects/uniqlaw && cd ~/Projects/uniqlaw
+git clone https://github.com/hans00/uniqlaw.git ~/Projects/uniqlaw && cd ~/Projects/uniqlaw
 bun install && bun link                          # `uniqlaw` on PATH
 cd ~/my-agent-project && uniqlaw init && uniqlaw doctor
 ```

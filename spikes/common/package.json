@@ -1,2 +1,0 @@
-{ "name": "@uniqlaw-spike/common", "private": true, "type": "module", "main": "index.ts",
-  "dependencies": { "@modelcontextprotocol/sdk": "latest", "zod": "^3" } }

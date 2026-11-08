@@ -1,5 +1,7 @@
 # claude-tmux spike notes
 
+> The PoC code (`spikes/claude-tmux/`: `poc.ts`, `lib/`, `out/`) was removed from the tree; it is in git history (the commit before "chore: prepare for open source").
+
 `poc.ts` launches the real `claude` TUI in tmux (`uniqlaw-spike-*`, 200×50) with:
 
 ```

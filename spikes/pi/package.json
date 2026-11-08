@@ -1,2 +1,0 @@
-{ "name": "@uniqlaw-spike/pi", "private": true, "type": "module",
-  "dependencies": { "@earendil-works/pi-coding-agent": "1.4.0", "@earendil-works/pi-ai": "1.4.0", "typebox": "1.3.27" } }

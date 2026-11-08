@@ -73,6 +73,7 @@ describe("classify + prompt + mcp + credentials", () => {
     expect(mcpConfigObject("http://x").mcpServers.uniqlaw.alwaysLoad).toBe(true);
   });
   test("credential env", async () => {
+    delete process.env.UQ_TEST_KEY; // other test files in the same `bun test` run may have set it
     expect(await claudeEnvForCredential({ kind: "anthropic-api-key", key: { env: "UQ_TEST_KEY" } }).catch((e) => String(e))).toContain("UQ_TEST_KEY");
     process.env.UQ_TEST_KEY = "k";
     expect(await claudeEnvForCredential({ kind: "anthropic-api-key", key: { env: "UQ_TEST_KEY" } })).toEqual({ ANTHROPIC_API_KEY: "k" });

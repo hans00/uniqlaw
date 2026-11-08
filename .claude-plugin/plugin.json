@@ -1,5 +1,12 @@
 {
   "name": "uniqlaw",
   "version": "0.1.0",
-  "description": "UniQlaw: multi-channel agent daemon — Telegram / Discord / Slack / LINE chats driven by Claude Code, Codex, OpenCode, Antigravity, ACP agents or any LLM API, with a shared message bus and A2A"
+  "description": "UniQlaw: multi-channel agent daemon — Telegram / Discord / Slack / LINE chats driven by Claude Code, Codex, OpenCode, Antigravity, ACP agents or any LLM API, with a shared message bus and A2A",
+  "author": {
+    "name": "Hans",
+    "url": "https://github.com/hans00"
+  },
+  "homepage": "https://github.com/hans00/uniqlaw",
+  "repository": "https://github.com/hans00/uniqlaw",
+  "license": "MIT"
 }

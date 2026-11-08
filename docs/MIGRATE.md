@@ -1,88 +1,88 @@
-# 從 ClaudeClaw v2 遷移到 UniQlaw（給 agent 的作業指南）
+# Migrating from ClaudeClaw v2 to UniQlaw (an agent runbook)
 
-> 這份文件是寫給 **agent**（Claude Code、Codex…）照著做的，不是固定腳本。每個 v2 安裝都不太一樣（舊版留下的 key、手改過的檔案、v1 殘留），由 agent 讀實際檔案、對照下面的對應表、跟使用者確認後再寫入。
+> This document is written for an **agent** (Claude Code, Codex, …) to follow. It is not a fixed script. Every v2 install is a little different (keys left over from older versions, hand-edited files, v1 leftovers), so the agent reads the actual files, maps them using the tables below, and confirms with the user before writing anything.
 >
-> 在 Claude Code 裡：`/uniqlaw:migrate`。
+> In Claude Code: `/uniqlaw:migrate`.
 
-## 鐵則
+## Hard rules
 
-1. **兩個程式不能同時用同一個 bot token。** Telegram 只允許一個 long-poller，Discord/Slack 也會重複回覆。寫入前、啟動前，v2 一定要先停掉。
-2. **v2 的檔案只讀不改**（`.claude/claudeclaw/`、`prompts/`、`CLAUDE.md`）。所有輸出都寫在 `.uniqlaw/`，要退回 v2 時才能直接退。
-3. **不要把 token / secret 印出來**（包括摘要、diff、log）。提到時只說「telegram.token：已複製」之類。
-4. **先給使用者看計畫，確認後才寫入**；`.uniqlaw/settings.json` 已存在時，先比對差異再問要不要覆蓋。
-5. 寫完一定要跑 `uniqlaw doctor` 檢查。
+1. **Two programs must never use the same bot token at the same time.** Telegram allows only one long-poller, and Discord/Slack will reply twice. Stop v2 before writing and before starting UniQlaw.
+2. **Treat v2 files as read-only** (`.claude/claudeclaw/`, `prompts/`, `CLAUDE.md`). Write all output under `.uniqlaw/`, so rolling back to v2 stays a no-op.
+3. **Never print tokens or secrets** (including in summaries, diffs and logs). When you mention one, say only something like "telegram.token: copied".
+4. **Show the user the plan first and write only after they confirm.** If `.uniqlaw/settings.json` already exists, diff it first and ask whether to overwrite.
+5. Always run `uniqlaw doctor` after writing.
 
-## 0. 前置檢查
+## 0. Preflight
 
-假設 v2 專案在 `$V2`（通常就是要跑 UniQlaw 的同一個目錄，例如 `~/claudeclaw`）。
+Assume the v2 project is at `$V2` (usually the same directory UniQlaw will run in, for example `~/claudeclaw`).
 
-- `$V2/.claude/claudeclaw/settings.json` 存在才是 v2 專案。
-- v2 是否在跑：`$V2/.claude/claudeclaw/daemon.pid` 裡的 pid 是否還活著（`kill -0 <pid>`）。在跑的話可以先讀、先做計畫，但**寫入前請使用者停掉**（`/claudeclaw2:stop` 或 `kill -TERM <pid>`）。
-- 看到 `$V2/.claude/claudeclaw/session.json`，或 `sessions.json` 是 `{ "threads": … }` 這種 v1 形狀：那是 v1 殘留。先請使用者用 v2 的 `/claudeclaw2:migrate` 升到 v2；這份指南不處理 v1。
+- It is a v2 project only if `$V2/.claude/claudeclaw/settings.json` exists.
+- Check whether v2 is running: is the pid in `$V2/.claude/claudeclaw/daemon.pid` still alive (`kill -0 <pid>`)? If it is running, you may read and plan, but **ask the user to stop it before writing** (`/claudeclaw2:stop` or `kill -TERM <pid>`).
+- If you see `$V2/.claude/claudeclaw/session.json`, or `sessions.json` has the v1 shape `{ "threads": … }`, those are v1 leftovers. Ask the user to upgrade to v2 first with v2's `/claudeclaw2:migrate`. This guide does not handle v1.
 
-## 1. 要讀的 v2 檔案
+## 1. v2 files to read
 
-| v2 檔案 | 內容 | 去處 |
+| v2 file | Contents | Destination |
 |---|---|---|
-| `.claude/claudeclaw/settings.json` | 全部設定 | `.uniqlaw/settings.json`（§2） |
-| `.claude/claudeclaw/sessions.json` | channelKey → Claude session | `.uniqlaw/state.db` 的 `sessions` 表（§3） |
-| `.claude/claudeclaw/inbox/*.jsonl` | 還沒送進 session 的訊息 | `state.db` 的 `pending_input`（§4，可選） |
-| `.claude/claudeclaw/jobs/*.md` | cron 工作 | 複製到 `.uniqlaw/jobs/`（格式相同） |
-| `prompts/**` | IDENTITY / USER / SOUL… | 同目錄就不用動；不同目錄時複製過去 |
-| `CLAUDE.md` | 專案指示 | 不用動，claude 會從 cwd 自己讀 |
+| `.claude/claudeclaw/settings.json` | All settings | `.uniqlaw/settings.json` (§2) |
+| `.claude/claudeclaw/sessions.json` | channelKey → Claude session | `sessions` table in `.uniqlaw/state.db` (§3) |
+| `.claude/claudeclaw/inbox/*.jsonl` | Messages not yet delivered to a session | `pending_input` in `state.db` (§4, optional) |
+| `.claude/claudeclaw/jobs/*.md` | Cron jobs | Copy to `.uniqlaw/jobs/` (same format) |
+| `prompts/**` | IDENTITY / USER / SOUL… | No change if it is the same directory; otherwise copy it over |
+| `CLAUDE.md` | Project instructions | No change; claude reads it from the cwd itself |
 
-## 2. settings.json 對應表
+## 2. settings.json mapping
 
-UniQlaw 的完整 schema 在 `packages/core/src/config.ts`；各 plugin 的設定在各自 package 的 `configSchema`。v2 沒寫的欄位就讓 UniQlaw 用預設值，不要硬填。
+The full UniQlaw schema is in `packages/core/src/config.ts`; each plugin's settings are in the `configSchema` of its own package. For fields v2 does not set, let UniQlaw use its defaults. Do not fill them in.
 
-| v2 | UniQlaw | 備註 |
+| v2 | UniQlaw | Notes |
 |---|---|---|
-| `timezone` | `timezone` | 照抄。v2 的 `"UTC+8"` 這種格式 cron 讀得懂，但建議問使用者要不要改成 IANA 名稱（`"Asia/Taipei"`） |
-| `model` | `profiles.main.model` | `profiles.main.provider` 用 `"claude-tmux"`（行為跟 v2 一樣） |
-| `agentic`（modes、hysteresis…） | `profiles.main.options.agentic` | 整個區塊照抄，模型路由直接讀這個格式 |
-| `security.level` | `profiles.main.permissions.level` | locked / strict / moderate / unrestricted，其他值當 moderate |
+| `timezone` | `timezone` | Copy as is. cron understands v2 formats like `"UTC+8"`, but ask the user whether to switch to an IANA name (`"Asia/Taipei"`) |
+| `model` | `profiles.main.model` | Set `profiles.main.provider` to `"claude-tmux"` (same behavior as v2) |
+| `agentic` (modes, hysteresis…) | `profiles.main.options.agentic` | Copy the whole block; model routing reads this format directly |
+| `security.level` | `profiles.main.permissions.level` | locked / strict / moderate / unrestricted; treat any other value as moderate |
 | `security.allowedTools` / `disallowedTools` | `permissions.allowTools` / `denyTools` | |
-| `security.skipPermissions: true` | `permissions.approval.mode: "auto-allow"` | 要跟使用者講清楚：所有工具都自動核准 |
-| `approval.enabled: false` | `permissions.approval.mode: "auto-deny"` | v2 會讓對話框一直掛著，UniQlaw 改成直接拒絕 |
-| 其他情況 | `permissions.approval.mode: "ask-operator"` | |
+| `security.skipPermissions: true` | `permissions.approval.mode: "auto-allow"` | Tell the user clearly: every tool is approved automatically |
+| `approval.enabled: false` | `permissions.approval.mode: "auto-deny"` | v2 left the dialog hanging; UniQlaw denies instead |
+| Any other case | `permissions.approval.mode: "ask-operator"` | |
 | `approval.timeoutSeconds` | `permissions.approval.timeoutSec` | |
-| `approval.survey` | （不用） | claude-tmux 自己處理（預設略過） |
-| `queue.mode` | `queue.mode` | **`"native"` → `"steer"`**（v2 的 native 其實就是 mid-turn steer）；其他值 queue / interrupt 照抄 |
-| `queue.debounceMs` / `cap` / `dropPolicy` | 同名 | |
-| `sessionCleanup.*` | `sessionCleanup.*` | 同名 |
+| `approval.survey` | (unused) | claude-tmux handles it itself (skipped by default) |
+| `queue.mode` | `queue.mode` | **`"native"` → `"steer"`** (v2's native is really mid-turn steer); copy other values (queue / interrupt) as is |
+| `queue.debounceMs` / `cap` / `dropPolicy` | Same names | |
+| `sessionCleanup.*` | `sessionCleanup.*` | Same names |
 | `backgroundNotify.mode` | `backgroundNotify.mode` | last / all / off |
-| `web.enabled` / `host` / `port` | `web.*` | 沿用 v2 的 4632，舊 skill 打的 `/api/send`、`/api/trigger` 就能照用 |
-| `telegram.messageStream.mode` | `output.stream` | UniQlaw 是全域設定；其他平台的 `messageStream` 留在各自的 plugin 區塊裡 |
-| `telegram.token` | `plugins.telegram.token` | 見下方「secret」 |
-| `telegram.allowedUserIds` | `plugins.telegram.allowedUserIds` | 轉成字串陣列。**空的就要問使用者**（見下方） |
+| `web.enabled` / `host` / `port` | `web.*` | Keep v2's 4632 so old skills calling `/api/send` and `/api/trigger` keep working |
+| `telegram.messageStream.mode` | `output.stream` | Global in UniQlaw; other platforms' `messageStream` stays in their own plugin block |
+| `telegram.token` | `plugins.telegram.token` | See "Secrets" below |
+| `telegram.allowedUserIds` | `plugins.telegram.allowedUserIds` | Convert to a string array. **If it is empty, ask the user** (see below) |
 | `telegramPollSeconds` | `plugins.telegram.pollSeconds` | |
-| `discord` / `slack` / `line` 區塊 | `plugins.discord` / `plugins.slack` / `plugins.line` | 整塊照抄（adapter 接受 v2 的欄位名稱），再加上 `enabled`；有 token 才搬 |
-| `heartbeat` | `plugins.heartbeat` | 照抄；`enabled` 依 v2 原本的值，或問使用者。**注意**：v2 的 heartbeat 跑在 `global`（就是私訊那段對話），UniQlaw 預設跑在自己的內部 session `heartbeat`，看不到私訊裡交代的事。要沿用 v2 行為，就把 `target` 設成使用者的私訊 key（例如 `telegram:<id>`）；要用獨立 session 的話，建議設 `replyTo` 指向使用者，或設 `"none"` 讓它自己用 `notify` / `agent_trigger` 決定要不要講 |
-| `jobs/*.md` | `plugins.cron` | cron 預設就開，不用寫。**注意**：v2 的 job 沒寫 `target` 時跑在 `global`（私訊），UniQlaw 沒寫時跑在 job 自己的內部 session `cron:<job>`。如果某個 job 需要私訊的對話 context，就在那個 job 檔加上 `target: telegram:<id>`（問使用者） |
-| `api`、`fallback`、`sessionTimeoutMs` | （不用） | v1 時代留下的 key，告訴使用者被略過了 |
-| 其他沒看過的 key | （不用） | 列給使用者看，不要猜 |
+| `discord` / `slack` / `line` blocks | `plugins.discord` / `plugins.slack` / `plugins.line` | Copy the whole block (the adapters accept v2 field names), then add `enabled`; migrate only if there is a token |
+| `heartbeat` | `plugins.heartbeat` | Copy as is; set `enabled` from v2's value, or ask the user. **Note**: v2's heartbeat runs in `global` (the DM conversation), while UniQlaw runs it by default in its own internal session `heartbeat`, which cannot see what the user said in DMs. To keep v2 behavior, set `target` to the user's DM key (for example `telegram:<id>`). To use a separate session, set `replyTo` to the user, or set it to `"none"` and let the heartbeat decide via `notify` / `agent_trigger` whether to speak |
+| `jobs/*.md` | `plugins.cron` | cron is on by default; nothing to write. **Note**: a v2 job without `target` runs in `global` (DMs), while in UniQlaw it runs in the job's own internal session `cron:<job>`. If a job needs the DM conversation context, add `target: telegram:<id>` to that job file (ask the user) |
+| `api`, `fallback`, `sessionTimeoutMs` | (unused) | Keys left over from v1; tell the user they were skipped |
+| Any other unknown key | (unused) | List them for the user; do not guess |
 
-最後加上 `"bindings": { "default": "main" }`。
+Finally, add `"bindings": { "default": "main" }`.
 
-**allowlist（最重要）**：v2 的空 `allowedUserIds` 代表「所有人都可以」，UniQlaw 的空清單代表「**所有人都拒絕**」（fail closed）。只要有平台的清單是空的，就要停下來問使用者要放哪些 user id。不要自己填，也不要為了讓它能動就留空。使用者也不知道的話，先把該平台設成 `enabled: false`。
+**Allowlist (most important)**: in v2 an empty `allowedUserIds` means "everyone is allowed"; in UniQlaw an empty list means "**everyone is denied**" (fail closed). If any platform's list is empty, stop and ask the user which user ids to add. Do not fill them in yourself, and do not leave the list empty just to make things work. If the user does not know either, set that platform to `enabled: false` for now.
 
-**secret**：token 可以照抄成字串（schema 接受），但建議使用者改成 SecretRef，例如 `{"env": "TELEGRAM_BOT_TOKEN"}`、`{"file": "~/.config/uniqlaw/tg"}`、`{"command": "pass show tg"}`。要改的話，請使用者自己設定環境變數或檔案，agent 不要經手 token 的值。
+**Secrets**: tokens may be copied as plain strings (the schema accepts them), but recommend that the user switch to a SecretRef, for example `{"env": "TELEGRAM_BOT_TOKEN"}`, `{"file": "~/.config/uniqlaw/tg"}`, `{"command": "pass show tg"}`. If they switch, have the user set up the environment variable or file themselves. The agent must not handle the token value.
 
-寫完先驗證 schema（不會印出內容）：
+After writing, validate the schema (this does not print the contents):
 
 ```bash
 bun -e 'import {parseSettings} from "<repo>/packages/core/src/config.ts"; parseSettings(JSON.parse(await Bun.file(".uniqlaw/settings.json").text())); console.log("ok")'
 ```
 
-## 3. 接回 v2 的 Claude session
+## 3. Reattach v2's Claude sessions
 
-v2 的 `sessions.json` 長這樣（key 就是 channelKey：`global`、`telegram:<chatId>`、`discord:<channelId>`、`slack:<channel>[:<thread>]`、`line:<id>`）：
+v2's `sessions.json` looks like this (each key is a channelKey: `global`, `telegram:<chatId>`, `discord:<channelId>`, `slack:<channel>[:<thread>]`, `line:<id>`):
 
 ```json
 { "telegram:-100123": { "sessionId": "<uuid>", "tmuxSession": "claudeclaw-…", "createdAt": "…", "lastActivityAt": "…", "multiparty": true } }
 ```
 
-每一筆寫成 `state.db` 的一列 session，`provider` 是 `claude-tmux`，`providerSessionId` 是 v2 的 `sessionId`。`state.db` 已經有同一個 channelKey 的話就跳過，不要覆蓋。範例（依實際內容調整）：
+Write each entry as one session row in `state.db`, with `provider` set to `claude-tmux` and `providerSessionId` set to v2's `sessionId`. If `state.db` already has the same channelKey, skip it; do not overwrite. Example (adjust to the actual contents):
 
 ```bash
 bun -e '
@@ -106,41 +106,41 @@ for (const [key, v] of Object.entries(v2)) {
 store.close();'
 ```
 
-**v2 的 `global`（私訊）要改名。** v2 把所有私訊收斂到 `global`；UniQlaw 的每個私訊都是自己的 session（`telegram:<userId>`、`discord:dm:<userId>`、`slack:dm:<userId>`、`line:<userId>`），所以照抄的話，沒有任何私訊會再進到 `global`。匯入時：
+**Rename v2's `global` (DM) session.** v2 funnels all DMs into `global`; in UniQlaw every DM is its own session (`telegram:<userId>`, `discord:dm:<userId>`, `slack:dm:<userId>`, `line:<userId>`), so if you copy it as is, no DM will reach `global` again. When importing:
 
-- 只有一個人在私訊 bot（通常就是 `allowedUserIds` 只有一個 id）：把 `global` 那一列的 channelKey 改成那個人的私訊 key（例如 `telegram:<那個 id>`），`lastTarget` 也指向他。這樣他下一次私訊就會接回原本的對話。
-- 有好幾個人：問使用者要把舊對話接給誰；其他人從新的 session 開始。
-- 使用者不想接：就照抄成 `global`，它會變成一個內部 session（`agents_list` 看得到，可以 `agent_ask` 它），但不會再收到私訊。
+- Only one person DMs the bot (usually `allowedUserIds` has a single id): change the `global` row's channelKey to that person's DM key (for example `telegram:<that id>`) and point `lastTarget` at them too. Their next DM then resumes the original conversation.
+- Several people: ask the user who should inherit the old conversation; everyone else starts a new session.
+- The user does not want to reattach it: copy it as `global`. It becomes an internal session (visible in `agents_list`, reachable with `agent_ask`), but it no longer receives DMs.
 
-第一則訊息進來時，claude-tmux 會在 UniQlaw 自己的 tmux socket（`tmux -L uniqlaw-<instanceId>`）用 `--resume <sessionId>` 接回對話。v2 留下的 tmux session 如果還在跑同一個 session，會先被關掉，避免兩個 claude 寫同一個 jsonl。對話歷史都在 `~/.claude/projects/*/<sessionId>.jsonl`，不會遺失。
+When the first message arrives, claude-tmux resumes the conversation with `--resume <sessionId>` on UniQlaw's own tmux socket (`tmux -L uniqlaw-<instanceId>`). If a tmux session left over from v2 is still running the same session, it is closed first so that two claude processes never write to the same jsonl. Conversation history lives in `~/.claude/projects/*/<sessionId>.jsonl` and is not lost.
 
-## 4. inbox（可選）
+## 4. Inbox (optional)
 
-`inbox/*.jsonl` 是 v2 還沒送進 session 的訊息（檔名是 channelKey，`:` 換成 `_`，例如 `telegram_-100123.jsonl` → `telegram:-100123`；slack 的 `_` 都還原成 `:`）。通常是空的或是很舊的東西，先把筆數和時間給使用者看，問要不要帶過去。要的話，每行寫一筆：
+`inbox/*.jsonl` holds messages v2 had not yet delivered to a session (the filename is the channelKey with `:` replaced by `_`, for example `telegram_-100123.jsonl` → `telegram:-100123`; for slack, turn every `_` back into `:`). It is usually empty or stale. Show the user the count and timestamps first, and ask whether to carry them over. If yes, write one entry per line:
 
 ```ts
 store.pushPending(channelKey, "external", { source: "v2-inbox", ts, kind, from, text, note });
 ```
 
-下一輪對話開始時，runtime 會用 v2 的格式（「you sent…」、「trigger response…」）把它們放進 prompt。
+At the start of the next turn, the runtime puts them into the prompt using v2's format ("you sent…", "trigger response…").
 
-## 5. 驗證、啟動
+## 5. Verify and start
 
 ```bash
-uniqlaw doctor --project "$V2"   # 工具、憑證、port、bot token 衝突、v2 是否還在跑
+uniqlaw doctor --project "$V2"   # tools, credentials, port, bot token conflicts, whether v2 is still running
 uniqlaw start  --project "$V2"
 uniqlaw status --project "$V2"
 uniqlaw logs   --project "$V2"
 ```
 
-最後跟使用者回報：搬了什麼、略過什麼（還有原因）、哪些需要他們自己處理（allowlist、SecretRef、時區）。
+Finally, report to the user: what was migrated, what was skipped (and why), and what they need to handle themselves (allowlist, SecretRef, timezone).
 
-## 退回 v2
+## Rolling back to v2
 
-v2 的檔案完全沒動，所以：
+v2's files were never touched, so:
 
 ```bash
 uniqlaw stop --project "$V2"
-tmux -L uniqlaw-<instanceId> kill-server   # instanceId 見 `uniqlaw status`
-# 再用 /claudeclaw2:start 啟動 v2
+tmux -L uniqlaw-<instanceId> kill-server   # instanceId: see `uniqlaw status`
+# then start v2 with /claudeclaw2:start
 ```

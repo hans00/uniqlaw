@@ -4,7 +4,7 @@ Surface: `codex app-server` (codex-cli 0.166.0), newline-delimited JSON-RPC 2.0 
 Authoritative types: `codex app-server generate-ts --out schema` (generated into `schema/`, 664 v2 files).
 README (`readme.md`, fetched from openai/codex main) has almost nothing on steer/approvals; the generated types and the experiments are the evidence.
 
-Files: `rpc.ts` (JSON-RPC client), `poc.ts` (scenarios; `bun poc.ts [S1..S7]`), `probe.ts` (model/list), `run1.log`, `out-run2.log`, `out/` (events/raw/result).
+Files: `rpc.ts` (JSON-RPC client), `poc.ts` (scenarios; `bun poc.ts [S1..S7]`), `probe.ts` (model/list), `run1.log`, `out-run2.log`, `out/` (events/raw/result). These files (under `spikes/codex/`) were removed from the tree; they are in git history (the commit before "chore: prepare for open source").
 
 ## Handshake
 

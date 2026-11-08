@@ -1,7 +1,7 @@
 # M0 summary: Claude adapters (claude-sdk + claude-tmux)
 
 Date 2026-11-02 · Claude Code 2.1.316 · Agent SDK 0.3.316 · model haiku.
-Details: `claude-sdk/{out/result.md,NOTES.md}`, `claude-tmux/{out/result.md,NOTES.md}`.
+Details: `docs/spikes/claude-sdk.md`, `docs/spikes/claude-tmux.md`. The raw results (`spikes/claude-sdk/out/result.md`, `spikes/claude-tmux/out/result.md`) are in git history (the commit before "chore: prepare for open source").
 All 7 standard scenarios pass on both adapters.
 
 ## (0) Session interop: ✅ both directions

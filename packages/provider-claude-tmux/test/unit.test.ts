@@ -37,7 +37,7 @@ describe("pane heuristics", () => {
       "    touch /tmp/x",
       "  Do you want to proceed?",
       "❯ 1. Yes",
-      "  2. Yes, and always allow access to /home/hans/Projects/very/long/path",
+      "  2. Yes, and always allow access to /home/user/projects/very/long/path",
       "     from this project",
       "  3. No, and tell Claude what to do differently (esc)",
       "",
