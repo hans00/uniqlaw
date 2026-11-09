@@ -13,6 +13,7 @@ Inside UniQlaw every session (whatever its provider: Claude Code, Codex, OpenCod
 |---|---|---|
 | another session (or remote A2A agent) to answer **you** | `agent_ask` | only you |
 | a human to read **text you wrote** | `notify` | that chat, verbatim |
+| a human to get **a file** (image, audio, voice note, document) | `send_file` | your chat, or the target you pass |
 | another session to answer **its own human** | `agent_trigger` | that session's chat |
 | to run something later / repeatedly | `cron_save` | wherever the job's `replyTo` points |
 
@@ -24,6 +25,7 @@ One-line rule: a human must see an agent-composed reply on another chat → `age
 - `agent_ask(to, message, wait?)` — the other session runs a normal turn; its final answer comes back to you. `wait` defaults to true (blocks until done, with a timeout). `wait:false` returns a `taskId` and the answer arrives later as a new message in your session. Works for remote `a2a:*` agents too.
 - `agent_trigger(to, prompt, replyTo?)` — the other session runs a turn and its reply is posted to its own chat. For an internal session (no chat) pass `replyTo: {platform, chatId}`. Not available for remote agents. You get the reply text later as activity context.
 - `notify(target, text)` — sends your text to `telegram:<chatId>`, `discord:<channelId>`, `slack:<channel>[:<threadTs>]` or `line:<id>`. The session that owns that chat sees "sent on your behalf" next turn.
+- `send_file(path, target?, caption?, kind?, name?)` — posts a local file. `target` defaults to your own chat; otherwise the same targets as `notify`. `kind` (`image` / `audio` / `voice` / `video` / `file`) defaults from the extension (`.ogg` / `.opus` → voice note). The file must be inside the project, your working directory, the temp dir or the operator's `files.roots`. Never call Telegram / Discord / Slack APIs yourself. LINE can't receive files this way yet.
 - `task_status(taskId)` — state/result of an ask or trigger you started (or received).
 - `worker_start(name, profile?, cwd?, task?, wait?)` — run another coding agent (a configured profile: Claude Code, Codex, …) in a directory on this machine and hand it a task. It becomes `worker:<name>` (`kind: "worker"` in `agents_list`, with `cwd` / `owner` / `heldBy`). `wait` defaults to false: you get a `taskId`, and its report arrives later as a new message. Follow up with `agent_ask` to `worker:<name>`; reusing the name continues its conversation. `cwd` must be inside the allowed worker directories (your system prompt lists them and the allowed profiles), and it is fixed per worker. Its permission prompts go to your human. While a human has taken it over (`/attach` in chat or `uniqlaw attach` in a terminal), it refuses your messages; you get a note when they leave.
 - `worker_stop(name, forget?)` — stop its process. The conversation is kept unless `forget: true`; files are never touched.

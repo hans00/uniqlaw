@@ -11,6 +11,7 @@ export function startFakeSlack(opts: { botUserId?: string; botId?: string } = {}
   let ts = 1700000000;
   let env = 0;
   const files = new Map<string, Uint8Array>();
+  const uploads: { id: string; name: string; size: number }[] = [];
   let port = 0;
   const server = Bun.serve({
     port: 0, hostname: "127.0.0.1",
@@ -22,12 +23,18 @@ export function startFakeSlack(opts: { botUserId?: string; botId?: string } = {}
         const f = files.get(url.pathname.slice(7));
         return f ? new Response(Buffer.from(f)) : new Response("nf", { status: 404 });
       }
+      if (url.pathname.startsWith("/upload/")) {
+        const f = (await req.formData()).get("file") as File | null;
+        uploads.push({ id: url.pathname.slice(8), name: f?.name ?? "", size: f?.size ?? 0 });
+        return new Response("OK");
+      }
       const m = url.pathname.match(/^\/api\/([\w.]+)$/);
       if (!m) return new Response("nf", { status: 404 });
       const method = m[1]!;
       const token = (req.headers.get("authorization") ?? "").replace("Bearer ", "");
       const text = await req.text();
-      const body = text && req.headers.get("content-type")?.includes("json") ? JSON.parse(text) : {};
+      const ctype = req.headers.get("content-type") ?? "";
+      const body = !text ? {} : ctype.includes("json") ? JSON.parse(text) : ctype.includes("urlencoded") ? Object.fromEntries(new URLSearchParams(text)) : {};
       calls.push({ method, token, body });
       const ok = (o: Record<string, unknown> = {}) => Response.json({ ok: true, ...o });
       switch (method) {
@@ -35,6 +42,7 @@ export function startFakeSlack(opts: { botUserId?: string; botId?: string } = {}
         case "apps.connections.open": return token === "xapp-test" ? ok({ url: `ws://127.0.0.1:${port}/socket` }) : Response.json({ ok: false, error: "invalid_auth" });
         case "users.info": return ok({ user: { name: `n${body.user}`, real_name: `Real ${body.user}`, profile: { display_name: "" } } });
         case "chat.postMessage": return ok({ ts: `${ts++}.000100`, channel: body.channel });
+        case "files.getUploadURLExternal": return ok({ upload_url: `http://127.0.0.1:${port}/upload/F${body.length}`, file_id: `F${body.length}` });
         case "conversations.open": return ok({ channel: { id: `D${body.users}` } });
         default: return ok();
       }
@@ -48,7 +56,7 @@ export function startFakeSlack(opts: { botUserId?: string; botId?: string } = {}
   port = server.port!;
   const base = `http://127.0.0.1:${server.port}`;
   return {
-    botUserId, calls, acks, webApiBase: `${base}/api`, fileBase: `${base}/files`,
+    botUserId, calls, acks, uploads, webApiBase: `${base}/api`, fileBase: `${base}/files`,
     addFile(name: string, data: Uint8Array) { files.set(name, data); },
     event(event: unknown) { const id = `e${++env}`; socket?.send(JSON.stringify({ type: "events_api", envelope_id: id, payload: { event } })); return id; },
     interactive(payload: unknown) { const id = `i${++env}`; socket?.send(JSON.stringify({ type: "interactive", envelope_id: id, payload })); return id; },

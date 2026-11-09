@@ -7,7 +7,7 @@ import { z } from "zod";
 import type { ChannelManager } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
 
-export const GATEWAY_TOOL_NAMES = ["agents_list", "agent_ask", "agent_trigger", "notify", "task_status", "worker_start", "worker_stop"];
+export const GATEWAY_TOOL_NAMES = ["agents_list", "agent_ask", "agent_trigger", "notify", "send_file", "task_status", "worker_start", "worker_stop"];
 
 export class McpGateway {
   private extra: GatewayTool[] = [];
@@ -109,6 +109,18 @@ export class McpGateway {
       description: "Send text you wrote to a chat target (a human sees it verbatim), e.g. target \"telegram:<chatId>\".",
       inputSchema: { target: z.string(), text: z.string() } },
       wrap(async ({ target, text }) => mgr.notify(caller, target, text)));
+
+    s.registerTool("send_file", {
+      description: "Post a local file (image, audio, voice note, video or document) to a chat; a human sees it. Default target: your own chat. "
+        + "Use this instead of calling a chat platform's API yourself. Files must be inside the project, your working directory, the temp dir or the configured roots.",
+      inputSchema: {
+        path: z.string().describe("absolute, ~ or relative to your working directory"),
+        target: z.string().optional().describe("chat target like \"telegram:<chatId>\"; omit for your own chat"),
+        caption: z.string().optional(),
+        kind: z.enum(["image", "audio", "voice", "video", "file"]).optional().describe("how to show it; default from the extension (.ogg/.opus = voice note)"),
+        name: z.string().optional().describe("file name shown in the chat"),
+      } },
+      wrap(async (a) => mgr.sendFile(caller, a)));
 
     s.registerTool("task_status", { description: "Status/result of an agent_ask or agent_trigger task.", inputSchema: { taskId: z.string() } },
       wrap(async ({ taskId }) => {

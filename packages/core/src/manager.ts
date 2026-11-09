@@ -1,21 +1,26 @@
 // Owns all ChannelRuntimes: inbound routing, core slash commands, the message
 // bus (agents_list / agent_ask / agent_trigger / notify) and idle cleanup.
 import type { AgentProvider, Profile } from "./provider.ts";
-import type { RemoteAgent, ScheduledFire } from "./plugin.ts";
-import type { InboundMessage, PlatformAdapter, Target } from "./platform.ts";
+import type { RemoteAgent, ScheduledFire, Transcriber } from "./plugin.ts";
+import type { InboundMessage, OutboundFile, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
+import type { GroupMode } from "./config.ts";
 import { ChannelRuntime, type RuntimeHost } from "./runtime.ts";
+import { PairingService } from "./pairing.ts";
 import { renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
 import { realpathSync, statSync } from "node:fs";
 import { expandHome } from "./credentials.ts";
-import { isAbsolute, resolve, sep } from "node:path";
+import { basename, extname, isAbsolute, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
 
 export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget"> {
   providers: Map<string, AgentProvider>;
   platforms: Map<string, PlatformAdapter>;
   profiles: Map<string, Profile>;
+  /** Transcriber named by settings.transcription.engine (absent = agents get the audio file only). */
+  transcriber?: Transcriber;
 }
 
 export interface AgentInfo {
@@ -39,6 +44,7 @@ export interface AgentInfo {
 export interface WorkerMeta { cwd: string; profile: string; owner?: string; createdAt: number }
 
 export const WORKER_PREFIX = "worker:";
+
 const WORKER_NAME = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 
 /** How a human takes over a session in a terminal (provider-specific). */
@@ -58,6 +64,8 @@ export class ChannelManager {
   private waiters = new Map<string, TaskWaiter>();
   private cleanupTimer?: ReturnType<typeof setInterval>;
   private readonly host: RuntimeHost;
+  /** DM pairing (strangers get a code; operators approve). */
+  readonly pairing: PairingService;
 
   constructor(private readonly deps: ManagerDeps) {
     this.host = {
@@ -78,6 +86,7 @@ export class ChannelManager {
       },
     };
     this.events.setMaxListeners(100);
+    this.pairing = new PairingService({ store: deps.store, settings: deps.settings, platforms: deps.platforms, log: deps.log });
   }
 
   start() {
@@ -160,13 +169,82 @@ export class ChannelManager {
           return;
       }
     }
+    const pair = msg.text.trim().match(/^\/pair(?:@\S+)?(?:\s+(.+))?$/i);
+    if (pair && msg.trusted) { await reply(await this.pairing.command(pair[1])); return; }
+    const act = msg.text.trim().match(/^\/activation(?:@\S+)?(?:\s+(\S+))?\s*$/i);
+    if (act && msg.trusted && msg.multiparty) { await reply(this.activationCommand(msg.channelKey, act[1]?.toLowerCase())); return; }
+    if (msg.multiparty && !this.shouldStartTurn(msg)) {
+      const g = this.groupSettings(msg.channelKey, msg.groupPolicy);
+      if (g.historyLimit > 0) {
+        const extra = msg.attachments.length ? ` [+${msg.attachments.length} attachment(s), not shown]` : "";
+        this.deps.store.pushPending(sessionKey, "group-context", { label: `${msg.sender.name} (not addressed to you)`, text: msg.text + extra });
+        this.deps.store.trimPending(sessionKey, "group-context", g.historyLimit);
+      }
+      return;
+    }
     const origin: Origin = { kind: "human", platform: msg.platform, channelKey: msg.channelKey, sender: msg.sender,
       replyTarget: msg.replyTarget, ref: msg.ref, trusted: msg.trusted };
+    const transcript = await this.transcribe(rt, msg.attachments);
     await rt.enqueue({
       origin,
-      item: { text: msg.text, receivedAt: msg.receivedAt, sourceLine: renderSourceLine(msg.platform, msg.sender) },
+      item: { text: [msg.text, transcript].filter(Boolean).join("\n\n"), receivedAt: msg.receivedAt, sourceLine: renderSourceLine(msg.platform, msg.sender) },
       attachments: msg.attachments,
     });
+  }
+
+  /** Transcripts of voice/audio attachments, as text for the prompt (best-effort: failures only log). */
+  private async transcribe(rt: ChannelRuntime, attachments: InboundMessage["attachments"]): Promise<string> {
+    const t = this.deps.transcriber;
+    const cfg = this.deps.settings.transcription;
+    if (!t) return "";
+    if (cfg.when === "unsupported" && rt.capabilities.attachments.includes("audio")) return "";
+    const out: string[] = [];
+    for (const a of attachments) {
+      if (a.kind !== "voice" && a.kind !== "audio") continue;
+      if (a.durationSec && a.durationSec > cfg.maxSeconds) { out.push(`[${a.kind} not transcribed: ${a.durationSec}s is over transcription.maxSeconds]`); continue; }
+      const started = Date.now();
+      try {
+        const text = (await t.transcribe({ path: a.path, ...(a.mime ? { mime: a.mime } : {}), ...(cfg.language !== "auto" ? { language: cfg.language } : {}) })).trim();
+        this.deps.log.info("transcribed", { engine: cfg.engine, ms: Date.now() - started, chars: text.length });
+        out.push(`[${a.kind === "voice" ? "Voice message" : "Audio"} transcript${a.name ? ` (${a.name})` : ""}: ${text || "(no speech)"}]`);
+      } catch (e) {
+        this.deps.log.warn("transcription failed; the agent gets the file only", { engine: cfg.engine, path: a.path, e: String(e) });
+      }
+    }
+    return out.join("\n");
+  }
+
+  /** Group settings for a channel: `/activation` override, then `groups.channels` (a Slack thread key falls back
+   *  to its channel), then `groups` defaults. */
+  groupSettings(channelKey: string, platformPolicy?: InboundMessage["groupPolicy"]): { mode: GroupMode; ignoreOtherMentions: boolean; historyLimit: number } {
+    const { channels, ...defaults } = this.deps.settings.groups;
+    const parts = channelKey.split(":");
+    let entry: Partial<typeof defaults> | undefined;
+    for (let n = parts.length; n >= 2 && !entry; n--) entry = channels[parts.slice(0, n).join(":")];
+    const override = this.deps.store.get(`group-mode:${channelKey}`) as GroupMode | undefined;
+    return { ...defaults, ...platformPolicy, ...entry, ...(override ? { mode: override } : {}) };
+  }
+
+  /** Multiparty gate: does this message start a turn, or only become context? */
+  private shouldStartTurn(msg: InboundMessage): boolean {
+    const addressed = msg.addressed ?? true; // an adapter that can't tell must not produce a bot that never answers
+    if (addressed) return true;
+    const g = this.groupSettings(msg.channelKey, msg.groupPolicy);
+    if (g.mode === "mention") return false;
+    return !(g.ignoreOtherMentions && msg.mentionsOthers);
+  }
+
+  private activationCommand(channelKey: string, arg?: string): string {
+    if (arg === "mention" || arg === "always") {
+      this.deps.store.set(`group-mode:${channelKey}`, arg);
+      return arg === "mention" ? "🔕 I'll answer only when mentioned or replied to; other messages are kept as context."
+        : "🔔 I'll read every message and answer when I have something to add.";
+    }
+    if (arg === "reset" || arg === "default") {
+      this.deps.store.del(`group-mode:${channelKey}`);
+      return `↩️ Back to the configured mode: ${this.groupSettings(channelKey).mode}.`;
+    }
+    return `Activation: ${this.groupSettings(channelKey).mode}. Use /activation mention | always | reset.`;
   }
 
   statusText(channelKey: string): string {
@@ -308,6 +386,43 @@ export class ChannelManager {
     const owner = platform.channelKeyForTarget(target);
     if (owner !== from) this.deps.store.pushPending(owner, "notify-echo", { label: `sent on your behalf by ${from}`, text });
     return { target: targetStr, owner };
+  }
+
+  /** send_file: post a local file to a chat (default: the caller's own chat) and echo it into the owning session. */
+  async sendFile(from: string, o: { path: string; target?: string; caption?: string; kind?: OutboundFile["kind"]; name?: string }): Promise<{ target: string; file: string }> {
+    let target: Target | undefined;
+    if (o.target) target = this.parseTargetString(o.target);
+    else target = this.runtimes.get(from)?.lastTarget() ?? this.targetForChannel(from);
+    if (!target) throw new Error(o.target ? `cannot resolve target "${o.target}" (expected e.g. telegram:<chatId>)` : "this session has no chat; pass target");
+    const platform = this.deps.platforms.get(target.platform);
+    if (!platform?.sendFile) throw new Error(`${target.platform} can't upload files`);
+    const real = this.resolveSendablePath(from, o.path);
+    const name = o.name?.trim() || basename(real);
+    const kind = o.kind ?? kindFromName(name);
+    const ref = await platform.sendFile(target, { path: real, name, kind, ...(o.caption ? { caption: o.caption } : {}) });
+    if (!ref) throw new Error(`${target.platform} rejected the upload (see daemon log)`);
+    const label = `${target.platform}:${target.chatId}${target.threadId ? `:${target.threadId}` : ""}`;
+    const owner = platform.channelKeyForTarget(target);
+    if (owner !== from) this.deps.store.pushPending(owner, "notify-echo", { label: `sent on your behalf by ${from}`, text: `[${kind}: ${name}]${o.caption ? ` ${o.caption}` : ""}` });
+    return { target: label, file: name };
+  }
+
+  /** Files an agent may send: inside the project dir, its own cwd, workers.roots, files.roots or the temp dir. */
+  private resolveSendablePath(from: string, p: string): string {
+    const cwd = this.deps.store.get(`session-cwd:${from}`) ?? this.deps.projectDir;
+    let real: string;
+    try { real = realpathSync(isAbsolute(expandHome(p)) ? expandHome(p) : resolve(cwd, p)); } catch { throw new Error(`file not found: ${p}`); }
+    const st = statSync(real);
+    if (!st.isFile()) throw new Error(`not a file: ${p}`);
+    const max = this.deps.settings.files.maxMB * 1024 * 1024;
+    if (st.size > max) throw new Error(`file is ${(st.size / 1048576).toFixed(1)} MB; the limit is ${this.deps.settings.files.maxMB} MB (settings files.maxMB)`);
+    const roots = [this.deps.projectDir, cwd, tmpdir(), ...this.deps.settings.workers.roots, ...this.deps.settings.files.roots].flatMap((r) => {
+      try { return [realpathSync(absPath(r, this.deps.projectDir))]; } catch { return []; }
+    });
+    if (!roots.some((r) => real === r || real.startsWith(r.endsWith(sep) ? r : r + sep))) {
+      throw new Error(`${real} is outside the directories files may be sent from (${roots.join(", ")}); the operator can add one to settings files.roots`);
+    }
+    return real;
   }
 
   taskStatus(taskId: string) { return this.deps.store.getTask(taskId); }
@@ -609,4 +724,14 @@ export class ChannelManager {
 function absPath(p: string, base: string): string {
   const e = p === "~" ? process.env.HOME ?? p : expandHome(p);
   return isAbsolute(e) ? e : resolve(base, e);
+}
+
+/** Default upload kind from the file extension. */
+export function kindFromName(name: string): OutboundFile["kind"] {
+  const ext = extname(name).toLowerCase();
+  if ([".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(ext)) return "image";
+  if ([".ogg", ".oga", ".opus"].includes(ext)) return "voice";
+  if ([".mp3", ".m4a", ".wav", ".flac", ".aac"].includes(ext)) return "audio";
+  if ([".mp4", ".mov", ".webm", ".mkv"].includes(ext)) return "video";
+  return "file";
 }

@@ -3,7 +3,7 @@ import type { TgUpdate } from "../src/api.ts";
 
 export interface Call { method: string; body: Record<string, any> }
 
-export function startFakeBotApi(opts: { token?: string; botUsername?: string; botId?: number } = {}) {
+export function startFakeBotApi(opts: { token?: string; botUsername?: string; botId?: number; rejectUpload?: string[] } = {}) {
   const token = opts.token ?? "TEST:TOKEN";
   const calls: Call[] = [];
   const updates: TgUpdate[] = [];
@@ -30,7 +30,7 @@ export function startFakeBotApi(opts: { token?: string; botUsername?: string; bo
       const m = url.pathname.match(new RegExp(`^/bot${escapeRe(token)}/(\\w+)$`));
       if (!m) return fail(404, "Not Found");
       const method = m[1]!;
-      const body = (await req.json().catch(() => ({}))) as Record<string, any>;
+      const body = (await readBody(req)) as Record<string, any>;
       calls.push({ method, body });
       switch (method) {
         case "getMe": return ok({ id: opts.botId ?? 999, is_bot: true, first_name: "Bot", username: opts.botUsername ?? "uniq_test_bot" });
@@ -49,6 +49,10 @@ export function startFakeBotApi(opts: { token?: string; botUsername?: string; bo
         case "sendMessage": {
           if (rejectHtml && body.parse_mode === "HTML") return fail(400, "Bad Request: can't parse entities");
           return ok({ message_id: nextMsgId++, chat: { id: Number(body.chat_id) }, text: body.text });
+        }
+        case "sendPhoto": case "sendAudio": case "sendVoice": case "sendVideo": case "sendDocument": {
+          if (opts.rejectUpload?.includes(method)) return fail(400, "Bad Request: wrong file type");
+          return ok({ message_id: nextMsgId++, chat: { id: Number(body.chat_id) } });
         }
         case "editMessageText": return ok(true);
         case "deleteMessage": return ok(true);
@@ -81,3 +85,13 @@ export function startFakeBotApi(opts: { token?: string; botUsername?: string; bo
 }
 
 function escapeRe(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/** JSON body, or multipart fields (files become { name, size, type }). */
+async function readBody(req: Request): Promise<Record<string, unknown>> {
+  if (!req.headers.get("content-type")?.includes("multipart/form-data")) return (await req.json().catch(() => ({}))) as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of (await req.formData()).entries()) {
+    out[k] = typeof v === "string" ? v : { name: (v as File).name, size: (v as File).size, type: (v as File).type };
+  }
+  return out;
+}

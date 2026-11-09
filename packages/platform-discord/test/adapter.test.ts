@@ -56,7 +56,7 @@ describe("gateway + routing", () => {
     expect(adapter.channelKeyForTarget({ platform: "discord", chatId: CH })).toBe(`discord:${CH}`);
   });
 
-  test("allowlists, disabled/unlisted channels, requireMention, ignoreOtherMentions, own messages", async () => {
+  test("allowlists, disabled/unlisted channels, own messages; mention flags + v2 channel policy go to core", async () => {
     fake.dispatch("MESSAGE_CREATE", msg(STRANGER, "nope"));
     fake.dispatch("MESSAGE_CREATE", msg("999", "unknown bot", { author: { id: "999", bot: true } }));
     fake.dispatch("MESSAGE_CREATE", msg(fake.botId, "myself"));
@@ -66,11 +66,13 @@ describe("gateway + routing", () => {
     fake.dispatch("MESSAGE_CREATE", msg(OWNER, "hey <@222>", { mentions: [{ id: FRIEND }] }));
     fake.dispatch("MESSAGE_CREATE", msg(OWNER, `<@${fake.botId}> do it`, { channel_id: MENTION_CH, mentions: [{ id: fake.botId }] }));
     fake.dispatch("MESSAGE_CREATE", msg(BOT_FRIEND, "allowed bot", { author: { id: BOT_FRIEND, bot: true, username: "b" } }));
-    await waitFor(() => inbox.length === 2);
+    await waitFor(() => inbox.length === 4);
     await Bun.sleep(50);
-    expect(inbox.map((m) => m.text)).toEqual(["do it", "allowed bot"]);
-    expect(inbox[0]!.addressed).toBe(true);
-    expect(inbox[1]!.sender.isBot).toBe(true);
+    expect(inbox.map((m) => m.text)).toEqual(["no mention", "hey <@222>", "do it", "allowed bot"]);
+    expect(inbox[0]).toMatchObject({ addressed: false, groupPolicy: { mode: "mention", ignoreOtherMentions: false } });
+    expect(inbox[1]).toMatchObject({ addressed: false, mentionsOthers: true, groupPolicy: { mode: "always", ignoreOtherMentions: true } });
+    expect(inbox[2]).toMatchObject({ addressed: true, mentionsOthers: false });
+    expect(inbox[3]!.sender.isBot).toBe(true);
   });
 
   test("attachments (voice flag) and stickers are downloaded", async () => {
@@ -86,6 +88,15 @@ describe("gateway + routing", () => {
 });
 
 describe("outbound", () => {
+  test("sendFile posts one multipart message with the file and caption", async () => {
+    const f = join(dir, "a.mp3");
+    await Bun.write(f, "1234");
+    const ref = await adapter.sendFile({ platform: "discord", chatId: CH, replyToMessageId: "42" }, { path: f, name: "a.mp3", kind: "audio", caption: "song" });
+    expect(ref).toMatchObject({ platform: "discord", chatId: CH });
+    const post = fake.callsTo("POST", /\/channels\/1001\/messages$/)[0]!.body;
+    expect(post).toMatchObject({ content: "song", message_reference: { message_id: "42" }, files: [{ field: "files[0]", name: "a.mp3", size: 4 }] });
+  });
+
   test("send chunks at the limit, replies to the first chunk; edit/delete/react/typing", async () => {
     const ref = await adapter.send({ platform: "discord", chatId: CH, replyToMessageId: "42" }, "a".repeat(2500));
     const posts = fake.callsTo("POST", /\/channels\/1001\/messages$/);

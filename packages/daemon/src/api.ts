@@ -157,6 +157,20 @@ export function startApi(o: ApiOptions) {
             const r = await manager.trigger(b.fromLabel ?? "api", b.target, b.prompt, replyTo);
             return json({ ok: true, dispatched: true, target: b.target, taskId: r.taskId });
           }
+          if (req.method === "GET" && path === "/api/pairing") {
+            return json({ ok: true, pending: manager.pairing.pending(), paired: manager.pairing.paired() });
+          }
+          if (req.method === "POST" && path === "/api/pairing") {
+            const b = (await req.json()) as { action?: "approve" | "deny" | "revoke"; code?: string; platform?: string; userId?: string };
+            if (b.action === "revoke") {
+              if (!b.platform || !b.userId) return json({ ok: false, error: "platform and userId are required" }, 400);
+              return json({ ok: manager.pairing.revoke(b.platform, String(b.userId)) });
+            }
+            if (!b.code || (b.action !== "approve" && b.action !== "deny")) return json({ ok: false, error: "action (approve|deny|revoke) and code are required" }, 400);
+            try {
+              return json({ ok: true, ...(b.action === "approve" ? { user: await manager.pairing.approve(b.code) } : { request: manager.pairing.deny(b.code) }) });
+            } catch (e) { return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 404); }
+          }
           if (req.method === "GET" && path === "/api/workers") {
             return json({ ok: true, workers: manager.listAgents().filter((a) => a.kind === "worker") });
           }

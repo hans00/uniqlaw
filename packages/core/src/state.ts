@@ -19,7 +19,7 @@ export interface SessionRow {
 export interface PendingInput {
   id: number;
   channelKey: string;
-  kind: "notify-echo" | "peer-result" | "external";
+  kind: "notify-echo" | "peer-result" | "external" | "group-context";
   /** JSON payload. */
   payload: string;
   createdAt: number;
@@ -114,6 +114,11 @@ export class StateStore {
       return rows.map((r) => ({ id: r.id as number, channelKey: r.channel_key as string, kind: r.kind as PendingInput["kind"],
         payload: r.payload as string, createdAt: r.created_at as number }));
     })();
+  }
+  /** Keep only the newest `keep` entries of one kind (bounded context buffers). */
+  trimPending(channelKey: string, kind: PendingInput["kind"], keep: number) {
+    this.db.query(`DELETE FROM pending_input WHERE channel_key = ? AND kind = ? AND id NOT IN (
+      SELECT id FROM pending_input WHERE channel_key = ? AND kind = ? ORDER BY id DESC LIMIT ?)`).run(channelKey, kind, channelKey, kind, keep);
   }
   countPending(channelKey: string): number {
     return (this.db.query("SELECT COUNT(*) AS n FROM pending_input WHERE channel_key = ?").get(channelKey) as { n: number }).n;

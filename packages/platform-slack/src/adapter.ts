@@ -3,7 +3,7 @@
 // thread-per-message → "slack:<ch>:<anchorTs>").
 import { randomBytes } from "node:crypto";
 import type {
-  Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, PlatformAdapter, PlatformCapabilities, Target,
+  Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, OutboundFile, PlatformAdapter, PlatformCapabilities, Target,
 } from "@uniqlaw/core";
 import { chunkText, downloadTo, extFromName, kindFromMime, sleep } from "./download.ts";
 import { markdownToMrkdwn, slackReactionName } from "./format.ts";
@@ -42,6 +42,8 @@ export class SlackAdapter implements PlatformAdapter {
 
   private readonly log: Logger;
   private sink: InboundSink | null = null;
+  private paired = new Set<string>();
+  setPairedUsers(userIds: string[]) { this.paired = new Set(userIds); }
   private ws: WebSocket | null = null;
   private running = false;
   private reconnectDelay = 1000;
@@ -50,6 +52,8 @@ export class SlackAdapter implements PlatformAdapter {
   private readonly pending = new Map<string, PendingChoice>();
   private readonly names = new Map<string, { name: string; username?: string }>();
   private readonly dmByUser = new Map<string, string>();
+  /** Threads ("<channel>:<ts>") the bot has posted in: replies there count as addressed (in memory only). */
+  private readonly botThreads = new Set<string>();
   private connectedResolve: (() => void) | null = null;
 
   constructor(private readonly opts: SlackAdapterOptions) {
@@ -142,14 +146,22 @@ export class SlackAdapter implements PlatformAdapter {
     const senderId: string | undefined = e.user ?? e.bot_id;
     if (!senderId) return;
     if (senderId === this.botUserId || (e.bot_id && e.bot_id === this.botId)) return;
-    if (isBot ? !this.opts.allowedBotIds.includes(senderId) : !this.opts.allowedUserIds.includes(senderId)) {
+    if (isBot ? !this.opts.allowedBotIds.includes(senderId) : !this.opts.allowedUserIds.includes(senderId) && !this.paired.has(senderId)) {
       this.log.debug(`slack: rejected message from ${senderId}`);
+      if (!isBot && e.channel_type === "im") {
+        this.dmByUser.set(senderId, String(e.channel));
+        const who = await this.userName(senderId);
+        this.sink?.unknownSender?.({ platform: "slack", userId: senderId, name: who.name, ...(who.username ? { username: who.username } : {}),
+          replyTarget: { platform: "slack", chatId: String(e.channel) } });
+      }
       return;
     }
     const channel = String(e.channel);
     const isDM = e.channel_type === "im";
     let text = String(e.text ?? "");
     const mentioned = !!this.botUserId && text.includes(`<@${this.botUserId}>`);
+    const mentionsOthers = !mentioned && [...text.matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g)].some((m) => m[1] !== this.botUserId);
+    const inBotThread = !!e.thread_ts && this.botThreads.has(`${channel}:${e.thread_ts}`);
     if (this.botUserId) text = text.replace(new RegExp(`<@${this.botUserId}>`, "g"), "").replace(/\s{2,}/g, " ").trim();
     const attachments = await this.collectAttachments(e, channel);
     if (!text && !attachments.length) return;
@@ -175,7 +187,8 @@ export class SlackAdapter implements PlatformAdapter {
       multiparty: !isDM,
       text,
       attachments,
-      addressed: isDM || mentioned,
+      addressed: isDM || mentioned || inBotThread,
+      ...(mentionsOthers ? { mentionsOthers } : {}),
       receivedAt: Date.now(),
     };
     this.sink?.message(inbound);
@@ -246,6 +259,7 @@ export class SlackAdapter implements PlatformAdapter {
     let first: MsgRef | undefined;
     for (const chunk of chunkText(markdownToMrkdwn(markdown), SLACK_MSG_LIMIT)) {
       const r = await this.web("chat.postMessage", { channel, text: chunk, ...(target.threadId ? { thread_ts: target.threadId } : {}), unfurl_links: false });
+      if (target.threadId) this.botThreads.add(`${channel}:${target.threadId}`);
       if (!r?.ok) { this.log.error(`slack: chat.postMessage failed: ${r?.error ?? "?"}`); continue; }
       if (!first && r.ts) first = { platform: "slack", chatId: String(r.channel ?? channel), messageId: String(r.ts), ...(target.threadId ? { threadId: target.threadId } : {}) };
     }
@@ -331,6 +345,30 @@ export class SlackAdapter implements PlatformAdapter {
     if (!id) { this.log.error(`slack: conversations.open failed for ${user}: ${r?.error ?? "?"}`); return undefined; }
     this.dmByUser.set(user, String(id));
     return String(id);
+  }
+
+  /** Slack's external upload flow: get an upload URL, POST the bytes, then complete into the channel/thread. */
+  async sendFile(target: Target, file: OutboundFile): Promise<MsgRef | undefined> {
+    const channel = await this.resolveChannel(target.chatId);
+    if (!channel) return undefined;
+    const blob = Bun.file(file.path);
+    const form = new URLSearchParams({ filename: file.name, length: String(blob.size) });
+    const u = await this.call("files.getUploadURLExternal", this.opts.botToken, form.toString(), "application/x-www-form-urlencoded");
+    if (!u?.ok || !u.upload_url || !u.file_id) { this.log.error(`slack: files.getUploadURLExternal failed: ${u?.error ?? "?"}`); return undefined; }
+    try {
+      const up = new FormData();
+      up.append("file", blob, file.name);
+      const res = await fetch(String(u.upload_url), { method: "POST", body: up });
+      if (!res.ok) { this.log.error(`slack: file upload failed (${res.status})`); return undefined; }
+    } catch (err) {
+      this.log.error(`slack: file upload failed: ${String(err)}`);
+      return undefined;
+    }
+    const done = await this.web("files.completeUploadExternal", { files: [{ id: u.file_id, title: file.name }], channel_id: channel,
+      ...(target.threadId ? { thread_ts: target.threadId } : {}), ...(file.caption ? { initial_comment: markdownToMrkdwn(file.caption) } : {}) });
+    if (!done?.ok) { this.log.error(`slack: files.completeUploadExternal failed: ${done?.error ?? "?"}`); return undefined; }
+    if (target.threadId) this.botThreads.add(`${channel}:${target.threadId}`);
+    return { platform: "slack", chatId: channel, messageId: String(u.file_id), ...(target.threadId ? { threadId: target.threadId } : {}) };
   }
 
   private async web(method: string, body?: Record<string, unknown>): Promise<any> {

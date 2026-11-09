@@ -230,6 +230,7 @@ export function busToolsPrompt(toolNames: string[]): string {
     "- `agent_ask`: ask another session something; its answer comes back to YOU (no human sees it).",
     "- `agent_trigger`: make another session answer ITS OWN human on its own chat.",
     "- `notify`: send text you wrote to a chat target (a human sees it verbatim).",
+    "- `send_file`: post a local file (image, audio, voice note, video, document) to your chat or another chat target. Use it instead of calling a chat platform's API.",
     ...(toolNames.includes("worker_start") ? ["- `worker_start` / `worker_stop`: run another coding agent (a profile) in a directory on this machine and hand it work; follow up with `agent_ask` to `worker:<name>`."] : []),
     ...(toolNames.includes("cron_save") ? ["- `cron_list` / `cron_save` / `cron_delete`: manage your scheduled jobs (validated cron; prefer these over editing job files)."] : []),
     "When you receive a message from another agent session, answer once and stop; do not reply to replies unless asked a question.",

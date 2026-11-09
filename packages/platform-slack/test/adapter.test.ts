@@ -76,6 +76,16 @@ describe("routing", () => {
 });
 
 describe("outbound", () => {
+  test("sendFile: external upload flow into the thread, with caption", async () => {
+    const f = join(dir, "chart.png");
+    await Bun.write(f, "12345"); // non-zero bytes: Bun's multipart parser drops all-NUL file parts
+    const ref = await adapter.sendFile({ platform: "slack", chatId: "C1", threadId: "1.5" }, { path: f, name: "chart.png", kind: "image", caption: "**here**" });
+    expect(ref).toMatchObject({ platform: "slack", chatId: "C1", threadId: "1.5" });
+    expect(fake.callsOf("files.getUploadURLExternal")[0]!.body).toEqual({ filename: "chart.png", length: "5" });
+    expect(fake.uploads).toEqual([{ id: "F5", name: "chart.png", size: 5 }]);
+    expect(fake.callsOf("files.completeUploadExternal")[0]!.body).toEqual({ files: [{ id: "F5", title: "chart.png" }], channel_id: "C1", thread_ts: "1.5", initial_comment: "*here*" });
+  });
+
   test("send (mrkdwn, chunked, threaded), edit, delete, react with shortcodes", async () => {
     const ref = await adapter.send({ platform: "slack", chatId: "C1", threadId: "1.5" }, `**bold** [x](https://e.com)\n${"a".repeat(4000)}`);
     const posts = fake.callsOf("chat.postMessage");

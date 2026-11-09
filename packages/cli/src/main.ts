@@ -18,6 +18,7 @@ const USAGE = `uniqlaw <command> [options]
   ls                                           list UniQlaw instances on this machine
   send     <target> <text...> [--project DIR]  post text to a chat (e.g. telegram:<chatId>)
   trigger  <target> <prompt...> [--project DIR] make a session answer its own chat
+  pairing  [list|approve <code>|deny <code>|revoke <platform> <userId>]  DM pairing requests and paired users
   workers  [--project DIR]                     list worker sessions (other coding agents started by sessions)
   worker   start <name> --profile P [--cwd DIR] [task...]   start a worker (and hand it a task)
   worker   stop <name> [--forget]              stop a worker (--forget also drops its conversation)
@@ -188,6 +189,32 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
       if (!target || !words.length) throw new Error("usage: uniqlaw trigger <target> <prompt>");
       console.log(JSON.stringify(await api(projectDir, "/api/trigger", { target, prompt: words.join(" "), fromLabel: "cli" })));
       return;
+    }
+    case "pairing": {
+      const [action, a, b] = pos;
+      if (!action || action === "list") {
+        const r = await api(projectDir, "/api/pairing");
+        if (!r.ok) throw new Error(String(r.error));
+        const pending = r.pending as { code: string; platform: string; userId: string; name: string; username?: string; expiresAt: number }[];
+        const paired = r.paired as { platform: string; userId: string; name: string }[];
+        console.log(pending.length ? "open requests:" : "no open requests");
+        for (const p of pending) console.log(`  ${p.code.slice(0, 4)}-${p.code.slice(4)}  ${p.platform}  ${p.userId}  ${p.name}${p.username ? ` (@${p.username})` : ""}  expires ${new Date(p.expiresAt).toLocaleTimeString()}`);
+        console.log(paired.length ? "paired users:" : "no paired users");
+        for (const u of paired) console.log(`  ${u.platform}  ${u.userId}  ${u.name}`);
+        return;
+      }
+      if ((action === "approve" || action === "deny") && a) {
+        const r = await api(projectDir, "/api/pairing", { action, code: a });
+        if (!r.ok) throw new Error(String(r.error));
+        console.log(action === "approve" ? "approved" : "denied");
+        return;
+      }
+      if (action === "revoke" && a && b) {
+        const r = await api(projectDir, "/api/pairing", { action, platform: a, userId: b });
+        console.log(r.ok ? "revoked" : "not a paired user");
+        return;
+      }
+      throw new Error("usage: uniqlaw pairing [list] | pairing approve <code> | pairing deny <code> | pairing revoke <platform> <userId>");
     }
     case "workers": {
       const r = await api(projectDir, "/api/workers");

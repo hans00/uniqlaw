@@ -15,3 +15,4 @@ export * from "./model-router.ts";
 export * from "./transcript.ts";
 export * from "./memory.ts";
 export * from "./dreaming.ts";
+export * from "./pairing.ts";

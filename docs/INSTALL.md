@@ -57,11 +57,11 @@ Every platform needs `allowedUserIds` (empty = nobody). `operatorUserIds` (defau
 ### Discord
 1. Create an application + bot in the Developer Portal; enable the **Message Content** privileged intent.
 2. Invite it with scopes `bot` and `applications.commands` (permissions: read/send messages, add reactions, read history).
-3. `"discord": { "token": {"env": "DISCORD_BOT_TOKEN"}, "allowedUserIds": ["<your user id>"], "channels": { "<channelId>": { "enabled": true, "requireMention": true } } }`.
+3. `"discord": { "token": {"env": "DISCORD_BOT_TOKEN"}, "allowedUserIds": ["<your user id>"], "channels": { "<channelId>": { "enabled": true } } }`. Whether the bot answers every message or only when mentioned is set in the top-level `groups` settings (default: only when mentioned).
 
 ### Slack
 1. Create an app, enable **Socket Mode**, create an app-level token with `connections:write` (`xapp-…`).
-2. Bot scopes (typical): `chat:write`, `reactions:write`, `app_mentions:read`, `im:history`, `channels:history`, `groups:history`, `files:read`, `users:read`; subscribe to `message.im`, `message.channels`, `app_mention` events. Install to the workspace (`xoxb-…`).
+2. Bot scopes (typical): `chat:write`, `reactions:write`, `app_mentions:read`, `im:history`, `channels:history`, `groups:history`, `files:read`, `files:write` (for `send_file`), `users:read`; subscribe to `message.im`, `message.channels`, `app_mention` events. Install to the workspace (`xoxb-…`).
 3. `"slack": { "botToken": {"env": "SLACK_BOT_TOKEN"}, "appToken": {"env": "SLACK_APP_TOKEN"}, "allowedUserIds": ["U…"] }`.
 
 ### LINE
@@ -73,4 +73,9 @@ Every platform needs `allowedUserIds` (empty = nobody). `operatorUserIds` (defau
 
 - **Web dashboard / HTTP API**: on by default at `127.0.0.1` (port auto-assigned; `uniqlaw status` shows it). Binding a non-loopback host requires `web.token`.
 - **A2A**: `"a2a": { "expose": { "main": { "description": "…" } }, "remotes": { "research": { "url": "https://…", "bearer": {"env": "…"} } } }`. Non-loopback exposure requires `auth.bearerTokens`.
+- **Voice transcription**: by default a voice note reaches the agent as a file path and the agent handles it. To add a transcript to the message instead (for providers that can't take audio: Claude Code, pi), pick an engine:
+  - Local whisper.cpp: `"transcription": { "engine": "whisper", "language": "auto" }` plus `"plugins": { "whisper": { "model": "models/ggml-large-v3-turbo-q5_0.bin" } }`. Download a ggml model from [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) (`ggml-base.bin` is small and fast; `large-v3-turbo` is much better for Chinese). Needs `ffmpeg` on PATH. `@fugood/whisper.node` is installed with UniQlaw (optional dependency, prebuilt for macOS/Linux/Windows); set `"variant": "cuda"` or `"vulkan"` for GPU builds.
+  - An OpenAI-compatible API: `"transcription": { "engine": "transcribe-api" }` plus `"plugins": { "transcribe-api": { "key": { "env": "OPENAI_API_KEY" }, "model": "whisper-1" } }`. Set `baseUrl` for Groq (`https://api.groq.com/openai/v1`, model `whisper-large-v3`) or a local server.
+  - `transcription.when: "always"` also transcribes for providers that accept audio (Codex); `maxSeconds` skips long clips. `uniqlaw doctor` checks ffmpeg, the model file and the native module.
+- **DM pairing**: on by default. A stranger who DMs the bot gets a code; you approve it with `/pair approve <code>` from your own chat or `uniqlaw pairing approve <code>`. `"pairing": { "enabled": false }` turns it off.
 - **Several instances on one machine**: just use separate project directories. Ports are auto-assigned, tmux sockets are per instance, and starting a second instance with the same bot token is refused. `uniqlaw ls` lists them.

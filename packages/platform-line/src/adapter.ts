@@ -50,6 +50,8 @@ export class LineAdapter implements PlatformAdapter {
 
   private readonly log: Logger;
   private sink: InboundSink | null = null;
+  private paired = new Set<string>();
+  setPairedUsers(userIds: string[]) { this.paired = new Set(userIds); }
   private server: ReturnType<typeof Bun.serve> | null = null;
   private botUserId: string | null = null;
   /** inbound messageId → replyToken (single use, short-lived). */
@@ -131,7 +133,7 @@ export class LineAdapter implements PlatformAdapter {
   }
 
   private allowed(src: { type: string; id: string; userId?: string }): boolean {
-    const userOk = !!src.userId && this.opts.allowedUserIds.includes(src.userId);
+    const userOk = !!src.userId && (this.opts.allowedUserIds.includes(src.userId) || this.paired.has(src.userId));
     if (src.type === "user") return userOk;
     return userOk || this.opts.allowedGroupIds.includes(src.id);
   }
@@ -139,7 +141,14 @@ export class LineAdapter implements PlatformAdapter {
   private async handleMessage(ev: any): Promise<void> {
     const src = this.sourceOf(ev);
     if (!src) return;
-    if (!this.allowed(src)) { this.log.debug(`line: rejected message from ${src.userId ?? "?"} in ${src.id}`); return; }
+    if (!this.allowed(src)) {
+      this.log.debug(`line: rejected message from ${src.userId ?? "?"} in ${src.id}`);
+      if (src.type === "user" && src.userId) {
+        this.sink?.unknownSender?.({ platform: "line", userId: src.userId, name: await this.displayName(src, src.userId),
+          replyTarget: { platform: "line", chatId: src.id } });
+      }
+      return;
+    }
     const m = ev.message ?? {};
     const messageId = String(m.id);
     if (ev.replyToken) this.replyTokens.set(messageId, { token: String(ev.replyToken), at: Date.now() });
@@ -175,6 +184,7 @@ export class LineAdapter implements PlatformAdapter {
       text,
       attachments,
       addressed: isDM || mentioned,
+      ...(!isDM && !mentioned && mentionees.length ? { mentionsOthers: true } : {}),
       receivedAt: Date.now(),
     };
     this.sink?.message(inbound);

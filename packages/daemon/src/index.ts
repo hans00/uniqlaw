@@ -5,7 +5,7 @@ import {
   BRAND_PROMPT, ChannelManager, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
   createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, type MemoryOriginKind,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
-  type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transport,
+  type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transcriber, type Transport,
 } from "@uniqlaw/core";
 import { acquireLock, claim, deriveInstanceId, registerInstance, stateDirOf, writeRuntime } from "./instance.ts";
 import { startApi } from "./api.ts";
@@ -31,6 +31,8 @@ const BUILTIN: Record<string, () => Promise<{ default: PluginDef }>> = {
   heartbeat: () => import("@uniqlaw/scheduler/heartbeat") as Promise<{ default: PluginDef }>,
   dreaming: () => import("@uniqlaw/scheduler/dreaming") as Promise<{ default: PluginDef }>,
   a2a: () => import("@uniqlaw/transport-a2a") as Promise<{ default: PluginDef }>,
+  whisper: () => import("@uniqlaw/transcriber/whisper") as Promise<{ default: PluginDef }>,
+  "transcribe-api": () => import("@uniqlaw/transcriber/api") as Promise<{ default: PluginDef }>,
 };
 /** Built-ins that load unless explicitly disabled. */
 const DEFAULT_ON = ["cron"];
@@ -77,6 +79,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     const platforms = new Map<string, PlatformAdapter>();
     const schedulers = new Map<string, Scheduler>();
     const transports = new Map<string, Transport>();
+    const transcribers = new Map<string, Transcriber>();
     const neededProviders = new Set(Object.values(settings.profiles).map((p) => p.provider));
     const pluginNames = new Set([...Object.keys(settings.plugins), ...neededProviders, ...DEFAULT_ON]);
     for (const name of pluginNames) {
@@ -94,6 +97,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
       if (def.kind === "provider") providers.set(name, inst as AgentProvider);
       else if (def.kind === "scheduler") schedulers.set(name, inst as Scheduler);
       else if (def.kind === "transport") transports.set(name, inst as Transport);
+      else if (def.kind === "transcriber") { transcribers.set(name, inst as Transcriber); cleanups.push(() => (inst as Transcriber).stop?.()); }
       else platforms.set(name, inst as PlatformAdapter);
       log.info("plugin loaded", { name, kind: def.kind });
     }
@@ -134,8 +138,11 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     cleanups.push(() => gateway.stop());
 
     const transcript = new TranscriptStore(store);
+    const engine = settings.transcription.engine;
+    const transcriber = engine === "none" ? undefined : transcribers.get(engine);
+    if (engine !== "none" && !transcriber) throw new Error(`transcription.engine "${engine}" is not a loaded transcriber plugin; add "plugins": { "${engine}": { … } } (built-in: whisper, transcribe-api)`);
     manager = new ChannelManager({
-      log, settings, store, transcript, projectDir, instanceId, providers, platforms, profiles,
+      log, settings, store, transcript, projectDir, instanceId, providers, platforms, profiles, ...(transcriber ? { transcriber } : {}),
       gatewayFor: (key) => gateway.endpointFor(key),
       systemPrompt: (profile, multiparty, toolNames, session) => buildSystemPrompt(projectDir, settings, profile, multiparty, toolNames, session, memory),
       providerEnv: async () => {
@@ -149,8 +156,12 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     manager.start();
     cleanups.push(() => manager.stop());
 
+    manager.pairing.sync(); // before start: paired users must be accepted from the first message
     for (const [name, p] of platforms) {
-      await p.start({ message: (m) => void manager.handleInbound(m).catch((e) => log.error("inbound failed", { platform: name, e: String(e) })) });
+      await p.start({
+        message: (m) => void manager.handleInbound(m).catch((e) => log.error("inbound failed", { platform: name, e: String(e) })),
+        unknownSender: (u) => void manager.pairing.onUnknownSender(u).catch((e) => log.error("pairing failed", { platform: name, e: String(e) })),
+      });
       cleanups.push(() => p.stop());
       if (p.setCommands) {
         await p.setCommands([
@@ -158,6 +169,8 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
           { name: "new", description: "Start a fresh agent session" },
           { name: "status", description: "Show this channel's session status" },
           { name: "model", description: "Show or switch the model" },
+          { name: "activation", description: "Group: answer only when mentioned, or every message (mention / always / reset)" },
+          { name: "pair", description: "Operator: list / approve / deny DM pairing requests" },
         ]).catch((e) => log.warn("setCommands failed", { e: String(e) }));
       }
     }

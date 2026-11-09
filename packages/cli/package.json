@@ -11,7 +11,8 @@
     "@uniqlaw/core": "workspace:*",
     "@uniqlaw/daemon": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.0",
-    "@uniqlaw/credentials": "workspace:*"
+    "@uniqlaw/credentials": "workspace:*",
+    "@uniqlaw/transcriber": "workspace:*"
   },
   "devDependencies": {
     "@uniqlaw/testkit": "workspace:*"

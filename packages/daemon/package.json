@@ -12,6 +12,7 @@
     "@uniqlaw/platform-telegram": "workspace:*",
     "@uniqlaw/provider-claude-tmux": "workspace:*",
     "@uniqlaw/scheduler": "workspace:*",
+    "@uniqlaw/transcriber": "workspace:*",
     "@uniqlaw/provider-claude-sdk": "workspace:*",
     "@uniqlaw/transport-a2a": "workspace:*",
     "@uniqlaw/provider-pi": "workspace:*",

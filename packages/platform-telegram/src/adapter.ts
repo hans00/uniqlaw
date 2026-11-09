@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type {
   Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, PlatformAdapter,
-  PlatformCapabilities, PlatformCommand, Target,
+  OutboundFile, PlatformCapabilities, PlatformCommand, Target,
 } from "@uniqlaw/core";
 import { TelegramApi, type TgCallbackQuery, type TgFile, type TgMessage, type TgUpdate, type TgUser } from "./api.ts";
 import {
@@ -37,6 +37,10 @@ interface PendingChoice {
 
 const ALLOWED_UPDATES = ["message", "edited_message", "callback_query"];
 
+const TG_UPLOAD: Record<OutboundFile["kind"], [string, string]> = {
+  image: ["sendPhoto", "photo"], audio: ["sendAudio", "audio"], voice: ["sendVoice", "voice"], video: ["sendVideo", "video"], file: ["sendDocument", "document"],
+};
+
 export class TelegramAdapter implements PlatformAdapter {
   readonly name = "telegram";
   readonly capabilities: PlatformCapabilities = {
@@ -46,6 +50,8 @@ export class TelegramAdapter implements PlatformAdapter {
   private readonly api: TelegramApi;
   private readonly log: Logger;
   private sink: InboundSink | null = null;
+  private paired = new Set<string>();
+  setPairedUsers(userIds: string[]) { this.paired = new Set(userIds); }
   private offset = 0;
   private running = false;
   private abort: AbortController | null = null;
@@ -262,8 +268,10 @@ export class TelegramAdapter implements PlatformAdapter {
     if (msg.chat.type === "channel") return;
 
     const fromId = String(msg.from.id);
-    if (!this.opts.allowedUserIds.includes(fromId)) {
+    if (!this.opts.allowedUserIds.includes(fromId) && !this.paired.has(fromId)) {
       this.log.debug(`telegram: rejected message from non-allowlisted user ${fromId}`);
+      if (msg.chat.type === "private") this.sink?.unknownSender?.({ platform: "telegram", userId: fromId, name: displayName(msg.from),
+        ...(msg.from.username ? { username: msg.from.username } : {}), replyTarget: { platform: "telegram", chatId: String(msg.chat.id) } });
       return;
     }
     const isDM = msg.chat.type === "private";
@@ -296,6 +304,7 @@ export class TelegramAdapter implements PlatformAdapter {
       text,
       attachments,
       addressed,
+      ...(!isDM && !addressed && this.mentionsOthers(msg) ? { mentionsOthers: true } : {}),
       receivedAt: Date.now(),
     };
     this.sink?.message(inbound);
@@ -312,6 +321,15 @@ export class TelegramAdapter implements PlatformAdapter {
       if (e.type === "text_mention" && e.user?.id === bot.id) return true;
     }
     return false;
+  }
+
+  /** Message @mentions some other user (an @username or text_mention entity that isn't the bot). */
+  private mentionsOthers(msg: TgMessage): boolean {
+    const raw = msg.text ?? msg.caption ?? "";
+    const uname = this.bot?.username?.toLowerCase();
+    return [...(msg.entities ?? []), ...(msg.caption_entities ?? [])].some((e) =>
+      (e.type === "mention" && raw.slice(e.offset + 1, e.offset + e.length).toLowerCase() !== uname)
+      || (e.type === "text_mention" && e.user?.id !== this.bot?.id));
   }
 
   /** "/status@my_bot args" → "/status args" so commands resolve the same in groups and DMs. */
@@ -416,6 +434,19 @@ export class TelegramAdapter implements PlatformAdapter {
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────
+
+  async sendFile(target: Target, file: OutboundFile): Promise<MsgRef | undefined> {
+    const [method, field] = TG_UPLOAD[file.kind];
+    const fields = { ...this.targetFields(target, true), ...(file.caption ? { caption: file.caption.slice(0, 1024) } : {}) };
+    let r = await this.api.upload<{ message_id: number }>(method, fields, field, file.path, file.name);
+    if (!r.ok && method !== "sendDocument") {
+      // e.g. a photo over 10 MB or a voice note that isn't OGG/Opus: send it as a plain document instead.
+      this.log.warn(`telegram: ${method} failed (${r.status}): ${r.description ?? ""}; sending as a document`);
+      r = await this.api.upload<{ message_id: number }>("sendDocument", fields, "document", file.path, file.name);
+    }
+    if (!r.ok || !r.result) { this.log.error(`telegram: file upload failed (${r.status}): ${r.description ?? ""}`); return undefined; }
+    return this.ref(target, r.result.message_id);
+  }
 
   private targetFields(target: Target, withReply: boolean): Record<string, unknown> {
     return {

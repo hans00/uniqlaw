@@ -44,6 +44,17 @@ export const profileSchema = z.object({
   options: z.record(z.string(), z.unknown()).prefault({}),
 });
 
+const groupSchema = z.object({
+  /** mention: only messages addressed to the bot (@mention, reply to the bot, command) start a turn; the rest is
+   *  kept as context for the next turn. always: every message starts a turn and the agent decides whether to answer. */
+  mode: z.enum(["mention", "always"]).default("mention"),
+  /** always mode: a message that @mentions someone else but not the bot is context only (v2 `ignoreOtherMentions`). */
+  ignoreOtherMentions: z.boolean().default(false),
+  /** How many unanswered messages are kept as context for the next turn (0 = none). */
+  historyLimit: z.number().int().nonnegative().default(30),
+});
+export type GroupMode = z.infer<typeof groupSchema>["mode"];
+
 export const settingsSchema = z.object({
   instance: z.object({
     id: z.string().regex(/^[a-z0-9-]{1,32}$/).optional(),
@@ -66,6 +77,12 @@ export const settingsSchema = z.object({
     debounceMs: z.number().int().nonnegative().default(1500),
     cap: z.number().int().positive().default(20),
     dropPolicy: z.enum(["old", "new", "summarize"]).default("summarize"),
+  }).prefault({}),
+  /** Group chats (multiparty channels). DMs are never gated. */
+  groups: groupSchema.extend({
+    /** Per-channel overrides, keyed by channel key ("telegram:<chatId>", "discord:<channelId>", "slack:<channel>", …).
+     *  A Slack thread key ("slack:<channel>:<ts>") falls back to its channel's entry. */
+    channels: z.record(z.string(), groupSchema.partial()).prefault({}),
   }).prefault({}),
   sessionCleanup: z.object({
     idleTimeoutHours: z.number().nonnegative().default(168),
@@ -95,6 +112,31 @@ export const settingsSchema = z.object({
     /** Profiles a worker may use. Empty = any profile. */
     profiles: z.array(z.string()).default([]),
     max: z.number().int().positive().default(8),
+  }).prefault({}),
+  /** Inbound voice/audio. Default: the agent gets the file path and handles it itself. Set `engine` to a
+   *  transcriber plugin ("whisper" = local whisper.cpp, "transcribe-api" = OpenAI-compatible API) to add a transcript. */
+  transcription: z.object({
+    engine: z.string().default("none"),
+    /** unsupported: only when the session's provider can't take audio itself; always: every voice/audio attachment. */
+    when: z.enum(["unsupported", "always"]).default("unsupported"),
+    /** Language hint (ISO 639-1, e.g. "zh", "en"); "auto" = detect. */
+    language: z.string().default("auto"),
+    /** Skip clips longer than this (seconds, when the platform reports a duration). */
+    maxSeconds: z.number().positive().default(600),
+  }).prefault({}),
+  /** DM pairing: a stranger who DMs the bot gets a code; an operator approves it (`/pair approve <code>` or
+   *  `uniqlaw pairing approve <code>`). Approved users are accepted like allowedUserIds but are not operators. */
+  pairing: z.object({
+    enabled: z.boolean().default(true),
+    ttlMinutes: z.number().positive().default(60),
+    /** Open requests per platform; further strangers are ignored until one is answered or expires. */
+    maxPending: z.number().int().positive().default(3),
+  }).prefault({}),
+  /** send_file: which local files an agent may post to a chat. Always allowed: the project directory, the
+   *  session's working directory, workers.roots and the system temp directory. */
+  files: z.object({
+    roots: z.array(z.string()).default([]),
+    maxMB: z.number().positive().default(50),
   }).prefault({}),
   /** UniQlaw's own long-term memory (memory/MEMORY.md + daily notes), shared by every session. */
   memory: z.object({

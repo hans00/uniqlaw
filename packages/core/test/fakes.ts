@@ -1,5 +1,5 @@
 import {
-  type AgentEvent, type AgentProvider, type AgentSession, type ChoiceRequest, type MsgRef,
+  type AgentEvent, type AgentProvider, type AgentSession, type ChoiceRequest, type MsgRef, type OutboundFile,
   type PermissionDecision, type PlatformAdapter, type ProviderCapabilities, type Target, type TurnInput,
 } from "../src/index.ts";
 
@@ -70,6 +70,10 @@ export class FakePlatform implements PlatformAdapter {
   async edit(ref: MsgRef, text: string) { this.edits.push({ ref, text }); return true; }
   async delete(ref: MsgRef) { this.deletes.push(ref); return true; }
   async react(ref: MsgRef, emojis: string[]) { this.reactions.push({ ref, emojis }); }
+  paired: string[] = [];
+  setPairedUsers(ids: string[]) { this.paired = ids; }
+  files: { target: Target; file: OutboundFile }[] = [];
+  async sendFile(target: Target, file: OutboundFile) { this.files.push({ target, file }); return { platform: "tg", chatId: target.chatId, messageId: `f${this.files.length}` }; }
   async askChoice(_t: Target, req: ChoiceRequest) { this.choices.push(req); return this.choiceAnswer; }
   operatorTargets() { return [{ platform: "tg", chatId: "1" }]; }
   parseTarget(s: string) { const [p, id] = s.split(":"); return p === "tg" && id ? { platform: "tg", chatId: id } : undefined; }

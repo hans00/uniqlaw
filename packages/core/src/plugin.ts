@@ -87,11 +87,19 @@ export interface Transport {
   ports?(): Record<string, number>;
 }
 
+/** Speech-to-text for inbound voice/audio (settings `transcription.engine` names the plugin). */
+export interface Transcriber {
+  /** Transcribe a local audio file; returns plain text ("" if nothing was said). Throws on failure. */
+  transcribe(input: { path: string; mime?: string; language?: string; signal?: AbortSignal }): Promise<string>;
+  stop?(): void | Promise<void>;
+}
+
 export interface PluginInstanceMap {
   provider: AgentProvider;
   platform: PlatformAdapter;
   scheduler: Scheduler;
   transport: Transport;
+  transcriber: Transcriber;
 }
 export type PluginKind = keyof PluginInstanceMap;
 

@@ -28,8 +28,15 @@ export function startFakeDiscord(opts: { botId?: string; appId?: string } = {}) 
       if (!m) return new Response("nf", { status: 404 });
       const path = m[1]!;
       if (req.headers.get("authorization") !== "Bot TEST-DC") return Response.json({ message: "401" }, { status: 401 });
-      const text = await req.text();
-      const body = text ? JSON.parse(text) : undefined;
+      let body: any;
+      if (req.headers.get("content-type")?.includes("multipart/form-data")) {
+        const form = await req.formData();
+        body = JSON.parse(String(form.get("payload_json") ?? "{}"));
+        body.files = [...form.entries()].flatMap(([k, v]) => { const f = v as unknown; return f instanceof Blob ? [{ field: k, name: (f as File).name, size: f.size }] : []; });
+      } else {
+        const text = await req.text();
+        body = text ? JSON.parse(text) : undefined;
+      }
       calls.push({ method: req.method, path, body });
       if (req.method === "POST" && /^\/channels\/\d+\/messages$/.test(path)) return Response.json({ id: String(nextId++), channel_id: path.split("/")[2] });
       if (req.method === "POST" && path === "/users/@me/channels") return Response.json({ id: `77${body.recipient_id}`, type: 1 });

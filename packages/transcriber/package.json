@@ -1,0 +1,10 @@
+{
+  "name": "@uniqlaw/transcriber",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "exports": { "./whisper": "./src/whisper-plugin.ts", "./api": "./src/api-plugin.ts", "./ffmpeg": "./src/ffmpeg.ts" },
+  "dependencies": { "@uniqlaw/core": "workspace:*", "zod": "^4.6.6" },
+  "optionalDependencies": { "@fugood/whisper.node": "1.1.3" }
+}

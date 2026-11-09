@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { silentLogger, type InboundMessage } from "@uniqlaw/core";
+import { silentLogger, type InboundMessage, type UnknownSender } from "@uniqlaw/core";
 import plugin, { TelegramAdapter } from "../src/index.ts";
 import { startFakeBotApi } from "./fake-api.ts";
 
@@ -88,6 +88,24 @@ describe("inbound routing", () => {
     expect(inbox.map((m) => m.text)).toEqual(["marker"]);
   });
 
+  test("a stranger's DM is reported for pairing (groups are not); paired users are accepted but untrusted", async () => {
+    const strangers: UnknownSender[] = [];
+    const a = new TelegramAdapter({ token: api.token, apiBase: api.apiBase, allowedUserIds: [String(OWNER)], allowedGroupIds: [],
+      operatorUserIds: [String(OWNER)], pollSeconds: 0, attachmentsDir: dir, log: silentLogger });
+    const got: InboundMessage[] = [];
+    const sink = { message: (m: InboundMessage) => got.push(m), unknownSender: (u: UnknownSender) => strangers.push(u) };
+    (a as any).sink = sink; // no start(): drive handleUpdate directly
+    await a.handleUpdate({ update_id: 3, ...dm(STRANGER, "let me in") } as any);
+    await a.handleUpdate({ update_id: 4, ...grp(STRANGER, "group hi") } as any);
+    expect(got).toHaveLength(0);
+    expect(strangers).toEqual([{ platform: "telegram", userId: String(STRANGER), name: expect.any(String), username: `u${STRANGER}`,
+      replyTarget: { platform: "telegram", chatId: String(STRANGER) } }]);
+    a.setPairedUsers([String(STRANGER)]);
+    await a.handleUpdate({ update_id: 5, ...dm(STRANGER, "thanks") } as any);
+    expect(got.map((m) => [m.text, m.trusted])).toEqual([["thanks", false]]);
+    expect(strangers).toHaveLength(1);
+  });
+
   test("allowedGroupIds restricts groups", async () => {
     const restricted = new TelegramAdapter({
       token: api.token, apiBase: api.apiBase, allowedUserIds: [String(OWNER)], allowedGroupIds: ["-1"],
@@ -146,6 +164,23 @@ describe("inbound routing", () => {
 
 describe("outbound", () => {
   const target = { platform: "telegram", chatId: String(OWNER), replyToMessageId: "77" };
+
+  test("sendFile picks the upload method by kind, falls back to sendDocument", async () => {
+    const f = join(dir, "note.ogg");
+    await Bun.write(f, new Uint8Array([1, 2, 3]));
+    const ref = await adapter.sendFile(target, { path: f, name: "note.ogg", kind: "voice", caption: "listen" });
+    expect(ref).toMatchObject({ platform: "telegram", chatId: String(OWNER) });
+    const v = api.callsOf("sendVoice")[0]!.body;
+    expect(v).toMatchObject({ chat_id: String(OWNER), caption: "listen", voice: { name: "note.ogg", size: 3 } });
+    expect(JSON.parse(v.reply_parameters)).toMatchObject({ message_id: 77 });
+
+    const api2 = startFakeBotApi({ rejectUpload: ["sendPhoto"] });
+    const a2 = (await plugin.create({ log: silentLogger, instanceId: "t", projectDir: dir, stateDir: dir, timezone: "UTC" },
+      plugin.configSchema.parse({ token: api2.token, apiBase: api2.apiBase, allowedUserIds: [OWNER] }))) as TelegramAdapter;
+    expect(await a2.sendFile(target, { path: f, name: "big.png", kind: "image" })).toBeDefined();
+    expect(api2.callsOf("sendDocument")[0]!.body.document).toMatchObject({ name: "big.png" });
+    api2.stop();
+  });
 
   test("send converts markdown to HTML and quotes only the first chunk", async () => {
     const long = Array.from({ length: 30 }, (_, i) => `**para ${i}** ${"x".repeat(200)}`).join("\n\n");

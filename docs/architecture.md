@@ -700,3 +700,30 @@ M0 results are in `docs/spikes/M0-results.md`. There are currently no open quest
 - End-to-end verification of Discord / Slack / LINE against the real services (needs test bots).
 - Real tests of agy API key and ADC.
 
+
+---
+
+## 16. Planned (OpenClaw comparison, 2026-11-10)
+
+Done in this round: group modes (`groups`, `/activation`), DM pairing (`pairing`, `/pair`, `uniqlaw pairing`), `send_file`, optional voice transcription (`transcription`, plugins `whisper` / `transcribe-api`).
+
+**Pre-compaction memory flush** (OpenClaw: a silent "write memory now" turn just below the auto-compaction threshold). Needs `Usage` to carry `contextTokens` / `contextWindow`. What each provider can report:
+
+| provider | context in use | window |
+|---|---|---|
+| claude-sdk | `query.getContextUsage({ detail: "summary" })` → `total_tokens`, `raw_max_tokens` (= the autocompact window) | exact |
+| claude-tmux | statusLine command JSON `context_window` (Claude Code ≥ 2.1.6; we already pass `--settings`), or the last assistant entry's usage in the session jsonl (input + cache read + cache creation) | `context_window.context_window_size` |
+| codex | `ThreadTokenUsageUpdated` → `last` | `modelContextWindow` |
+| acp | `session/update` `usage_update` (`used`, `size`; stable since 2026-06), when the agent sends it | same |
+| opencode | per-message `tokens` (input + cache) | model `limit.context` from the provider list |
+| pi | per-message usage | `model.contextWindow` |
+| agy | per-turn `input_tokens` only | unknown (model table) |
+
+The flush itself is a scheduler-style silent turn (`silent` origin, `NO_REPLY`) asking the agent to `memory_write`, once per compaction cycle, triggered when `contextTokens > window − softThreshold`.
+
+**Failover across providers.** Trigger on `usage_limit` (rate limits are already retried). Profile option `fallback: [profile…]`; the channel runs on the fallback until the primary is usable again. Continuity: claude-tmux ↔ claude-sdk share session files natively; otherwise the new session's first turn gets a handoff block built from the provider-neutral `TranscriptStore` (last N turns, capped in tokens), and when the channel returns to the primary, its still-resumable native session gets a "meanwhile" block with the turns that ran elsewhere. Open questions: automatic vs. ask in chat, when to switch back, raw transcript vs. a summary.
+
+**TODO**
+- Semantic memory search (embeddings / hybrid with the current substring search; OpenClaw: LanceDB, Active Memory).
+- Hooks (user handlers on message / `/new` / startup events), inbound webhooks mapped to sessions, and a control UI (settings, pairing, groups, jobs) — the web dashboard is the natural place.
+- Voice replies (TTS) on top of `send_file`.

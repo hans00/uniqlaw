@@ -96,6 +96,17 @@ export class TelegramApi {
     return { ok: res.ok && !!data?.ok, result: data?.result, status: res.status, description: data?.description };
   }
 
+  /** multipart/form-data upload of one local file as `field` (objects in `fields` are sent as JSON). */
+  async upload<T = unknown>(method: string, fields: Record<string, unknown>, field: string, path: string, name: string): Promise<ApiResult<T>> {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) if (v !== undefined) form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+    form.append(field, Bun.file(path), name);
+    const res = await fetch(`${this.apiBase}/bot${this.token}/${method}`, { method: "POST", body: form });
+    type Body = { ok?: boolean; result?: T; description?: string };
+    const data = (await res.json().catch(() => null)) as Body | null;
+    return { ok: res.ok && !!data?.ok, result: data?.result, status: res.status, description: data?.description };
+  }
+
   fileUrl(filePath: string): string {
     return `${this.apiBase}/file/bot${this.token}/${filePath}`;
   }

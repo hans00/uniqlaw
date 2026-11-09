@@ -3,7 +3,7 @@
 import { randomBytes } from "node:crypto";
 import type {
   Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, PlatformAdapter,
-  PlatformCapabilities, PlatformCommand, Target,
+  OutboundFile, PlatformCapabilities, PlatformCommand, Target,
 } from "@uniqlaw/core";
 import { chunkText, downloadTo, extFromName, kindFromMime, sleep } from "./download.ts";
 
@@ -13,7 +13,7 @@ const INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15); // GUILDS | GUILD_M
 const FLAG_VOICE_MESSAGE = 1 << 13;
 const FATAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 
-export interface DiscordChannelOptions { enabled: boolean; requireMention: boolean; ignoreOtherMentions: boolean }
+export interface DiscordChannelOptions { enabled: boolean; requireMention?: boolean; ignoreOtherMentions?: boolean }
 
 export interface DiscordAdapterOptions {
   token: string;
@@ -46,6 +46,8 @@ export class DiscordAdapter implements PlatformAdapter {
 
   private readonly log: Logger;
   private sink: InboundSink | null = null;
+  private paired = new Set<string>();
+  setPairedUsers(userIds: string[]) { this.paired = new Set(userIds); }
   private ws: WebSocket | null = null;
   private running = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -200,14 +202,22 @@ export class DiscordAdapter implements PlatformAdapter {
   // ── inbound ──────────────────────────────────────────────────────────────
 
   private allowedAuthor(author: { id: string; bot?: boolean }): boolean {
-    return author.bot ? this.opts.allowedBotIds.includes(author.id) : this.opts.allowedUserIds.includes(author.id);
+    return author.bot ? this.opts.allowedBotIds.includes(author.id) : this.opts.allowedUserIds.includes(author.id) || this.paired.has(author.id);
   }
 
   /** Exposed for tests; normally driven by the gateway. */
   async handleMessage(m: any): Promise<void> {
     if (!m?.author || (this.botUserId && m.author.id === this.botUserId)) return;
     const author = m.author as { id: string; bot?: boolean; username?: string; global_name?: string };
-    if (!this.allowedAuthor(author)) { this.log.debug(`discord: rejected message from ${author.id}`); return; }
+    if (!this.allowedAuthor(author)) {
+      this.log.debug(`discord: rejected message from ${author.id}`);
+      if (!author.bot && (m.guild_id ?? null) === null) {
+        this.dmByUser.set(author.id, String(m.channel_id));
+        this.sink?.unknownSender?.({ platform: "discord", userId: author.id, name: String(author.global_name ?? author.username ?? author.id),
+          ...(author.username ? { username: author.username } : {}), replyTarget: { platform: "discord", chatId: String(m.channel_id) } });
+      }
+      return;
+    }
 
     const guildId: string | null = m.guild_id ?? null;
     const channelId = String(m.channel_id);
@@ -218,8 +228,6 @@ export class DiscordAdapter implements PlatformAdapter {
     if (!isDM) {
       const ch = this.opts.channels[channelId];
       if (!ch?.enabled) return;
-      if (ch.requireMention && !mentionsBot && !repliesToBot) return;
-      if (ch.ignoreOtherMentions && !mentionsBot && mentions.length > 0) return;
     } else {
       this.dmByUser.set(author.id, channelId);
     }
@@ -241,6 +249,8 @@ export class DiscordAdapter implements PlatformAdapter {
       text,
       attachments,
       addressed: isDM || mentionsBot || repliesToBot,
+      mentionsOthers: !mentionsBot && mentions.some((u) => u?.id !== this.botUserId),
+      ...(isDM ? {} : groupPolicyOf(this.opts.channels[channelId])),
       receivedAt: Date.now(),
     };
     this.sink?.message(inbound);
@@ -347,6 +357,27 @@ export class DiscordAdapter implements PlatformAdapter {
       if (!first && r.json?.id) first = { platform: "discord", chatId: channelId, messageId: String(r.json.id) };
     }
     return first;
+  }
+
+  /** One message with the file attached (multipart: payload_json + files[0]). Voice notes go as plain audio files. */
+  async sendFile(target: Target, file: OutboundFile): Promise<MsgRef | undefined> {
+    const channelId = await this.resolveChannel(target.chatId);
+    if (!channelId) return undefined;
+    const payload: Record<string, unknown> = { content: file.caption ? clip(file.caption) : "", allowed_mentions: { parse: ["users"], replied_user: false },
+      attachments: [{ id: 0, filename: file.name }] };
+    if (target.replyToMessageId) payload.message_reference = { message_id: target.replyToMessageId, fail_if_not_exists: false };
+    const form = new FormData();
+    form.append("payload_json", JSON.stringify(payload));
+    form.append("files[0]", Bun.file(file.path), file.name);
+    try {
+      const res = await fetch(`${this.opts.apiBase}/channels/${channelId}/messages`, { method: "POST", headers: { authorization: `Bot ${this.opts.token}` }, body: form });
+      const json = (await res.json().catch(() => null)) as { id?: string; message?: string } | null;
+      if (!res.ok || !json?.id) { this.log.error(`discord: file upload failed (${res.status}): ${json?.message ?? ""}`); return undefined; }
+      return { platform: "discord", chatId: channelId, messageId: String(json.id) };
+    } catch (err) {
+      this.log.error(`discord: file upload failed: ${String(err)}`);
+      return undefined;
+    }
   }
 
   async edit(ref: MsgRef, markdown: string): Promise<boolean> {
@@ -475,3 +506,11 @@ export class DiscordAdapter implements PlatformAdapter {
 }
 
 function clip(s: string, max = 2000): string { return s.length > max ? s.slice(0, max - 1) + "…" : s; }
+
+/** v2 per-channel flags → core group policy (only what was set). */
+function groupPolicyOf(ch?: { requireMention?: boolean; ignoreOtherMentions?: boolean }): Pick<InboundMessage, "groupPolicy"> {
+  const p: NonNullable<InboundMessage["groupPolicy"]> = {};
+  if (ch?.requireMention !== undefined) p.mode = ch.requireMention ? "mention" : "always";
+  if (ch?.ignoreOtherMentions !== undefined) p.ignoreOtherMentions = ch.ignoreOtherMentions;
+  return Object.keys(p).length ? { groupPolicy: p } : {};
+}

@@ -101,6 +101,22 @@ export async function runDoctor(projectDirIn: string, deps: DoctorDeps = default
     } catch {}
   }
 
+  // ── transcription ──
+  const engine = settings.transcription.engine;
+  if (engine !== "none") {
+    const cfg = settings.plugins[engine] as Record<string, unknown> | undefined;
+    if (!cfg || cfg.enabled === false) add("fail", "transcription", `transcription.engine is "${engine}" but plugins.${engine} is not configured/enabled`);
+    else if (engine === "whisper") {
+      const ffmpeg = String(cfg.ffmpeg ?? "ffmpeg");
+      add(deps.which(ffmpeg) ? "ok" : "fail", "transcription", `whisper needs \`${ffmpeg}\` to decode voice notes${deps.which(ffmpeg) ? "" : " — not found"}`);
+      const model = typeof cfg.model === "string" ? resolve(projectDir, cfg.model) : undefined;
+      add(model && existsSync(model) ? "ok" : "fail", "transcription", model ? `whisper model ${model}${existsSync(model) ? "" : " — not found"}` : "plugins.whisper.model is required");
+      const { whisperModuleAvailable } = await import("@uniqlaw/transcriber/whisper");
+      if (await whisperModuleAvailable()) add("ok", "transcription", "@fugood/whisper.node is installed");
+      else add("fail", "transcription", "@fugood/whisper.node is not installed or has no build for this platform (run bun install in the UniQlaw checkout)");
+    }
+  }
+
   // ── ClaudeClaw v2 on the same bot ──
   const v2 = detectRunningV2(projectDir);
   if (existsSync(join(projectDir, ".claude", "claudeclaw", "settings.json"))) {

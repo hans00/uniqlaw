@@ -18,8 +18,9 @@ export const discordConfigSchema = z.object({
   /** Guild channels the bot participates in (keyed by channel id). Unlisted guild channels are ignored. */
   channels: z.record(z.string(), z.object({
     enabled: z.boolean().default(true),
-    requireMention: z.boolean().default(false),
-    ignoreOtherMentions: z.boolean().default(false),
+    /** v2 compat; prefer core `groups.channels["discord:<id>"]`. Unset = core `groups` settings. */
+    requireMention: z.boolean().optional(),
+    ignoreOtherMentions: z.boolean().optional(),
   }).passthrough()).prefault({}),
   apiBase: z.string().url().default("https://discord.com/api/v10"),
   gatewayUrl: z.string().default("wss://gateway.discord.gg/?v=10&encoding=json"),
@@ -42,7 +43,9 @@ export default definePlugin({
       allowedUserIds: cfg.allowedUserIds,
       allowedBotIds: cfg.allowedBotIds,
       operatorUserIds: cfg.operatorUserIds ?? cfg.allowedUserIds,
-      channels: Object.fromEntries(Object.entries(cfg.channels).map(([k, v]) => [k, { enabled: v.enabled, requireMention: v.requireMention, ignoreOtherMentions: v.ignoreOtherMentions }])),
+      channels: Object.fromEntries(Object.entries(cfg.channels).map(([k, v]) => [k, { enabled: v.enabled,
+        ...(v.requireMention !== undefined ? { requireMention: v.requireMention } : {}),
+        ...(v.ignoreOtherMentions !== undefined ? { ignoreOtherMentions: v.ignoreOtherMentions } : {}) }])),
       attachmentsDir: join(ctx.stateDir, "attachments"),
       log: ctx.log.child("discord"),
     });

@@ -44,7 +44,22 @@ export interface InboundMessage {
   attachments: Attachment[];
   /** Bot was explicitly addressed (@mention / reply-to-bot) in a multiparty chat. */
   addressed?: boolean;
+  /** Message @mentions someone other than the bot (and not the bot). */
+  mentionsOthers?: boolean;
+  /** Platform-level per-channel group settings (e.g. Discord `channels.<id>.requireMention`); core settings
+   *  `groups.channels` and `/activation` take precedence. */
+  groupPolicy?: { mode?: "mention" | "always"; ignoreOtherMentions?: boolean };
   receivedAt: number;
+}
+
+/** A local file to post to a chat (send_file). `kind` picks how the platform shows it. */
+export interface OutboundFile {
+  path: string;
+  /** File name shown in the chat (default: the path's basename). */
+  name: string;
+  kind: "image" | "audio" | "voice" | "video" | "file";
+  mime?: string;
+  caption?: string;
 }
 
 export interface ChoiceRequest {
@@ -70,8 +85,19 @@ export interface PlatformCommand {
   description: string;
 }
 
+/** A DM from someone not on the allowlist (pairing). Never sent for groups or bots. */
+export interface UnknownSender {
+  platform: string;
+  userId: string;
+  name: string;
+  username?: string;
+  /** Where to answer them (their DM). */
+  replyTarget: Target;
+}
+
 export interface InboundSink {
   message(msg: InboundMessage): void;
+  unknownSender?(s: UnknownSender): void;
 }
 
 export interface PlatformAdapter {
@@ -84,11 +110,15 @@ export interface PlatformAdapter {
   /** Replace a message's content; false if unsupported/failed (caller falls back to send). */
   edit?(ref: MsgRef, markdown: string): Promise<boolean>;
   delete?(ref: MsgRef): Promise<boolean>;
+  /** Post a local file (photo / audio / voice note / video / document). Absent = the platform can't upload files. */
+  sendFile?(target: Target, file: OutboundFile): Promise<MsgRef | undefined>;
   react?(ref: MsgRef, emojis: string[]): Promise<void>;
   typing?(target: Target): Promise<void>;
   /** Show buttons; resolves with the chosen option index, or null on timeout. */
   askChoice?(target: Target, req: ChoiceRequest): Promise<number | null>;
   setCommands?(cmds: PlatformCommand[]): Promise<void>;
+  /** Users approved by pairing: accepted like allowedUserIds, but never operators. Replaces the previous set. */
+  setPairedUsers?(userIds: string[]): void;
   /** Default targets for operator notifications (e.g. allowed DM user ids). */
   operatorTargets(): Target[];
   /** Resolve a v2-style target string ("telegram:<chatId>") into a Target. */
