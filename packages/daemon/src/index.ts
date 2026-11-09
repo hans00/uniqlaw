@@ -119,7 +119,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
 
     // ── gateway + manager ──
     let manager!: ChannelManager;
-    const gateway = new McpGateway(() => manager, log.child("gateway"));
+    const gateway = new McpGateway(() => manager, log.child("gateway"), join(stateDirOf(projectDir), "gateway.json"));
     if (memory) {
       const classify = (caller: string): MemoryOriginKind => {
         const k = manager.kindOf(caller);

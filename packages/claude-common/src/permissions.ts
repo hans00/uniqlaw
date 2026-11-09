@@ -10,7 +10,9 @@ export type ClaudePermissionMode = "acceptEdits" | "auto" | "bypassPermissions" 
 export function permissionModeFor(p: PermissionPolicy, override?: string): ClaudePermissionMode {
   if (override) return override as ClaudePermissionMode;
   switch (p.approval.mode) {
-    case "ask-operator": return "default";
+    // v2 parity: moderate runs Claude Code's auto mode (routine actions approved by its classifier);
+    // whatever still raises a dialog goes to the operator. Other levels prompt for everything.
+    case "ask-operator": return p.level === "moderate" ? "auto" : "default";
     case "auto-deny": return "dontAsk";
     case "auto-allow": return p.level === "unrestricted" ? "bypassPermissions" : "auto";
   }

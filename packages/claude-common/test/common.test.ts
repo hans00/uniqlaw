@@ -11,7 +11,8 @@ import {
 describe("permissions", () => {
   test("always pins mode and disallows native cross-session tools", () => {
     const a = buildPermissionArgs(DEFAULT_PERMISSIONS);
-    expect(a.slice(0, 2)).toEqual(["--permission-mode", "default"]);
+    expect(a.slice(0, 2)).toEqual(["--permission-mode", "auto"]); // moderate + ask-operator (v2 parity)
+    expect(buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "strict" })[1]).toBe("default");
     const deny = a[a.indexOf("--disallowedTools") + 1];
     expect(deny).toContain("ListAgents");
     expect(deny).toContain("SendMessage");

@@ -2,6 +2,7 @@
 // the calling session; tools never accept a "who am I" argument.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import type { ChannelManager } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
@@ -14,13 +15,35 @@ export class McpGateway {
   private byKey = new Map<string, string>();  // channelKey → token
   private server?: ReturnType<typeof Bun.serve>;
 
-  constructor(private manager: () => ChannelManager, private log: Logger) {}
+  private lastPort?: number;
 
+  /** `stateFile` keeps the port and channel tokens across daemon restarts: claude-tmux sessions outlive
+   *  the daemon and are reattached with the MCP URL they were spawned with, so that URL must stay valid. */
+  constructor(private manager: () => ChannelManager, private log: Logger, private stateFile?: string) {
+    if (stateFile && existsSync(stateFile)) {
+      try {
+        const s = JSON.parse(readFileSync(stateFile, "utf8")) as { port?: number; tokens?: Record<string, string> };
+        this.lastPort = s.port;
+        for (const [key, token] of Object.entries(s.tokens ?? {})) {
+          this.byKey.set(key, token);
+          this.tokens.set(token, key);
+        }
+      } catch (e) { log.warn("ignoring unreadable gateway state file", { file: stateFile, error: String(e) }); }
+    }
+  }
+
+  private save() {
+    if (this.stateFile) writeFileSync(this.stateFile, JSON.stringify({ port: this.server?.port, tokens: Object.fromEntries(this.byKey) }, null, 2), { mode: 0o600 });
+  }
+
+  /** With `port` 0, the previous run's port is tried first (see constructor). */
   start(host: string, port: number) {
-    this.server = Bun.serve({
-      hostname: host, port, idleTimeout: 255,
-      fetch: (req) => this.handle(req),
-    });
+    const serve = (p: number) => Bun.serve({ hostname: host, port: p, idleTimeout: 255, fetch: (req) => this.handle(req) });
+    if (port === 0 && this.lastPort) {
+      try { this.server = serve(this.lastPort); } catch { this.log.warn("previous gateway port taken; reattached sessions lose MCP until respawned", { port: this.lastPort }); }
+    }
+    this.server ??= serve(port);
+    this.save();
     this.log.info("mcp gateway listening", { url: `http://${host}:${this.server.port}` });
     return this.server.port;
   }
@@ -34,7 +57,7 @@ export class McpGateway {
 
   get port() { return this.server?.port; }
 
-  /** Stable per-channel token for this daemon run. */
+  /** Stable per-channel token (kept across restarts when a state file is set). */
   endpointFor(channelKey: string) {
     if (!this.server) return undefined;
     let token = this.byKey.get(channelKey);
@@ -42,6 +65,7 @@ export class McpGateway {
       token = crypto.randomUUID().replace(/-/g, "");
       this.byKey.set(channelKey, token);
       this.tokens.set(token, channelKey);
+      this.save();
     }
     return { url: `http://${this.server.hostname}:${this.server.port}/mcp/${token}`, token, toolNames: this.toolNames() };
   }
