@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { isAlive, listInstances, loadSettings, readRuntime, runForever, stateDirOf } from "@uniqlaw/daemon";
-import type { DreamReport } from "@uniqlaw/core";
+import { resolveSecret, type DreamReport, type SecretRef } from "@uniqlaw/core";
 
 const USAGE = `uniqlaw <command> [options]
 
@@ -49,8 +49,11 @@ async function api(projectDir: string, path: string, body?: unknown) {
   const rt = readRuntime(projectDir);
   if (!rt || !isAlive(rt.pid)) throw new Error(`daemon is not running for ${projectDir}`);
   if (!rt.webPort) throw new Error("daemon has the HTTP API disabled (web.enabled=false)");
-  const res = await fetch(`http://127.0.0.1:${rt.webPort}${path}`, body === undefined ? {} : {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  // web.token protects the API; the CLI must present it too.
+  const ref = loadSettings(projectDir).web.token;
+  const auth: Record<string, string> = ref ? { authorization: `Bearer ${await resolveSecret(ref as SecretRef)}` } : {};
+  const res = await fetch(`http://127.0.0.1:${rt.webPort}${path}`, body === undefined ? { headers: auth } : {
+    method: "POST", headers: { "content-type": "application/json", ...auth }, body: JSON.stringify(body),
   });
   return res.json() as Promise<Record<string, unknown>>;
 }
