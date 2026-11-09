@@ -74,6 +74,9 @@ export interface SessionInit {
   env: Record<string, string>;
   log: Logger;
   timings?: Partial<Timings>;
+  /** Kill and restart claude with the current profile flags (--resume); used for a stale reattached process. */
+  respawn?: () => Promise<void>;
+  readyTimeoutMs?: number;
 }
 
 const fp = (s: string) => createHash("sha1").update(s).digest("hex").slice(0, 12);
@@ -89,6 +92,8 @@ export class ClaudeTmuxSession implements AgentSession {
   private log: Logger;
   private tailer: JsonlTailer;
   private state: State = "starting";
+  private staleLaunch = false;
+  private respawning = false;
   private turnId = "";
   private turnSeq = 0;
   private closed = false;
@@ -139,10 +144,11 @@ export class ClaudeTmuxSession implements AgentSession {
   // ───────────────────────── lifecycle ─────────────────────────
 
   /** Called by the provider after spawn/reattach. */
-  async start(o: { reattach: boolean; readyTimeoutMs?: number }): Promise<void> {
+  async start(o: { reattach: boolean; readyTimeoutMs?: number; staleLaunch?: boolean }): Promise<void> {
     this.emit({ type: "session", providerSessionId: this.providerSessionId });
     this.tailer.start();
     if (o.reattach) {
+      this.staleLaunch = !!o.staleLaunch && !!this.init.respawn;
       const pane = await this.tmux.capture(this.name).catch(() => "");
       if (looksActivelyBusy(pane)) {
         this.state = "running";
@@ -150,6 +156,7 @@ export class ClaudeTmuxSession implements AgentSession {
       } else if (isReady(pane)) {
         this.setIdle();
       }
+      // Otherwise (e.g. sitting on a permission dialog: neither busy nor ready) the first poll classifies it.
     } else {
       const r = await waitForReady(this.tmux, this.name, {
         timeoutMs: o.readyTimeoutMs,
@@ -317,6 +324,24 @@ export class ClaudeTmuxSession implements AgentSession {
     this.emit({ type: "turn_start", turnId: this.turnId });
   }
 
+  /** Restart a reattached claude whose launch flags no longer match the profile; input waits (waitReady) meanwhile. */
+  private async respawnStale() {
+    this.state = "starting";
+    this.respawning = true;
+    try {
+      await this.init.respawn!();
+      const r = await waitForReady(this.tmux, this.name, { timeoutMs: this.init.readyTimeoutMs,
+        onPrompt: (label) => this.log.info(`startup prompt handled: ${label}`) });
+      if (r.status !== "ready") this.log.warn("respawned claude is not ready yet", { status: r.status });
+      else this.setIdle();
+    } catch (e) {
+      this.log.error("respawn failed", { e: String(e) });
+      this.onDead(`respawn failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      this.respawning = false;
+    }
+  }
+
   private endTurn(reason: "done" | "interrupted" | "error", error?: string) {
     if (this.state !== "running") return;
     this.clearTimer("slashTimer");
@@ -330,6 +355,11 @@ export class ClaudeTmuxSession implements AgentSession {
   }
 
   private setIdle() {
+    if (this.staleLaunch && !this.closed && !this.pendingSteers.length) {
+      this.staleLaunch = false;
+      void this.respawnStale();
+      return;
+    }
     this.state = "idle";
     for (const w of this.readyWaiters.splice(0)) w();
     for (const w of this.idleWaiters.splice(0)) w();
@@ -441,7 +471,7 @@ export class ClaudeTmuxSession implements AgentSession {
   }
 
   private async poll() {
-    if (this.closed) return;
+    if (this.closed || this.respawning) return;
     let pane: string;
     try { pane = await this.tmux.capture(this.name); }
     catch {
@@ -455,8 +485,11 @@ export class ClaudeTmuxSession implements AgentSession {
     if (await this.checkLogin(pane)) return;
 
     if (this.state === "starting") {
-      if (isReady(pane)) this.setIdle();
-      return;
+      if (isReady(pane)) { this.setIdle(); return; }
+      // A reattached pane may sit on a dialog (it opened while the daemon was down): surface it now,
+      // or nobody answers it and the turn stalls.
+      const d = parsePermissionDialog(pane);
+      if (!d || d.kind === "login") return;
     }
 
     await this.checkDialogs(pane);

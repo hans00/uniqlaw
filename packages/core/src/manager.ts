@@ -139,7 +139,11 @@ export class ChannelManager {
       if (!row.providerSessionId || this.runtimes.has(row.channelKey)) continue;
       // A handoff takeover is still in progress: the human's own CLI owns the conversation.
       if (this.terminalHold(row.channelKey)?.live === false) continue;
-      try { this.runtime(row.channelKey, row.multiparty); } catch (e) { this.deps.log.warn("restore skipped", { key: row.channelKey, e: String(e) }); }
+      try {
+        const rt = this.runtime(row.channelKey, row.multiparty);
+        // It was mid-turn when the daemon stopped: reattach now so the reply is delivered, not at the next message.
+        if (this.deps.store.get(`inflight-turn:${row.channelKey}`)) void rt.ensureOpen();
+      } catch (e) { this.deps.log.warn("restore skipped", { key: row.channelKey, e: String(e) }); }
     }
   }
 

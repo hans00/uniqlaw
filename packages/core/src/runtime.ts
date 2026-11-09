@@ -89,6 +89,8 @@ const STREAM_FIRST_MS = 800;
 const STREAM_EDIT_MS = 1500;
 const STREAM_MIN_CHARS = 24;
 const MAX_RATE_LIMIT_RETRIES = 3;
+/** How long after reopening a turn may still claim the origins of the turn that was in flight at detach. */
+const RESUME_ORIGINS_MS = 120_000;
 /** First retry delay; doubles each attempt. Overridable for tests via UNIQLAW_RATE_LIMIT_BACKOFF_MS. */
 const rateLimitBackoffMs = () => Number(process.env.UNIQLAW_RATE_LIMIT_BACKOFF_MS ?? 30_000);
 const INTERRUPT_SETTLE_MS = 8000;
@@ -115,6 +117,8 @@ export class ChannelRuntime {
    *  (steer raced with turn end), that turn belongs to these origins, not to "background". */
   private steerLog: { origin: Origin; at: number }[] = [];
   private steerCarry?: { origins: Origin[]; until: number };
+  /** Who a turn answered when the daemon detached mid-turn (see detach); used by the first turn after reopening. */
+  private resumeOrigins?: { origins: Origin[]; until: number };
   private retryTimer?: ReturnType<typeof setTimeout>;
   private stallTimer?: ReturnType<typeof setTimeout>;
   /** A permission/input request is waiting for a human: the stall watchdog is paused. */
@@ -248,6 +252,10 @@ export class ChannelRuntime {
   /** Daemon shutdown: keep the provider process alive for reattach when supported. */
   async detach(): Promise<void> {
     if (this.session?.detach) {
+      // A turn still running in the provider (e.g. claude-tmux keeps working through a reload): remember who it
+      // answers, so the reattached session delivers the reply to them instead of treating it as background output.
+      const keep = (this.turn?.origins ?? []).filter((o) => o.kind === "human" || (o.kind === "scheduler" && !o.taskId));
+      if (this.state === "running" && keep.length) this.host.store.set(`inflight-turn:${this.channelKey}`, JSON.stringify(keep));
       const s = this.session;
       this.session = undefined;
       this.stopTyping();
@@ -316,6 +324,11 @@ export class ChannelRuntime {
         instanceId: this.host.instanceId,
         nativeMemory: !this.host.settings.memory.enabled || this.host.settings.memory.nativeMemory,
       });
+      const inflight = this.host.store.get(`inflight-turn:${this.channelKey}`);
+      if (inflight) {
+        this.host.store.del(`inflight-turn:${this.channelKey}`);
+        try { this.resumeOrigins = { origins: JSON.parse(inflight) as Origin[], until: Date.now() + RESUME_ORIGINS_MS }; } catch {}
+      }
       this.session = session;
       this.state = "idle";
       void this.consume(session);
@@ -470,7 +483,8 @@ export class ChannelRuntime {
         if (!this.turn) {
           const carry = this.steerCarry && Date.now() < this.steerCarry.until ? this.steerCarry.origins : undefined;
           this.steerCarry = undefined;
-          this.turn = { origins: carry ?? [], startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: !carry };
+          const resumed = carry ? undefined : this.takeResumeOrigins();
+          this.turn = { origins: carry ?? resumed ?? [], startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: !carry && !resumed };
           this.state = "running";
           this.startTyping();
         }
@@ -484,7 +498,7 @@ export class ChannelRuntime {
           return;
         }
         if (this.turn && this.turn.origins.length) return; // core already owns this turn
-        this.turn = { origins: [{ kind: "system", reason: "background" }], startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: true };
+        this.turn = { origins: this.takeResumeOrigins() ?? [{ kind: "system", reason: "background" }], startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: true };
         this.state = "running";
         return;
       case "text":
@@ -659,24 +673,33 @@ export class ChannelRuntime {
 
   private async postToolStatus(line: string) {
     const target = this.visibleTarget();
-    if (!target || !this.turn) return;
+    // Hold on to this turn: it may end (or the daemon may detach) while we await the platform.
+    const turn = this.turn;
+    if (!target || !turn) return;
     const p = this.host.platform(target.platform);
     if (!p) return;
-    this.turn.toolLines.push(line);
+    turn.toolLines.push(line);
     const stream = this.host.settings.output.stream;
-    if (this.turn.toolBubble && p.edit && stream !== "off") {
-      const lines = this.turn.toolLines.slice(-8);
-      const ok = await p.edit(this.turn.toolBubble, lines.join("\n")).catch(() => false);
+    if (turn.toolBubble && p.edit && stream !== "off") {
+      const lines = turn.toolLines.slice(-8);
+      const ok = await p.edit(turn.toolBubble, lines.join("\n")).catch(() => false);
       if (ok) return;
     }
     const { replyToMessageId: _r, ...plain } = target;
-    this.turn.toolBubble = await p.send(plain, line).catch(() => undefined);
-    if (this.turn.toolBubble) (this.turn.toolBubbles ??= []).push(this.turn.toolBubble);
-    if (stream !== "replace") this.turn.toolBubble = undefined;
-    this.turn.toolLines = [line];
+    const bubble = await p.send(plain, line).catch(() => undefined);
+    turn.toolBubble = stream === "replace" ? bubble : undefined;
+    if (bubble) (turn.toolBubbles ??= []).push(bubble);
+    turn.toolLines = [line];
   }
 
   /** (Re)start the stall watchdog while a turn is running. */
+  /** Origins of a turn that was in flight when the daemon detached (once, shortly after reopening). */
+  private takeResumeOrigins(): Origin[] | undefined {
+    const r = this.resumeOrigins;
+    this.resumeOrigins = undefined;
+    return r && Date.now() < r.until ? r.origins : undefined;
+  }
+
   private armStall() {
     clearTimeout(this.stallTimer);
     const sec = this.host.settings.turn.stallTimeoutSec;

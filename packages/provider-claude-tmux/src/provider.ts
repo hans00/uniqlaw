@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
 import {
@@ -65,50 +65,75 @@ export class ClaudeTmuxProvider implements AgentProvider {
 
     this.sessions.get(spec.sessionId)?.detach();
 
+    const existing = spec.providerSessionId ? locateJsonl(providerSessionId, env) : undefined;
+    const dir = join(this.deps.stateDir, "claude-tmux", slug(spec.sessionId));
+    mkdirSync(dir, { recursive: true });
+    const launchArgs = (resume: boolean) => {
+      const argv = [this.cfg.claudePath, resume ? "--resume" : "--session-id", providerSessionId];
+      if (spec.profile.model) argv.push("--model", spec.profile.model);
+      argv.push(...buildPermissionArgs(spec.profile.permissions, {
+        modeOverride: opts.permissionMode,
+        extraAllowed: spec.mcp ? [`mcp__${MCP_SERVER_NAME}`] : [],
+      }));
+      const append = composeAppendSystemPrompt({
+        parts: spec.systemPrompt, permissions: spec.profile.permissions, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames,
+      });
+      // Via a file: tmux rejects a new-session command over ~16 KB ("command too long"),
+      // and MEMORY.md alone may be up to 24 KB.
+      if (append) {
+        const file = join(dir, "append-system-prompt.md");
+        writeFileSync(file, append, { mode: 0o600 });
+        argv.push("--append-system-prompt-file", file);
+      }
+      if (spec.mcp) argv.push("--mcp-config", writeMcpConfig(join(dir, "mcp.json"), spec.mcp.url));
+      argv.push(...nativeMemoryArgs(spec.nativeMemory));
+      if (opts.extraArgs?.length) argv.push(...opts.extraArgs);
+      return argv;
+    };
+    const launchFile = join(dir, "launch.sha");
+    const spawn = async (resume: boolean) => {
+      const argv = launchArgs(resume);
+      await tmux.newSession(name, { cwd: spec.cwd, env, argv, width: this.cfg.width, height: this.cfg.height });
+      writeFileSync(launchFile, launchFingerprint(argv));
+    };
+
     // Reattach after a daemon restart.
     if (spec.providerSessionId && (await tmux.hasSession(name)) && !(await tmux.paneDead(name))) {
-      log.info("reattaching to existing tmux session", { name });
-      const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings }, "end");
-      await s.start({ reattach: true });
+      // The live claude keeps the flags it was started with (permission mode, model, tools, …). If the profile
+      // changed since, respawn it with --resume once it is idle; the conversation is kept.
+      const want = launchFingerprint(launchArgs(true));
+      const had = existsSync(launchFile) ? readFileSync(launchFile, "utf8").trim() : undefined;
+      const stale = had !== want;
+      log.info("reattaching to existing tmux session", { name, ...(stale ? { staleLaunchArgs: true } : {}) });
+      const respawn = async () => {
+        log.info("respawning claude with the current profile flags (--resume)", { name });
+        await tmux.killSession(name);
+        await spawn(!!locateJsonl(providerSessionId, env));
+      };
+      const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings,
+        respawn, readyTimeoutMs: this.cfg.readyTimeoutMs }, "end");
+      await s.start({ reattach: true, staleLaunch: stale });
       this.sessions.set(spec.sessionId, s);
       return s;
     }
     await tmux.killSession(name); // dead pane left by remain-on-exit
 
-    const existing = spec.providerSessionId ? locateJsonl(providerSessionId, env) : undefined;
     if (existing && this.cfg.takeOverLegacy) {
       const killed = await killLegacySessions(providerSessionId, this.deps.legacy ?? systemLegacyDeps());
       if (killed.length) log.warn("killed legacy tmux sessions holding this claude session", { killed });
     }
 
-    const argv = [this.cfg.claudePath, existing ? "--resume" : "--session-id", providerSessionId];
-    if (spec.profile.model) argv.push("--model", spec.profile.model);
-    argv.push(...buildPermissionArgs(spec.profile.permissions, {
-      modeOverride: opts.permissionMode,
-      extraAllowed: spec.mcp ? [`mcp__${MCP_SERVER_NAME}`] : [],
-    }));
-    const append = composeAppendSystemPrompt({
-      parts: spec.systemPrompt, permissions: spec.profile.permissions, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames,
-    });
-    const dir = join(this.deps.stateDir, "claude-tmux", slug(spec.sessionId));
-    mkdirSync(dir, { recursive: true });
-    // Via a file: tmux rejects a new-session command over ~16 KB ("command too long"),
-    // and MEMORY.md alone may be up to 24 KB.
-    if (append) {
-      const file = join(dir, "append-system-prompt.md");
-      writeFileSync(file, append, { mode: 0o600 });
-      argv.push("--append-system-prompt-file", file);
-    }
-    if (spec.mcp) argv.push("--mcp-config", writeMcpConfig(join(dir, "mcp.json"), spec.mcp.url));
-    argv.push(...nativeMemoryArgs(spec.nativeMemory));
-    if (opts.extraArgs?.length) argv.push(...opts.extraArgs);
-
     log.info("spawning claude", { name, resume: !!existing, providerSessionId });
-    await tmux.newSession(name, { cwd: spec.cwd, env, argv, width: this.cfg.width, height: this.cfg.height });
+    await spawn(!!existing);
     const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings },
       existing ? "end" : "start");
     await s.start({ reattach: false, readyTimeoutMs: this.cfg.readyTimeoutMs });
     this.sessions.set(spec.sessionId, s);
     return s;
   }
+}
+
+/** Launch flags that matter for a live process: everything but the session-id/resume pair. */
+export function launchFingerprint(argv: string[]): string {
+  return new Bun.CryptoHasher("sha256").update(JSON.stringify([argv[0], ...argv.slice(3)])).digest("hex");
 }

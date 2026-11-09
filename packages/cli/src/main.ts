@@ -2,6 +2,7 @@
 // uniqlaw CLI: init | doctor | start | stop | reload | status | logs | ls | send | trigger | workers | worker | attach | run | mcp-shim
 import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { findProjectDir } from "./project.ts";
 import { isAlive, listInstances, loadSettings, readRuntime, runForever, stateDirOf } from "@uniqlaw/daemon";
 import { resolveSecret, type DreamReport, type SecretRef } from "@uniqlaw/core";
 
@@ -62,7 +63,7 @@ async function api(projectDir: string, path: string, body?: unknown) {
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { flags, pos } = parse(rest);
-  const projectDir = resolve(String(flags.project ?? process.cwd()));
+  const projectDir = flags.project !== undefined ? resolve(String(flags.project)) : cmd === "init" ? process.cwd() : findProjectDir(process.cwd());
 
   switch (cmd) {
     case "init": {

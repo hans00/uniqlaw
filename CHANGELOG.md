@@ -17,3 +17,10 @@ First public version.
 - `send_file` bus tool: agents post local files (image, audio, voice note, video, document) to their own or another chat without calling platform APIs. Telegram, Discord and Slack (needs the `files:write` scope); limited to the project, the session's directory, the temp dir, `workers.roots` and `files.roots`, up to `files.maxMB`.
 - Group modes: `mention` (default; unaddressed messages are kept as context for the next turn) or `always`, with `ignoreOtherMentions`, per-channel settings (`groups.channels`) and `/activation`. Discord's v2 per-channel `requireMention` / `ignoreOtherMentions` map onto them; unaddressed messages are no longer dropped.
 - Agent-guided migration from ClaudeClaw v2 (`docs/MIGRATE.md`), including importing Claude auto-memory.
+
+### Fixes
+
+- claude-tmux: a permission dialog that opened while the daemon was down (pane neither busy nor ready on reattach) was never forwarded, so the turn stalled for `turn.stallTimeoutSec`. It is now detected on the first poll and sent to the operator.
+- claude-tmux: a reattached claude whose launch flags no longer match the profile (permission mode, model, tools, …) is respawned with `--resume` once idle; the conversation is kept. The flags are fingerprinted per session at spawn.
+- A turn still running when the daemon stops or reloads now keeps its reply: the session is reopened on startup and the reply goes to the chat that asked. Also fixes `this.turn.toolBubble` errors when a turn ends while a tool status is being posted.
+- CLI commands find the project from any subdirectory, including `.uniqlaw/` itself (`init` still uses the current directory).
