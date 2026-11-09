@@ -4,6 +4,6 @@
   "license": "MIT",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts", "./cron": "./src/cron-plugin.ts", "./heartbeat": "./src/heartbeat-plugin.ts" },
+  "exports": { ".": "./src/index.ts", "./cron": "./src/cron-plugin.ts", "./heartbeat": "./src/heartbeat-plugin.ts", "./dreaming": "./src/dreaming-plugin.ts" },
   "dependencies": { "@uniqlaw/core": "workspace:*", "zod": "^4.6.6" }
 }

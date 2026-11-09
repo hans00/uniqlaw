@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_PERMISSIONS } from "@uniqlaw/core";
 import {
   buildPermissionArgs, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
-  isInterruptMarker, isRejectionText, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
+  isInterruptMarker, isRejectionText, nativeMemoryArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
 } from "../src/index.ts";
 
 describe("permissions", () => {
@@ -71,6 +71,13 @@ describe("classify + prompt + mcp + credentials", () => {
     expect(s).toContain("mcp__uniqlaw__agent_ask");
     expect(s).toContain("/w");
     expect(mcpConfigObject("http://x").mcpServers.uniqlaw.alwaysLoad).toBe(true);
+  });
+  test("native memory off → Claude auto-memory and auto-dream disabled (CLI flag and SDK option)", () => {
+    expect(nativeMemoryArgs(false)).toEqual(["--settings", '{"autoMemoryEnabled":false,"autoDreamEnabled":false}']);
+    expect(nativeMemoryArgs(undefined)).toEqual([]);
+    expect(nativeMemoryArgs(true)).toEqual([]);
+    expect(nativeMemorySettings(false)).toEqual({ settings: { autoMemoryEnabled: false, autoDreamEnabled: false } });
+    expect(nativeMemorySettings(true)).toEqual({});
   });
   test("credential env", async () => {
     delete process.env.UQ_TEST_KEY; // other test files in the same `bun test` run may have set it

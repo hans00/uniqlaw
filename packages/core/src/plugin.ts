@@ -2,6 +2,7 @@
 import type { z } from "zod";
 import type { AgentProvider } from "./provider.ts";
 import type { PlatformAdapter } from "./platform.ts";
+import type { MemoryStore } from "./memory.ts";
 
 export interface Logger {
   debug(msg: string, extra?: Record<string, unknown>): void;
@@ -36,6 +37,12 @@ export interface SchedulerApi {
   /** Durable per-plugin key/value (e.g. lastFiredAt for catch-up). */
   kvGet(key: string): string | undefined;
   kvSet(key: string, value: string): void;
+  /** Run one turn in an internal session and get its final reply (ChannelManager.complete). */
+  complete?(o: { channelKey: string; text: string; job: string; profile?: string; model?: string; timeoutMs?: number; fresh?: boolean }): Promise<{ ok: boolean; text: string }>;
+  /** UniQlaw memory, when enabled. */
+  memory?: MemoryStore;
+  /** Leave a note for every open chat session (delivered with its next turn). */
+  noteToOpenChats?(label: string, text: string): number;
 }
 
 /** A tool a plugin contributes to the MCP Gateway. `caller` is the calling session (from its token). */
@@ -52,6 +59,8 @@ export interface Scheduler {
   stop(): void | Promise<void>;
   /** Optional MCP tools for agents (e.g. cron job management). */
   tools?(): GatewayTool[];
+  /** Optional manual run (`uniqlaw dream`, POST /api/scheduler/<name>/run). */
+  runNow?(opts: Record<string, unknown>): Promise<unknown>;
 }
 
 /** An agent reachable through a transport (e.g. a remote A2A agent). Appears in agents_list. */

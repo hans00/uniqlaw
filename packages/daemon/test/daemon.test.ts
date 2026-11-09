@@ -47,9 +47,12 @@ test("boots, writes runtime.json, routes a message end-to-end, serves the API", 
 
   // system prompt: brand + prompt file + dir scope + bus tools; MCP endpoint issued
   const spec = lastSpecs.at(-1) as { systemPrompt: { fragments: { id: string; text: string }[] }; mcp: { url: string; toolNames: string[] }; env: Record<string, string> };
-  expect(spec.systemPrompt.fragments.map((f) => f.id)).toEqual(["brand", "file:prompts/IDENTITY.md", "dir-scope", "reactions", "bus-tools", "workers"]);
+  expect(spec.systemPrompt.fragments.map((f) => f.id)).toEqual(["brand", "file:prompts/IDENTITY.md", "dir-scope", "reactions", "bus-tools", "memory", "workers"]);
   expect(spec.mcp.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/[a-f0-9]+$/);
   expect(spec.env.UNIQLAW_INSTANCE).toBe(rt.instanceId);
+  // UniQlaw memory is on by default: memory tools offered, provider-native memory turned off
+  expect(spec.mcp.toolNames).toEqual(expect.arrayContaining(["memory_write", "memory_search", "memory_get"]));
+  expect((spec as unknown as { nativeMemory?: boolean }).nativeMemory).toBe(false);
   expect(Object.keys(spec.env).some((k) => k.includes("TOKEN") || k.includes("KEY"))).toBe(false);
 
   const status = await (await fetch(`http://127.0.0.1:${d.webPort}/api/status`)).json() as { agents: { name: string }[] };

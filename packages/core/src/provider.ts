@@ -83,6 +83,9 @@ export interface SessionSpec {
   env: Record<string, string>;
   /** Instance-scoped namespace for anything global (tmux socket, process names). */
   instanceId: string;
+  /** false: UniQlaw memory is in use; disable the provider's own memory features if it has any
+   *  (Claude Code auto-memory / auto-dream). Undefined/true: leave them as configured. */
+  nativeMemory?: boolean;
 }
 
 export type PermissionDecision =

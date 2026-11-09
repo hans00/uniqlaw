@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   BRAND_PROMPT, ChannelManager, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
-  createLogger, dirScopePrompt, parseSettings, resolveSecret,
+  createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, type MemoryOriginKind,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
   type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transport,
 } from "@uniqlaw/core";
@@ -29,6 +29,7 @@ const BUILTIN: Record<string, () => Promise<{ default: PluginDef }>> = {
   line: () => import("@uniqlaw/platform-line") as Promise<{ default: PluginDef }>,
   cron: () => import("@uniqlaw/scheduler/cron") as Promise<{ default: PluginDef }>,
   heartbeat: () => import("@uniqlaw/scheduler/heartbeat") as Promise<{ default: PluginDef }>,
+  dreaming: () => import("@uniqlaw/scheduler/dreaming") as Promise<{ default: PluginDef }>,
   a2a: () => import("@uniqlaw/transport-a2a") as Promise<{ default: PluginDef }>,
 };
 /** Built-ins that load unless explicitly disabled. */
@@ -111,9 +112,23 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     }
     if (!profiles.has(settings.bindings.default)) throw new Error(`bindings.default "${settings.bindings.default}" is not a profile`);
 
+    // ── memory ──
+    const memory = settings.memory.enabled
+      ? new MemoryStore(projectDir, store, { dir: settings.memory.dir, maxInjectBytes: settings.memory.maxInjectBytes, timezone: settings.timezone })
+      : undefined;
+
     // ── gateway + manager ──
     let manager!: ChannelManager;
     const gateway = new McpGateway(() => manager, log.child("gateway"));
+    if (memory) {
+      const classify = (caller: string): MemoryOriginKind => {
+        const k = manager.kindOf(caller);
+        // Group chats include people who aren't operators: their notes are kept but never promoted.
+        if (k === "chat") return store.getSession(caller)?.multiparty ? "group" : "chat";
+        return k === "worker" ? "worker" : k === "a2a" ? "remote" : "internal";
+      };
+      gateway.addTools(memory.tools(classify, (caller) => caller !== DREAM_SESSION));
+    }
     for (const s of schedulers.values()) if (s.tools) gateway.addTools(s.tools());
     const gatewayPort = gateway.start(settings.mcpGateway.host, settings.mcpGateway.port);
     cleanups.push(() => gateway.stop());
@@ -122,7 +137,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     manager = new ChannelManager({
       log, settings, store, transcript, projectDir, instanceId, providers, platforms, profiles,
       gatewayFor: (key) => gateway.endpointFor(key),
-      systemPrompt: (profile, multiparty, toolNames, session) => buildSystemPrompt(projectDir, settings, profile, multiparty, toolNames, session),
+      systemPrompt: (profile, multiparty, toolNames, session) => buildSystemPrompt(projectDir, settings, profile, multiparty, toolNames, session, memory),
       providerEnv: async () => {
         const env: Record<string, string> = {};
         for (const k of BASE_ENV_KEYS) if (process.env[k]) env[k] = process.env[k]!;
@@ -154,6 +169,9 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
         isBusy: (k) => manager.isBusy(k),
         kvGet: (k) => store.get(`${name}:${k}`),
         kvSet: (k, v) => store.set(`${name}:${k}`, v),
+        complete: (o) => manager.complete(o),
+        ...(memory ? { memory } : {}),
+        noteToOpenChats: (label, text) => manager.noteToOpenChats(label, text),
       });
       cleanups.push(() => sch.stop());
     }
@@ -177,7 +195,14 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
       const cronDir = (settings.plugins.cron as { dir?: string } | undefined)?.dir ?? ".uniqlaw/jobs";
       const api = startApi({ manager, store, host: settings.web.host, port: settings.web.port, log: log.child("api"), version: VERSION, token,
         validateSettings: () => { loadSettings(projectDir); },
-        logFile: join(stateDir, "logs", "daemon.log"), jobsDir: resolve(projectDir, cronDir), timezone: settings.timezone });
+        logFile: join(stateDir, "logs", "daemon.log"), jobsDir: resolve(projectDir, cronDir), timezone: settings.timezone,
+        ...(memory ? { dream: async ({ dryRun }: { dryRun?: boolean }) => {
+          const sch = schedulers.get("dreaming");
+          if (sch?.runNow) return sch.runNow({ dryRun });
+          // Not enabled: a dry run (ranking only, no model, no writes) still works with default thresholds.
+          if (dryRun) return runDreamSweep({ memory, maxMemoryBytes: memory.maxInjectBytes, complete: async () => ({ ok: false, text: "dry run" }) }, DEFAULT_DREAMING, { dryRun: true });
+          throw new Error("dreaming is not enabled: add \"dreaming\": {} under plugins in settings.json");
+        } } : {}) });
       webPort = api.port;
       cleanups.push(() => api.stop());
     }
@@ -211,8 +236,11 @@ async function claimSecret(cfg: Record<string, unknown>): Promise<string | undef
   return undefined;
 }
 
+/** Internal session the dreaming sweep runs its model turns in. */
+export const DREAM_SESSION = "dream";
+
 export async function buildSystemPrompt(projectDir: string, settings: Settings, profile: Profile, multiparty: boolean, toolNames: string[],
-  session?: SessionContext): Promise<SystemPromptParts> {
+  session?: SessionContext, memory?: MemoryStore): Promise<SystemPromptParts> {
   const fragments: { id: string; text: string }[] = [{ id: "brand", text: BRAND_PROMPT }];
   // Workers get the profile's own prompt files only: the assistant persona (IDENTITY/USER/SOUL) is for chats.
   const files = (profile.options.prompts as string[] | undefined) ?? (session?.worker ? [] : settings.prompts.files);
@@ -227,6 +255,10 @@ export async function buildSystemPrompt(projectDir: string, settings: Settings, 
   fragments.push({ id: "reactions", text: REACTION_PROMPT });
   if (toolNames.length) fragments.push({ id: "bus-tools", text: busToolsPrompt(toolNames) });
   if (session?.internal) fragments.push({ id: "internal-session", text: internalSessionPrompt(session.channelKey) });
+  // Memory: chats and internal sessions share one memory; workers work on code elsewhere and don't get it.
+  if (memory && !session?.worker && session?.channelKey !== DREAM_SESSION && toolNames.includes("memory_search")) {
+    fragments.push({ id: "memory", text: memoryPrompt(memory.injectText(), { canWrite: true, promotable: !session?.internal && !multiparty }) });
+  }
   if (toolNames.includes("worker_start")) {
     const roots = settings.workers.roots.length ? settings.workers.roots.map((r) => resolve(projectDir, expandHome(r))) : [projectDir];
     const allowed = Object.entries(settings.profiles).filter(([n]) => !settings.workers.profiles.length || settings.workers.profiles.includes(n))

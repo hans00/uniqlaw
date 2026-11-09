@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
 import {
-  baseChildEnv, buildPermissionArgs, claudeEnvForCredential, composeAppendSystemPrompt, locateJsonl,
+  baseChildEnv, buildPermissionArgs, nativeMemoryArgs, claudeEnvForCredential, composeAppendSystemPrompt, locateJsonl,
   MCP_SERVER_NAME, writeMcpConfig,
 } from "@uniqlaw/claude-common";
 import { Tmux } from "./tmux.ts";
@@ -96,6 +96,7 @@ export class ClaudeTmuxProvider implements AgentProvider {
       mkdirSync(dir, { recursive: true });
       argv.push("--mcp-config", writeMcpConfig(join(dir, "mcp.json"), spec.mcp.url));
     }
+    argv.push(...nativeMemoryArgs(spec.nativeMemory));
     if (opts.extraArgs?.length) argv.push(...opts.extraArgs);
 
     log.info("spawning claude", { name, resume: !!existing, providerSessionId });

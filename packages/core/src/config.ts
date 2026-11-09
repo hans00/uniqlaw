@@ -96,6 +96,16 @@ export const settingsSchema = z.object({
     profiles: z.array(z.string()).default([]),
     max: z.number().int().positive().default(8),
   }).prefault({}),
+  /** UniQlaw's own long-term memory (memory/MEMORY.md + daily notes), shared by every session. */
+  memory: z.object({
+    enabled: z.boolean().default(true),
+    /** Directory relative to the project. */
+    dir: z.string().default("memory"),
+    /** Bytes of MEMORY.md injected into prompts. */
+    maxInjectBytes: z.number().int().positive().default(24_000),
+    /** Keep provider-native memory too (Claude Code auto-memory / auto-dream). Off = UniQlaw memory only. */
+    nativeMemory: z.boolean().default(false),
+  }).prefault({}),
   mcpGateway: z.object({ host: z.string().default("127.0.0.1"), port: z.number().int().nonnegative().default(0) }).prefault({}),
   web: z.object({
     enabled: z.boolean().default(true),

@@ -10,4 +10,6 @@ First public version.
 - Every DM is its own session; heartbeat and cron jobs run in their own internal sessions with per-job profile/model.
 - Workers: start another coding agent in a chosen directory and take it over from chat (`/attach`) or a terminal (`uniqlaw attach`).
 - Credentials layer (API keys, Bedrock, Vertex AI, Azure, provider logins) with secrets stored by reference only.
-- Agent-guided migration from ClaudeClaw v2 (`docs/MIGRATE.md`).
+- Memory: `memory/MEMORY.md` + daily notes, `memory_write` / `memory_search` / `memory_get` for every provider, CJK-capable full-text search; Claude Code's auto-memory is turned off while it is on.
+- Dreaming plugin (after OpenClaw): nightly promotion of daily notes into `MEMORY.md` with rule-based gates and model-chosen add / merge / supersede / skip, validation and history; dream diary; `uniqlaw dream [--dry-run]`.
+- Agent-guided migration from ClaudeClaw v2 (`docs/MIGRATE.md`), including importing Claude auto-memory.

@@ -22,9 +22,10 @@ Successor to [ClaudeClaw v2](https://github.com/hans00/claudeclaw2) (Claude-only
 
 - **Per-chat sessions**: every DM is its own session (per user, per platform, like OpenClaw), and groups/channels/threads get their own too, queue / steer / interrupt handling for messages that arrive mid-turn, `/stop`, `/new`, `/status`, `/model`.
 - **Approvals on your phone**: permission prompts from any provider become buttons on the chat that triggered the work (or the operator).
-- **A provider-independent message bus** exposed to every agent as MCP tools: `agents_list`, `agent_ask`, `agent_trigger`, `notify`, `task_status`, `worker_start`, `worker_stop`, plus `cron_list` / `cron_save` / `cron_delete`. Provider-native cross-session features are disabled so nothing bypasses routing.
+- **A provider-independent message bus** exposed to every agent as MCP tools: `agents_list`, `agent_ask`, `agent_trigger`, `notify`, `task_status`, `worker_start`, `worker_stop`, `memory_write` / `memory_search` / `memory_get`, plus `cron_list` / `cron_save` / `cron_delete`. Provider-native cross-session features are disabled so nothing bypasses routing.
 - **A2A v1.0**: expose profiles as A2A agents; remote A2A agents show up in `agents_list` and answer `agent_ask`.
 - **Workers**: a session can start another coding agent (any profile: Claude Code, Codex, OpenCode, …) in a chosen directory on the same machine with `worker_start`, and get its report back. A human can take a worker over: `/attach <worker>` from a chat (any provider) or `uniqlaw attach <worker>` in a terminal (live for `claude-tmux`; `claude-sdk` / `codex` are handed to their own CLI and handed back on exit). Allowed directories and profiles come from `workers` in settings (default: the project directory only).
+- **Memory and dreaming**: one long-term memory for the whole assistant, independent of the provider: `memory/MEMORY.md` (in every chat's prompt) plus daily notes the agents write with `memory_write` and search with `memory_search` (substring search, works for Chinese/Japanese). An optional nightly *dreaming* sweep, after OpenClaw's, promotes notes that keep coming up into `MEMORY.md`: rules pick the candidates, the model only decides add / merge / supersede / skip, and the text written is always the original note, so it can't invent memories; notes from group chats and background jobs are never promoted. It also keeps a dream diary (`memory/DREAMS.md`). Claude Code's own auto-memory is turned off so there is one memory, not two.
 - **Scheduling**: v2-format cron jobs (IANA time zones, optional catch-up) and a heartbeat with quiet hours. By default each runs in its own internal session (`heartbeat`, `cron:<job>`). A job can pin a `profile` or switch the `model` for its turn, and can reach humans or other sessions through the bus (`notify`, `agent_trigger`, `agent_ask`), or set `replyTo: "none"` and decide for itself.
 - **Model routing**: per-turn model choice by keywords/phrases with hysteresis (v2 "agentic modes").
 - **Multiple instances per machine**: per-project lock, auto-assigned ports, per-instance tmux socket, bot-token claims so two instances never poll the same bot.
@@ -84,6 +85,7 @@ As a Claude Code plugin: `/plugin marketplace add hans00/uniqlaw`, then `/plugin
 | `uniqlaw trigger <target> <prompt>` | make a session answer its own chat |
 | `uniqlaw workers` / `worker start <name> --profile P [--cwd DIR] [task]` / `worker stop <name> [--forget]` | list / start / stop worker sessions |
 | `uniqlaw attach <worker\|session>` / `release <…>` | take a session over in this terminal / end a takeover that didn't hand back |
+| `uniqlaw dream [--dry-run]` | run the memory consolidation sweep now; `--dry-run` explains which notes would be promoted and why, without a model or writes |
 | `uniqlaw mcp-shim` | stdio⇄HTTP bridge to the MCP gateway (used by providers that only accept file-configured MCP) |
 
 All commands take `--project DIR` (default: current directory). The daemon's HTTP API keeps v2's `POST /api/send` and `/api/trigger`.
@@ -96,7 +98,8 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
   "profiles": {
     "main":   { "provider": "claude-tmux", "model": "sonnet" },
     "coder":  { "provider": "codex" },
-    "vertex": { "provider": "pi", "model": "google-vertex/gemini-3-pro", "credential": "gcp" }
+    "vertex": { "provider": "pi", "model": "google-vertex/gemini-3-pro", "credential": "gcp" },
+    "dreamer": { "provider": "claude-sdk", "model": "haiku", "permissions": { "level": "locked" } }
   },
   "credentials": { "gcp": { "kind": "gcp", "project": "my-proj", "location": "us-central1" } },
   "bindings": { "default": "main", "channels": { "discord:1234": "coder" } },
@@ -105,6 +108,7 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
   "plugins": {
     "telegram": { "token": { "env": "TELEGRAM_BOT_TOKEN" }, "allowedUserIds": ["123456789"] },
     "heartbeat": { "interval": 60, "profile": "cheap", "replyTo": "telegram:123456789", "excludeWindows": [{ "start": "23:00", "end": "07:00" }] },
+    "dreaming": { "schedule": "0 3 * * *", "profile": "dreamer" },
     "a2a": { "expose": { "main": { "description": "My assistant" } } }
   }
 }

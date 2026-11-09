@@ -310,6 +310,7 @@ export class ChannelRuntime {
         mcp: gw,
         env: await this.host.providerEnv(this.profile),
         instanceId: this.host.instanceId,
+        nativeMemory: !this.host.settings.memory.enabled || this.host.settings.memory.nativeMemory,
       });
       this.session = session;
       this.state = "idle";
@@ -725,7 +726,10 @@ export class ChannelRuntime {
     }
     if (turn && reason === "error" && error === "usage_limit") {
       await this.postTo(turn, "⛔ The model provider's usage limit is reached. Try again later (or switch this channel to another profile).");
-      for (const o of turn.origins) if (o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) this.host.onTaskResult(o.taskId, false, "usage limit reached");
+      for (const o of turn.origins) {
+        if (o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) this.host.onTaskResult(o.taskId, false, "usage limit reached");
+        else if (o.kind === "scheduler" && o.taskId) this.host.onTaskResult(o.taskId, false, "usage limit reached");
+      }
       this.touch();
       if (this.queue.length) this.scheduleDrain(0);
       return;
@@ -733,8 +737,8 @@ export class ChannelRuntime {
     if (turn) {
       const answer = turn.texts.filter((t) => !isSilentReplyText(t)).map((t) => extractReactions(stripSilentToken(t)).cleanText).join("\n\n").trim();
       for (const o of turn.origins) {
-        if ((o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) || o.kind === "a2a") {
-          this.host.onTaskResult(o.taskId, reason === "done", reason === "done" ? answer : `(${reason}${error ? `: ${error}` : ""}) ${answer}`.trim());
+        if ((o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) || o.kind === "a2a" || (o.kind === "scheduler" && o.taskId)) {
+          this.host.onTaskResult(o.taskId!, reason === "done", reason === "done" ? answer : `(${reason}${error ? `: ${error}` : ""}) ${answer}`.trim());
         }
       }
       if (reason === "error" && error) await this.notifyFailure(turn.origins.at(-1), `⚠️ ${error === "rate_limit" ? "Still rate limited after retries — please try again later." : error === "stall" ? "The agent stopped responding; the turn was abandoned." : error}`);
@@ -844,6 +848,8 @@ export class ChannelRuntime {
   private async notifyFailure(origin: Origin | undefined, text: string) {
     let target: Target | undefined;
     if (origin?.kind === "a2a") { this.host.onTaskResult(origin.taskId, false, text); return; }
+    // A plugin is waiting for this turn's answer (ChannelManager.complete): it reports the failure itself.
+    if (origin?.kind === "scheduler" && origin.taskId) { this.host.onTaskResult(origin.taskId, false, text); return; }
     if (origin?.kind === "human") target = origin.replyTarget;
     else if (origin?.kind === "peer" && (origin.mode === "ask" || origin.mode === "trigger")) {
       this.host.onTaskResult(origin.taskId, false, text);

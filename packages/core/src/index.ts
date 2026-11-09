@@ -13,3 +13,5 @@ export * from "./manager.ts";
 export * from "./gateway.ts";
 export * from "./model-router.ts";
 export * from "./transcript.ts";
+export * from "./memory.ts";
+export * from "./dreaming.ts";

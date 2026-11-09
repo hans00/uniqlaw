@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { isAlive, listInstances, loadSettings, readRuntime, runForever, stateDirOf } from "@uniqlaw/daemon";
+import type { DreamReport } from "@uniqlaw/core";
 
 const USAGE = `uniqlaw <command> [options]
 
@@ -23,6 +24,7 @@ const USAGE = `uniqlaw <command> [options]
   attach   <worker|session> [--project DIR]    take over a session in this terminal (claude-tmux: live;
                                                claude-sdk/codex: resumed in their own CLI, handed back on exit)
   release  <worker|session> [--project DIR]   end a terminal takeover that didn't hand back (closed terminal, crash)
+  dream    [--dry-run] [--json] [--project DIR] run the memory consolidation sweep now (--dry-run: rank and explain only)
   mcp-shim                                     stdio⇄HTTP MCP bridge to the gateway (env UNIQLAW_MCP_URL, UNIQLAW_TOKEN)
 `;
 
@@ -231,6 +233,14 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
       console.log(r.released ? `Released ${key}.` : `${key} was not held from a terminal.`);
       return;
     }
+    case "dream": {
+      const r = await api(projectDir, "/api/dream", { dryRun: !!flags["dry-run"] });
+      if (!r.ok) throw new Error(String(r.error));
+      const rep = r.report as DreamReport;
+      if (flags.json) { console.log(JSON.stringify(rep, null, 2)); return; }
+      console.log(formatDreamReport(rep));
+      return;
+    }
     case "mcp-shim": {
       const { runMcpShim } = await import("./mcp-shim.ts");
       await runMcpShim();
@@ -243,3 +253,20 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
 }
 
 main().catch((e) => { console.error(`error: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); });
+
+function formatDreamReport(r: DreamReport): string {
+  const out = [`${r.dryRun ? "Dry run" : "Sweep"} ${r.day}: ${r.considered} recent entries, ${r.candidates.length} candidate(s).`];
+  for (const c of r.candidates) out.push(`  ✓ [${c.passed.join("+")}] score ${c.score} · recalled ${c.recallCount}× · ${c.day}  ${c.text.slice(0, 100)}`);
+  if (r.rejected?.length) {
+    out.push("Not promoted:");
+    for (const c of r.rejected.slice(0, 20)) out.push(`  · ${c.text.slice(0, 80)}\n      ${c.excluded}`);
+    if (r.rejected.length > 20) out.push(`  … ${r.rejected.length - 20} more (--json for all)`);
+  }
+  if (!r.dryRun) {
+    const d = r.deep;
+    out.push(`MEMORY.md: ${d.mode} — ${d.added} added, ${d.merged} merged, ${d.superseded} superseded, ${d.skipped} skipped${d.reason ? ` (${d.reason})` : ""}`);
+    if (r.memoryBytes !== undefined) out.push(`  now ${r.memoryEntries} entries, ${r.memoryBytes} bytes`);
+    if (r.diary) out.push("", r.diary);
+  }
+  return out.join("\n");
+}

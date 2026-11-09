@@ -20,6 +20,8 @@ export interface ApiOptions {
   /** Absolute cron jobs dir. */
   jobsDir: string;
   timezone: string;
+  /** Manual dreaming sweep (POST /api/dream). */
+  dream?: (o: { dryRun?: boolean }) => Promise<unknown>;
 }
 
 const WEB_DIR = join(import.meta.dir, "web");
@@ -174,6 +176,11 @@ export function startApi(o: ApiOptions) {
             const b = (await req.json()) as { key?: string };
             if (!b.key) return json({ ok: false, error: "key is required" }, 400);
             return json({ ok: true, released: manager.release(b.key) });
+          }
+          if (req.method === "POST" && path === "/api/dream") {
+            if (!o.dream) return json({ ok: false, error: "UniQlaw memory is disabled (settings.memory.enabled)" }, 400);
+            const b = (await req.json().catch(() => ({}))) as { dryRun?: boolean };
+            return json({ ok: true, report: await o.dream({ dryRun: !!b.dryRun }) });
           }
           return json({ ok: false, error: "not found" }, 404);
         } catch (e) {

@@ -6,7 +6,7 @@ import type {
 } from "@uniqlaw/core";
 import {
   MCP_SERVER_NAME, NATIVE_CROSS_SESSION_TOOLS, baseChildEnv, claudeEnvForCredential, composeAppendSystemPrompt,
-  mcpToolId, permissionModeFor,
+  mcpToolId, permissionModeFor, nativeMemorySettings,
 } from "@uniqlaw/claude-common";
 import { InputQueue } from "./input.ts";
 import { SdkMapper } from "./mapper.ts";
@@ -88,6 +88,7 @@ export class ClaudeSdkSession implements AgentSession {
         ...(spec.providerSessionId ? { resume: spec.providerSessionId } : { sessionId: this.providerSessionId }),
         includePartialMessages: true,
         settingSources: opts.userSettings === false ? ["project", "local"] : ["user", "project", "local"],
+        ...nativeMemorySettings(spec.nativeMemory),
         permissionMode: mode,
         ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
         canUseTool,

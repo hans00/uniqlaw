@@ -207,6 +207,21 @@ export function internalSessionPrompt(channelKey: string): string {
   ].join("\n");
 }
 
+/** Memory section for chat and internal sessions: how to use UniQlaw memory, plus MEMORY.md itself. */
+export function memoryPrompt(memoryText: string, opts: { canWrite: boolean; promotable?: boolean }): string {
+  return [
+    "## Memory",
+    "UniQlaw memory is your long-term memory. It is shared by every session of this assistant (all chats, heartbeat, cron) and survives restarts and provider changes. It is the only memory system to use here: don't keep memories in other places (no provider-native memory files).",
+    "- `memory/MEMORY.md`: curated long-term memory, included below. A nightly consolidation pass (dreaming) maintains it from the daily notes; don't edit it directly.",
+    "- `memory/YYYY-MM-DD.md`: daily notes. Not included in your context; find things with `memory_search`, read with `memory_get`.",
+    ...(opts.canWrite ? ["- When you learn something worth keeping (a preference, a decision, a fact about a person or project, a commitment, a lesson), save it with `memory_write`: one short self-contained entry per call, with enough context to be understood months later. Don't save secrets, and don't save what's already below."] : []),
+    ...(opts.canWrite && opts.promotable === false ? ["- Notes written from this session (a group chat or a background job) stay searchable in the daily notes but are never promoted into MEMORY.md automatically."] : []),
+    "- Before answering about earlier conversations, decisions, people or preferences that aren't in your context, call `memory_search` first.",
+    "",
+    memoryText ? `### MEMORY.md\n${memoryText}` : "### MEMORY.md\n(empty so far)",
+  ].join("\n");
+}
+
 export function busToolsPrompt(toolNames: string[]): string {
   return [
     "## UniQlaw tools",

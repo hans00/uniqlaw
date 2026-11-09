@@ -45,3 +45,16 @@ export function dirScopePrompt(dirs: string[]): string {
     "If a request requires accessing files outside, refuse and explain why.",
   ].join("\n");
 }
+
+/** Claude Code settings that turn off its own memory when UniQlaw memory is in use
+ *  (SessionSpec.nativeMemory === false): auto-memory files and background auto-dream. */
+export const NO_NATIVE_MEMORY_SETTINGS = { autoMemoryEnabled: false, autoDreamEnabled: false } as const;
+
+/** CLI flags for SessionSpec.nativeMemory (claude-tmux). */
+export function nativeMemoryArgs(nativeMemory: boolean | undefined): string[] {
+  return nativeMemory === false ? ["--settings", JSON.stringify(NO_NATIVE_MEMORY_SETTINGS)] : [];
+}
+/** SDK `settings` option for SessionSpec.nativeMemory (claude-sdk). */
+export function nativeMemorySettings(nativeMemory: boolean | undefined): { settings?: { autoMemoryEnabled: false; autoDreamEnabled: false } } {
+  return nativeMemory === false ? { settings: { ...NO_NATIVE_MEMORY_SETTINGS } } : {};
+}

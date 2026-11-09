@@ -331,6 +331,38 @@ export class ChannelManager {
     });
   }
 
+  /** Run one turn in an internal session and return its final reply (no chat sees it). Used by plugins that
+   *  need a model's answer, e.g. the dreaming sweep. fresh: start a new provider session first, so earlier
+   *  turns don't leak into this one. */
+  async complete(o: { channelKey: string; text: string; job: string; profile?: string; model?: string; timeoutMs?: number; fresh?: boolean }): Promise<{ ok: boolean; text: string }> {
+    if (this.kindOf(o.channelKey) !== "internal") throw new Error(`complete() runs in internal sessions only, not ${o.channelKey}`);
+    if (this.isBusy(o.channelKey)) return { ok: false, text: `${o.channelKey} is busy` };
+    if (o.profile) await this.pinProfile(o.channelKey, o.profile, o.job);
+    if (o.fresh) await this.runtime(o.channelKey).reset();
+    const taskId = crypto.randomUUID();
+    this.deps.store.createTask({ taskId, fromSession: `job:${o.job}`, toSession: o.channelKey, mode: "ask", request: o.text });
+    const done = this.waitTask(taskId);
+    await this.runtime(o.channelKey).enqueue({
+      origin: { kind: "scheduler", job: o.job, silent: true, taskId, ...(o.model ? { model: o.model } : {}) },
+      item: { text: o.text, receivedAt: Date.now(), sourceLine: `[${o.job}]`, raw: true },
+      attachments: [],
+    });
+    this.deps.store.updateTask(taskId, "working");
+    const ms = o.timeoutMs ?? this.deps.settings.bus.askTimeoutSec * 1000;
+    return Promise.race([done, new Promise<{ ok: boolean; text: string }>((r) => setTimeout(() => r({ ok: false, text: `timed out after ${ms / 1000}s` }), ms))]);
+  }
+
+  /** Leave a note for every open chat session (shown with its next turn), e.g. "MEMORY.md changed". */
+  noteToOpenChats(label: string, text: string): number {
+    let n = 0;
+    for (const [key, rt] of this.runtimes) {
+      if (this.kindOf(key) !== "chat" || rt.state === "closed") continue;
+      this.deps.store.pushPending(key, "peer-result", { label, text });
+      n++;
+    }
+    return n;
+  }
+
   /** Pin a session to a profile (sticky in state.db). An idle runtime on another profile is
    *  reopened; a busy one keeps its profile until it is next idle-closed or restarted. */
   private async pinProfile(channelKey: string, profile: string, job: string) {

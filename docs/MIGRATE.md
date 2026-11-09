@@ -7,7 +7,7 @@
 ## Hard rules
 
 1. **Two programs must never use the same bot token at the same time.** Telegram allows only one long-poller, and Discord/Slack will reply twice. Stop v2 before writing and before starting UniQlaw.
-2. **Treat v2 files as read-only** (`.claude/claudeclaw/`, `prompts/`, `CLAUDE.md`). Write all output under `.uniqlaw/`, so rolling back to v2 stays a no-op.
+2. **Treat v2 files as read-only** (`.claude/claudeclaw/`, `prompts/`, `CLAUDE.md`, Claude's auto-memory directory). Write all output under `.uniqlaw/` and `memory/`, so rolling back to v2 stays a no-op.
 3. **Never print tokens or secrets** (including in summaries, diffs and logs). When you mention one, say only something like "telegram.token: copied".
 4. **Show the user the plan first and write only after they confirm.** If `.uniqlaw/settings.json` already exists, diff it first and ask whether to overwrite.
 5. Always run `uniqlaw doctor` after writing.
@@ -30,6 +30,7 @@ Assume the v2 project is at `$V2` (usually the same directory UniQlaw will run i
 | `.claude/claudeclaw/jobs/*.md` | Cron jobs | Copy to `.uniqlaw/jobs/` (same format) |
 | `prompts/**` | IDENTITY / USER / SOUL… | No change if it is the same directory; otherwise copy it over |
 | `CLAUDE.md` | Project instructions | No change; claude reads it from the cwd itself |
+| `~/.claude/projects/<sanitized cwd>/memory/` | Claude Code auto-memory (v2's memory) | `memory/` (§4b, ask first) |
 
 ## 2. settings.json mapping
 
@@ -123,6 +124,18 @@ store.pushPending(channelKey, "external", { source: "v2-inbox", ts, kind, from, 
 ```
 
 At the start of the next turn, the runtime puts them into the prompt using v2's format ("you sent…", "trigger response…").
+
+## 4b. Memory (ask first)
+
+v2 had no memory of its own; the agent used Claude Code's auto-memory in `~/.claude/projects/<sanitized $V2>/memory/` (the sanitized name is the absolute path with every character other than letters and digits replaced by `-`, e.g. `/home/me/claudeclaw` → `-home-me-claudeclaw`). UniQlaw has its own memory in `$V2/memory/` and **turns Claude's auto-memory off** while it is on (`memory.nativeMemory: false`), so without this step the agent stops seeing what it remembered.
+
+Show the user the file count and total size, then, if they agree:
+
+1. Copy every file to `$V2/memory/imports/claude-code/` (keep names; never move or delete the originals). These are searchable with `memory_search` / `memory_get` but not injected.
+2. If `$V2/memory/MEMORY.md` doesn't exist yet, copy the auto-memory `MEMORY.md` (the index Claude kept in context) to `$V2/memory/MEMORY.md`, and rewrite its `[[name]]` / relative links to `imports/claude-code/<file>` so they still resolve. Keep it under 24 KB (`memory.maxInjectBytes`); if it is larger, tell the user rather than cutting it.
+3. Look for v2 cron jobs that maintain memory by hand (e.g. a nightly "dream" job that edits the auto-memory directory). Point them out and suggest `plugins.dreaming` instead (`"dreaming": { "profile": "<a locked profile>" }`); don't delete or rewrite those jobs yourself. A job that edits files in the old directory would keep editing files UniQlaw no longer reads.
+
+If the user wants to keep Claude's auto-memory as well, set `"memory": { "nativeMemory": true }`; then there are two memories and the agent may write to either.
 
 ## 5. Verify and start
 
