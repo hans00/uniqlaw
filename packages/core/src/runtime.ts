@@ -73,6 +73,10 @@ interface TurnState {
   startedAt: number;
   texts: string[];
   toolBubble?: MsgRef;
+  /** Every tool-status message posted this turn: deleted once the turn ends with a delivered reply. */
+  toolBubbles?: MsgRef[];
+  /** A reply (not just tool status) reached the chat this turn. */
+  delivered?: boolean;
   toolLines: string[];
   denied: boolean;
   unsolicited: boolean;
@@ -585,6 +589,7 @@ export class ChannelRuntime {
     if (!finalView) { if (p?.delete) await p.delete(seg.ref).catch(() => false); return true; }
     const ok = await p?.edit?.(seg.ref, finalView).catch(() => false);
     if (!ok && seg.target) await p?.send(seg.target, finalView).catch(() => {});
+    if (this.turn) this.turn.delivered = true;
     return true;
   }
 
@@ -641,7 +646,8 @@ export class ChannelRuntime {
     for (const t of targets) {
       const p = this.host.platform(t.platform);
       if (!p) continue;
-      await p.send(t, markdown).catch((e) => this.log.error("send failed", { e: String(e) }));
+      const ref = await p.send(t, markdown).catch((e) => { this.log.error("send failed", { e: String(e) }); return undefined; });
+      if (ref && this.turn) this.turn.delivered = true;
     }
     if (this.turn) this.turn.toolBubble = undefined; // next tool status starts a new bubble
   }
@@ -665,6 +671,7 @@ export class ChannelRuntime {
     }
     const { replyToMessageId: _r, ...plain } = target;
     this.turn.toolBubble = await p.send(plain, line).catch(() => undefined);
+    if (this.turn.toolBubble) (this.turn.toolBubbles ??= []).push(this.turn.toolBubble);
     if (stream !== "replace") this.turn.toolBubble = undefined;
     this.turn.toolLines = [line];
   }
@@ -702,6 +709,14 @@ export class ChannelRuntime {
     this.stopTyping();
     const turn = this.turn;
     this.turn = undefined;
+    // Tool status is progress, not content: once the reply is in the chat, remove it (like OpenClaw).
+    // Kept when the turn failed or produced no visible reply, so the human can see what it was doing.
+    if (turn?.toolBubbles?.length && reason === "done" && turn.delivered) {
+      for (const ref of turn.toolBubbles) {
+        const p = this.host.platform(ref.platform);
+        if (p?.delete && p.capabilities.delete) void p.delete(ref).catch(() => false); // don't hold up the next turn
+      }
+    }
     if (turn) {
       this.record("turn_end", reason + (error ? `: ${error}` : ""), { reason, error });
       this.host.emit?.({ type: "turn_end", channelKey: this.channelKey, reason, error, at: Date.now() });

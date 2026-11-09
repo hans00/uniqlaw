@@ -224,3 +224,28 @@ test("stream off: deltas are ignored, finals posted as usual", async () => {
   s.emit({ type: "text", segmentId: "a", final: "done!" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
   await until(() => platform.sent.length === 1);
 });
+
+test("tool status bubbles are removed once the reply is delivered; kept on error or silent turns", async () => {
+  const tool = (id: string) => ({ type: "tool_start" as const, id, name: "Bash", input: { command: "ls" } });
+  let turnNo = 0;
+  const { mgr, platform } = setup((_i, s) => {
+    turnNo++;
+    if (turnNo === 1) s.emit(tool("a"), tool("b"), { type: "text", segmentId: "x", final: "answer" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
+    if (turnNo === 2) s.emit(tool("c"), { type: "turn_end", turnId: s.turnId(), reason: "error", error: "boom" });
+    if (turnNo === 3) s.emit(tool("d"), { type: "text", segmentId: "y", final: "NO_REPLY" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
+  }, { output: { toolStatus: true, stream: "replace" } });
+
+  await mgr.handleInbound(inbound("one"));
+  await until(() => platform.deletes.length === 1);
+  const bubble = platform.sent.findIndex((m) => m.text.includes("ls"));
+  expect(platform.deletes[0]!.messageId).toBe(String(bubble + 1)); // the (edited-in-place) tool bubble
+  expect(platform.sent.some((m) => m.text === "answer")).toBe(true);
+
+  const before = platform.deletes.length;
+  await mgr.handleInbound(inbound("two"));
+  await Bun.sleep(100);
+  await mgr.handleInbound(inbound("three"));
+  await Bun.sleep(100);
+  expect(platform.deletes.length).toBe(before); // error turn and silent turn keep their bubbles
+  expect(platform.sent.filter((m) => m.text.includes("ls")).length).toBe(3); // turns 2 and 3 really posted bubbles
+});
