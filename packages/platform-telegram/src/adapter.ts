@@ -81,6 +81,9 @@ export class TelegramAdapter implements PlatformAdapter {
     this.abort?.abort();
     await this.loopPromise?.catch(() => {});
     this.loopPromise = null;
+    // Telegram only forgets updates once a later getUpdates passes a higher offset. Confirm what we handled,
+    // or a restarted daemon receives the last message(s) again. Anything returned here stays unconfirmed.
+    if (this.offset > 0) await this.api.call("getUpdates", { offset: this.offset, timeout: 0, limit: 1 }).catch(() => {});
     for (const [token, p] of this.pending) {
       clearTimeout(p.timer);
       this.pending.delete(token);

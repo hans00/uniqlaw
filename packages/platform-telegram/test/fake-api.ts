@@ -36,6 +36,9 @@ export function startFakeBotApi(opts: { token?: string; botUsername?: string; bo
         case "getMe": return ok({ id: opts.botId ?? 999, is_bot: true, first_name: "Bot", username: opts.botUsername ?? "uniq_test_bot" });
         case "getUpdates": {
           const offset = Number(body.offset ?? 0);
+          // Like Telegram: an offset confirms (deletes) every earlier update, so a restarted poller
+          // starting from offset 0 only gets what was never confirmed.
+          if (offset > 0) for (let i = updates.length - 1; i >= 0; i--) if (updates[i]!.update_id < offset) updates.splice(i, 1);
           const take = () => updates.filter((u) => u.update_id >= offset);
           if (!take().length) {
             // long-poll: wait for an update or a short timeout

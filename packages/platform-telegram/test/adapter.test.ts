@@ -50,6 +50,15 @@ afterEach(async () => {
 });
 
 describe("inbound routing", () => {
+  test("stop confirms the handled offset, so a restarted daemon doesn't get the last message again", async () => {
+    api.pushUpdate(dm(OWNER, "first"));
+    await waitFor(() => inbox.length === 1);
+    await adapter.stop();
+    const last = api.callsOf("getUpdates").at(-1)!.body;
+    expect(last).toMatchObject({ timeout: 0, limit: 1 });
+    expect(Number(last.offset)).toBeGreaterThan(0);
+  });
+
   test("DM is its own session (telegram:<userId>), single-party, trusted operator", async () => {
     api.pushUpdate(dm(OWNER, "hello"));
     const m = await waitFor(() => inbox[0]);
