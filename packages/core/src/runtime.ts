@@ -53,6 +53,9 @@ export interface RuntimeHost {
   gatewayFor(channelKey: string): { url: string; token: string; toolNames: string[] } | undefined;
   /** Minimal isolated env for provider child processes. */
   providerEnv(profile: Profile): Promise<Record<string, string>>;
+  /** A turn hit the provider's usage limit. Return true when the host took over telling the human
+   *  (e.g. asked the owner to switch profile); false = the runtime posts its usual error. */
+  onUsageLimit?(channelKey: string, failed: { origins: Origin[]; input?: TurnInput }): Promise<boolean>;
   /** Called when a peer ask/trigger turn finishes. */
   onTaskResult(taskId: string, ok: boolean, text: string): void;
   /** Optional: bounded transcript for UIs. */
@@ -366,11 +369,13 @@ export class ChannelRuntime {
     const batch: QueuedInput[] = [];
     while (this.queue.length && !(isPassthroughSlashCommand(this.queue[0]!.item.text) && this.queue[0]!.origin.kind === "human")) batch.push(this.queue.shift()!);
     const tz = this.host.settings.timezone;
-    const pending = this.drainPendingNotes();
+    const notes = this.drainPendingNotes();
+    const handoff = notes.filter((n) => n.raw).map((n) => n.text);
+    const pending = notes.filter((n) => !n.raw);
     await this.scheduledModel(batch);
     await this.routeModel(batch);
     const body = mergeQueued(batch.map((b) => b.item), tz, this.dropped.splice(0));
-    const text = [formatPendingForPrompt(pending, tz), body].filter(Boolean).join("\n\n");
+    const text = [...handoff, formatPendingForPrompt(pending, tz), body].filter(Boolean).join("\n\n");
     await this.startTurn(batch.map((b) => b.origin), { text, attachments: batch.flatMap((b) => b.attachments) });
   }
 
@@ -409,8 +414,12 @@ export class ChannelRuntime {
     await this.session.setModel(d.model).then(() => { this.activeModel = d.model; }, (e) => this.log.warn("setModel failed", { e: String(e) }));
   }
 
-  private drainPendingNotes(): PendingNote[] {
+  /** Queued inputs not yet sent (moved to the new runtime when the chat switches profile). */
+  takeQueue(): QueuedInput[] { return this.queue.splice(0); }
+
+  private drainPendingNotes(): (PendingNote & { raw?: boolean })[] {
     return this.host.store.drainPending(this.channelKey).map((p) => {
+      if (p.kind === "handoff") return { at: p.createdAt, label: "handoff", text: (JSON.parse(p.payload) as { text: string }).text, raw: true };
       const d = JSON.parse(p.payload) as { label?: string; text?: string; source?: string; ts?: string; kind?: string; from?: string; note?: string };
       if (d.source === "v2-inbox") {
         // Migrated v2 inbox entry: same labels as v2's formatInboxForPrompt.
@@ -763,7 +772,9 @@ export class ChannelRuntime {
       return;
     }
     if (turn && reason === "error" && error === "usage_limit") {
-      await this.postTo(turn, "⛔ The model provider's usage limit is reached. Try again later (or switch this channel to another profile).");
+      const handled = await this.host.onUsageLimit?.(this.channelKey, { origins: turn.origins, ...(turn.input ? { input: turn.input } : {}) })
+        .catch((e) => { this.log.warn("usage-limit handler failed", { e: String(e) }); return false; }) ?? false;
+      if (!handled) await this.postTo(turn, `⛔ The usage limit of profile "${this.profile.name}" is reached. Try again later, or ask the owner to switch this chat with /profile.`);
       for (const o of turn.origins) {
         if (o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) this.host.onTaskResult(o.taskId, false, "usage limit reached");
         else if (o.kind === "scheduler" && o.taskId) this.host.onTaskResult(o.taskId, false, "usage limit reached");

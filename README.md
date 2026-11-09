@@ -21,6 +21,7 @@ Successor to [ClaudeClaw v2](https://github.com/hans00/claudeclaw2) (Claude-only
 ## What you get
 
 - **Per-chat sessions**: every DM is its own session (per user, per platform, like OpenClaw), and groups/channels/threads get their own too, queue / steer / interrupt handling for messages that arrive mid-turn, `/stop`, `/new`, `/status`, `/model`.
+- **Switching profiles**: `/profile <name>` moves a chat to another profile (another agent or model) and `/profile reset` moves it back. The conversation follows: providers that share sessions (same provider, or Claude Code TUI ↔ SDK) keep the same session; otherwise the new profile gets the raw transcript, and a profile you return to resumes its own session plus what happened meanwhile. When a profile hits its usage limit, the owner is asked in chat whether to switch to one of its `fallback` profiles and the message is re-sent there; anyone else gets the error.
 - **Group modes**: in `mention` mode (default) the bot answers only when @mentioned or replied to, and keeps the other messages (the last `historyLimit`) as context for its next turn; in `always` mode it reads every message and decides whether to answer (`NO_REPLY`), optionally skipping messages that @mention someone else. Set it in `groups` (per channel in `groups.channels`) or switch a group with `/activation mention|always|reset`.
 - **Approvals on your phone**: permission prompts from any provider become buttons on the chat that triggered the work (or the operator).
 - **A provider-independent message bus** exposed to every agent as MCP tools: `agents_list`, `agent_ask`, `agent_trigger`, `notify`, `send_file`, `task_status`, `worker_start`, `worker_stop`, `memory_write` / `memory_search` / `memory_get`, plus `cron_list` / `cron_save` / `cron_delete`. Provider-native cross-session features are disabled so nothing bypasses routing.
@@ -99,7 +100,7 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
 // .uniqlaw/settings.json
 {
   "profiles": {
-    "main":   { "provider": "claude-tmux", "model": "sonnet" },
+    "main":   { "provider": "claude-tmux", "model": "sonnet", "fallback": ["coder"] },
     "coder":  { "provider": "codex" },
     "vertex": { "provider": "pi", "model": "google-vertex/gemini-3-pro", "credential": "gcp" },
     "dreamer": { "provider": "claude-sdk", "model": "haiku", "permissions": { "level": "locked" } }

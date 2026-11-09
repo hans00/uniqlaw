@@ -19,7 +19,7 @@ export interface SessionRow {
 export interface PendingInput {
   id: number;
   channelKey: string;
-  kind: "notify-echo" | "peer-result" | "external" | "group-context";
+  kind: "notify-echo" | "peer-result" | "external" | "group-context" | "handoff";
   /** JSON payload. */
   payload: string;
   createdAt: number;

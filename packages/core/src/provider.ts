@@ -34,6 +34,8 @@ export interface Profile {
   permissions: PermissionPolicy;
   /** Provider-specific options, validated by the provider plugin. */
   options: Record<string, unknown>;
+  /** Profiles offered when this one hits its usage limit. */
+  fallback?: string[];
 }
 
 export interface SystemPromptParts {

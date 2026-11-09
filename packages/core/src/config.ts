@@ -42,6 +42,8 @@ export const profileSchema = z.object({
   prompts: z.array(z.string()).optional(),
   /** Provider-specific options. */
   options: z.record(z.string(), z.unknown()).prefault({}),
+  /** Profiles to offer when this one hits its usage limit (the owner is asked in chat). Empty = every other profile. */
+  fallback: z.array(z.string()).default([]),
 });
 
 const groupSchema = z.object({
@@ -112,6 +114,11 @@ export const settingsSchema = z.object({
     /** Profiles a worker may use. Empty = any profile. */
     profiles: z.array(z.string()).default([]),
     max: z.number().int().positive().default(8),
+  }).prefault({}),
+  /** Switching a chat between profiles (/profile, usage-limit fallback): the conversation moves as raw transcript. */
+  profileSwitch: z.object({
+    /** Budget for the transcript handed to the new profile (newest entries win). */
+    handoffMaxChars: z.number().int().positive().default(60_000),
   }).prefault({}),
   /** Inbound voice/audio. Default: the agent gets the file path and handles it itself. Set `engine` to a
    *  transcriber plugin ("whisper" = local whisper.cpp, "transcribe-api" = OpenAI-compatible API) to add a transcript. */

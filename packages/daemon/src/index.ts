@@ -112,7 +112,10 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
         if (!credentialResolved) throw new Error(`profile "${name}": unknown credential "${p.credential}"`);
       }
       profiles.set(name, { name, provider: p.provider, model: p.model, credential: p.credential, credentialResolved,
-        permissions: p.permissions, options: { ...p.options, prompts: p.prompts } });
+        permissions: p.permissions, options: { ...p.options, prompts: p.prompts }, ...(p.fallback.length ? { fallback: p.fallback } : {}) });
+    }
+    for (const [name, p] of Object.entries(settings.profiles)) {
+      for (const f of p.fallback) if (!settings.profiles[f]) throw new Error(`profile "${name}": fallback "${f}" is not a profile`);
     }
     if (!profiles.has(settings.bindings.default)) throw new Error(`bindings.default "${settings.bindings.default}" is not a profile`);
 
@@ -170,6 +173,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
           { name: "status", description: "Show this channel's session status" },
           { name: "model", description: "Show or switch the model" },
           { name: "activation", description: "Group: answer only when mentioned, or every message (mention / always / reset)" },
+          { name: "profile", description: "Show or switch this chat's profile (agent / model); reset = default" },
           { name: "pair", description: "Operator: list / approve / deny DM pairing requests" },
         ]).catch((e) => log.warn("setCommands failed", { e: String(e) }));
       }

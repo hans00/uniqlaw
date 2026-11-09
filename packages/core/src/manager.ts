@@ -1,13 +1,13 @@
 // Owns all ChannelRuntimes: inbound routing, core slash commands, the message
 // bus (agents_list / agent_ask / agent_trigger / notify) and idle cleanup.
-import type { AgentProvider, Profile } from "./provider.ts";
+import type { AgentProvider, Profile, TurnInput } from "./provider.ts";
 import type { RemoteAgent, ScheduledFire, Transcriber } from "./plugin.ts";
 import type { InboundMessage, OutboundFile, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
 import type { GroupMode } from "./config.ts";
 import { ChannelRuntime, type RuntimeHost } from "./runtime.ts";
 import { PairingService } from "./pairing.ts";
-import { renderSourceLine } from "./format.ts";
+import { formatTimestamp, renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
 import { realpathSync, statSync } from "node:fs";
@@ -15,7 +15,7 @@ import { expandHome } from "./credentials.ts";
 import { basename, extname, isAbsolute, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
-export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget"> {
+export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "onUsageLimit" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget"> {
   providers: Map<string, AgentProvider>;
   platforms: Map<string, PlatformAdapter>;
   profiles: Map<string, Profile>;
@@ -45,6 +45,18 @@ export interface WorkerMeta { cwd: string; profile: string; owner?: string; crea
 
 export const WORKER_PREFIX = "worker:";
 
+/** A turn that failed on the usage limit (re-sent after a profile switch). */
+type FailedTurn = { origins: Origin[]; input?: TurnInput };
+/** A chat's provider session on a profile it switched away from (resumed when it switches back). */
+interface SavedProfileSession { provider: string; providerSessionId: string; adapterState: string | null; transcriptId: number }
+
+const HANDOFF_BLOCK_RE = /\[(?:Handover: this chat|While you were away, this chat)[\s\S]*?\[End of transcript\]\s*/g;
+
+/** Providers that can continue each other's sessions natively. */
+function sharesSessions(a: string, b: string): boolean {
+  const claude = new Set(["claude-tmux", "claude-sdk"]);
+  return a === b || (claude.has(a) && claude.has(b));
+}
 const WORKER_NAME = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 
 /** How a human takes over a session in a terminal (provider-specific). */
@@ -62,6 +74,8 @@ export class ChannelManager {
   /** channelKey → profile override (A2A sessions run on the profile they were addressed to). */
   private profileOverride = new Map<string, string>();
   private waiters = new Map<string, TaskWaiter>();
+  /** Usage-limit fallback offers waiting for the owner, per chat: the failed turns to re-send after a switch. */
+  private pendingSwitch = new Map<string, { failed: FailedTurn[]; until: number }>();
   private cleanupTimer?: ReturnType<typeof setInterval>;
   private readonly host: RuntimeHost;
   /** DM pairing (strangers get a code; operators approve). */
@@ -73,6 +87,7 @@ export class ChannelManager {
       platform: (n) => deps.platforms.get(n),
       operatorTargets: () => [...deps.platforms.values()].flatMap((p) => p.operatorTargets()),
       onTaskResult: (id, ok, text) => this.completeTask(id, ok, text),
+      onUsageLimit: (key, failed) => this.onUsageLimit(key, failed),
       emit: (ev: RuntimeEvent) => { this.events.emit("event", ev); },
       isInternal: (k) => this.kindOf(k) === "internal",
       cwdFor: (k) => deps.store.get(`session-cwd:${k}`),
@@ -173,6 +188,8 @@ export class ChannelManager {
           return;
       }
     }
+    const prof = msg.text.trim().match(/^\/profile(?:@\S+)?(?:\s+(\S+))?\s*$/i);
+    if (prof && msg.trusted) { await reply(await this.profileCommand(sessionKey, prof[1])); return; }
     const pair = msg.text.trim().match(/^\/pair(?:@\S+)?(?:\s+(.+))?$/i);
     if (pair && msg.trusted) { await reply(await this.pairing.command(pair[1])); return; }
     const act = msg.text.trim().match(/^\/activation(?:@\S+)?(?:\s+(\S+))?\s*$/i);
@@ -194,6 +211,145 @@ export class ChannelManager {
       item: { text: [msg.text, transcript].filter(Boolean).join("\n\n"), receivedAt: msg.receivedAt, sourceLine: renderSourceLine(msg.platform, msg.sender) },
       attachments: msg.attachments,
     });
+  }
+
+  // ── profile switching (/profile, usage-limit fallback) ───────────────────
+
+  private bindingProfile(channelKey: string): string {
+    return this.deps.settings.bindings.channels[channelKey] ?? this.deps.settings.bindings.default;
+  }
+
+  private async profileCommand(channelKey: string, arg?: string): Promise<string> {
+    const cur = this.profileFor(channelKey);
+    const list = [...this.deps.profiles.values()].map((p) => `${p.name === cur.name ? "▸ " : "  "}${p.name} (${p.provider}${p.model ? ` · ${p.model}` : ""})`);
+    if (!arg) return [`Profile: **${cur.name}** (${cur.provider}). Default for this chat: ${this.bindingProfile(channelKey)}.`, ...list, "Switch with /profile <name>; /profile reset goes back to the default."].join("\n");
+    const name = arg.toLowerCase() === "reset" ? this.bindingProfile(channelKey) : arg;
+    try {
+      const r = await this.switchProfile(channelKey, name);
+      return r.changed ? `🔀 Switched to **${name}** (${r.provider})${r.how === "native" ? " — same conversation." : r.how === "resumed" ? " — resumed its earlier session, with what happened meanwhile." : " — handed the conversation over as a transcript."}${r.resent ? ` Re-sending ${r.resent} message(s) that hit the usage limit.` : ""}`
+        : `Already on **${name}**.`;
+    } catch (e) { return `⚠️ ${e instanceof Error ? e.message : String(e)}`; }
+  }
+
+  /**
+   * Move a chat to another profile. The conversation follows:
+   *  - native: same provider (or claude-tmux ↔ claude-sdk) → the provider session id is carried over;
+   *  - resumed: the target profile has a session from before → resume it and add the turns that ran elsewhere;
+   *  - handoff: otherwise a fresh session gets the raw transcript (newest first within profileSwitch.handoffMaxChars).
+   * Turns that failed on the usage limit (pending offer) are re-sent on the new profile.
+   */
+  async switchProfile(channelKey: string, name: string): Promise<{ changed: boolean; provider: string; how?: "native" | "resumed" | "handoff"; resent?: number }> {
+    const target = this.deps.profiles.get(name);
+    if (!target) throw new Error(`unknown profile "${name}"`);
+    if (!this.deps.providers.has(target.provider)) throw new Error(`profile "${name}" uses provider "${target.provider}", which is not loaded`);
+    const old = this.profileFor(channelKey);
+    const rt = this.runtime(channelKey);
+    if (old.name === name) return { changed: false, provider: target.provider };
+    if (rt.state === "running" || rt.state === "interrupting") throw new Error("the agent is busy; /stop it first");
+    const failed = this.pendingSwitch.get(channelKey)?.failed ?? [];
+    this.pendingSwitch.delete(channelKey);
+
+    const row = this.deps.store.getSession(channelKey);
+    const lastId = this.deps.transcript?.list(channelKey, 1).at(-1)?.id ?? 0;
+    if (row?.providerSessionId) {
+      this.deps.store.set(`profile-session:${channelKey}:${old.name}`, JSON.stringify({ provider: row.provider, providerSessionId: row.providerSessionId,
+        adapterState: row.adapterState, transcriptId: lastId } satisfies SavedProfileSession));
+    }
+    const savedRaw = this.deps.store.get(`profile-session:${channelKey}:${name}`);
+    const saved = savedRaw ? JSON.parse(savedRaw) as SavedProfileSession : undefined;
+    const native = !!row?.providerSessionId && sharesSessions(old.provider, target.provider);
+    const how = native ? "native" : saved && saved.provider === target.provider ? "resumed" : "handoff";
+
+    const queued = rt.takeQueue();
+    await rt.close();
+    this.runtimes.delete(channelKey);
+    if (name === this.bindingProfile(channelKey)) this.deps.store.del(`session-profile:${channelKey}`);
+    else this.deps.store.set(`session-profile:${channelKey}`, name);
+    const now = Date.now();
+    this.deps.store.upsertSession({
+      channelKey, profile: name, provider: target.provider,
+      providerSessionId: how === "native" ? row!.providerSessionId : how === "resumed" ? saved!.providerSessionId : null,
+      multiparty: row?.multiparty ?? false, createdAt: row?.createdAt ?? now, lastActivityAt: now, lastTarget: row?.lastTarget ?? null,
+      adapterState: how === "native" && row!.provider === target.provider ? row!.adapterState : how === "resumed" ? saved!.adapterState : null,
+    });
+    // Leave out the turns that are about to be re-sent (they failed; their prompts are in the transcript too).
+    const failedTexts = new Set(failed.map((f) => f.input?.text).filter(Boolean));
+    if (how !== "native") {
+      const block = this.handoffBlock(channelKey, { from: old, to: target, afterId: how === "resumed" ? saved!.transcriptId : 0, resumed: how === "resumed", skip: failedTexts });
+      if (block) this.deps.store.pushPending(channelKey, "handoff", { text: block });
+    }
+    this.deps.log.info("profile switched", { key: channelKey, from: old.name, to: name, how });
+    const next = this.runtime(channelKey);
+    for (const f of failed) {
+      const human = [...f.origins].reverse().find((o) => o.kind === "human");
+      if (!human || !f.input) continue;
+      await next.enqueue({ origin: human, item: { text: f.input.text, receivedAt: Date.now(), sourceLine: "[Re-sent: this hit the usage limit of the previous profile]", raw: true },
+        attachments: f.input.attachments });
+    }
+    for (const q of queued) await next.enqueue(q);
+    return { changed: true, provider: target.provider, how, ...(failed.length ? { resent: failed.length } : {}) };
+  }
+
+  /** Raw transcript (oldest first) for a profile that takes over a chat; undefined if there is nothing to hand over. */
+  private handoffBlock(channelKey: string, o: { from: Profile; to: Profile; afterId: number; resumed: boolean; skip: Set<string | undefined> }): string | undefined {
+    const t = this.deps.transcript;
+    if (!t) return undefined;
+    const tz = this.deps.settings.timezone;
+    const entries = t.list(channelKey, 500, o.afterId).filter((e) => e.kind === "prompt" || e.kind === "assistant" || e.kind === "tool" || e.kind === "permission");
+    // Drop the trailing failed turn(s): they are re-sent as new messages.
+    while (entries.length && entries.at(-1)!.kind === "prompt" && o.skip.has(entries.at(-1)!.text)) entries.pop();
+    if (!entries.length) return undefined;
+    const label = { prompt: "incoming", assistant: "assistant", tool: "tool", permission: "permission" } as Record<string, string>;
+    const blocks: string[] = [];
+    let used = 0;
+    let omitted = 0;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i]!;
+      // A prompt may itself carry an earlier handover block: the target already has (or never needs) that.
+      const text = e.kind === "prompt" ? e.text.replace(HANDOFF_BLOCK_RE, "").trim() : e.text;
+      if (!text) continue;
+      const b = `--- ${label[e.kind]} · ${formatTimestamp(new Date(e.at), tz)} ---\n${text}`;
+      if (used + b.length > this.deps.settings.profileSwitch.handoffMaxChars) { omitted = i + 1; break; }
+      blocks.unshift(b);
+      used += b.length;
+    }
+    const head = o.resumed
+      ? `[While you were away, this chat ran on profile "${o.from.name}" (${o.from.provider}). Below is what happened since your last turn, raw, oldest first. Already-answered messages need no reply.]`
+      : `[Handover: this chat was running on profile "${o.from.name}" (${o.from.provider}) and now runs on you ("${o.to.name}", ${o.to.provider}). Below is the conversation so far, raw, oldest first — continue it. Already-answered messages need no reply.]`;
+    return [head, ...(omitted ? [`[${omitted} earlier entries omitted]`] : []), ...blocks, "[End of transcript]"].join("\n\n");
+  }
+
+  /** Usage limit: the owner is asked whether to switch profile; anyone else just gets the error (runtime posts it). */
+  private async onUsageLimit(channelKey: string, failed: FailedTurn): Promise<boolean> {
+    const human = [...failed.origins].reverse().find((o): o is Extract<Origin, { kind: "human" }> => o.kind === "human");
+    if (!human?.trusted) return false;
+    const cur = this.profileFor(channelKey);
+    const candidates = (cur.fallback?.length ? cur.fallback : [...this.deps.profiles.keys()])
+      .filter((n) => n !== cur.name && this.deps.profiles.has(n) && this.deps.providers.has(this.deps.profiles.get(n)!.provider));
+    if (!candidates.length) return false;
+    const open = this.pendingSwitch.get(channelKey);
+    if (open && open.until > Date.now()) { open.failed.push(failed); return true; } // already asked; re-send this one too
+    const ttl = 30 * 60_000;
+    this.pendingSwitch.set(channelKey, { failed: [failed], until: Date.now() + ttl });
+    const platform = this.deps.platforms.get(human.platform);
+    const title = `⛔ Profile "${cur.name}" (${cur.provider}) hit its usage limit.`;
+    if (!platform?.askChoice) {
+      await platform?.send(human.replyTarget, `${title} Switch this chat with /profile <name> (${candidates.join(", ")}); your message is re-sent there.`);
+      return true;
+    }
+    void platform.askChoice(human.replyTarget, {
+      title, body: "Switch this chat to another profile? The conversation is handed over and your message is re-sent. /profile switches back later.",
+      options: [...candidates.map((c) => `Switch to ${c}`), "Not now"], approverIds: [human.sender.id], timeoutMs: ttl,
+    }).then(async (choice) => {
+      const name = choice !== null ? candidates[choice] : undefined;
+      if (!name) {
+        if (this.pendingSwitch.get(channelKey)?.failed.includes(failed)) this.pendingSwitch.delete(channelKey);
+        await platform.send(human.replyTarget, "OK — staying on this profile. Try again later, or /profile <name> to switch.");
+        return;
+      }
+      await platform.send(human.replyTarget, await this.profileCommand(channelKey, name));
+    }).catch((e) => this.deps.log.warn("usage-limit offer failed", { key: channelKey, e: String(e) }));
+    return true;
   }
 
   /** Transcripts of voice/audio attachments, as text for the prompt (best-effort: failures only log). */
