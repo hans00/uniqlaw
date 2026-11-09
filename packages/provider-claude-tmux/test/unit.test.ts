@@ -26,6 +26,13 @@ describe("legacy takeover", () => {
 describe("pane heuristics", () => {
   const box = "────────────────────────────────────────\n❯ \n────────────────────────────────────────\n  ? for shortcuts";
   test("ready box", () => expect(isReady(box)).toBe(true));
+  test("ready box with a session name on the top border", () => {
+    const named = "──────────────────────────────────────── claudeclaw-global ─\n❯ \n────────────────────────────────────────\n  ⏸ manual mode on · ← 1 agent";
+    expect(isReady(named)).toBe(true);
+  });
+  test("plain separator lines are not a ready box", () => {
+    expect(isReady("──────────────────────────────────────── some text\nreply line\n────────────────────────────────────────")).toBe(false);
+  });
   test("new spinner shape counts as busy", () => {
     expect(looksActivelyBusy("✻ Warping… (2s · ↓ 75 tokens)\n" + box)).toBe(true);
     expect(looksActivelyBusy("✶ Pondering… (12s)\n" + box)).toBe(true);

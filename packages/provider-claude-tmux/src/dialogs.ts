@@ -37,7 +37,8 @@ export interface LoginPrompt {
 /** The bordered `❯` input box only renders on an authed, interactive session
  *  (never during the login flow). Its presence means any login text elsewhere
  *  in the pane is stale scrollback — a strong "we're authed" signal. */
-const READY_INPUT_BOX_RE = /─{20,}[ \t]*\n[ \t]*❯[^\n]*\n[ \t]*─{20,}/;
+// The top border may carry a label after the dashes (the session name, e.g. `──── claudeclaw-global ─`).
+const READY_INPUT_BOX_RE = /─{20,}[^\n]*\n[ \t]*❯[^\n]*\n[ \t]*─{20,}/;
 export function hasReadyPrompt(pane: string): boolean {
   return READY_INPUT_BOX_RE.test(pane);
 }

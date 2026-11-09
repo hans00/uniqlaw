@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
 import {
@@ -90,12 +90,16 @@ export class ClaudeTmuxProvider implements AgentProvider {
     const append = composeAppendSystemPrompt({
       parts: spec.systemPrompt, permissions: spec.profile.permissions, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames,
     });
-    if (append) argv.push("--append-system-prompt", append);
-    if (spec.mcp) {
-      const dir = join(this.deps.stateDir, "claude-tmux", slug(spec.sessionId));
-      mkdirSync(dir, { recursive: true });
-      argv.push("--mcp-config", writeMcpConfig(join(dir, "mcp.json"), spec.mcp.url));
+    const dir = join(this.deps.stateDir, "claude-tmux", slug(spec.sessionId));
+    mkdirSync(dir, { recursive: true });
+    // Via a file: tmux rejects a new-session command over ~16 KB ("command too long"),
+    // and MEMORY.md alone may be up to 24 KB.
+    if (append) {
+      const file = join(dir, "append-system-prompt.md");
+      writeFileSync(file, append, { mode: 0o600 });
+      argv.push("--append-system-prompt-file", file);
     }
+    if (spec.mcp) argv.push("--mcp-config", writeMcpConfig(join(dir, "mcp.json"), spec.mcp.url));
     argv.push(...nativeMemoryArgs(spec.nativeMemory));
     if (opts.extraArgs?.length) argv.push(...opts.extraArgs);
 
