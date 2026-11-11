@@ -69,8 +69,12 @@ type TaskWaiter = { resolve: (r: { ok: boolean; text: string }) => void };
 /** A turn still in flight (graceful restart bookkeeping). */
 export interface InflightTurn { channelKey: string; origins: Origin[]; detachable: boolean }
 
-/** Open tasks older than this are failed quietly after a restart (no notice to the asker): they predate it. */
+/** A task the previous daemon left open and that could not be resumed. */
+export interface FailedTask { taskId: string; from: string; to: string; mode: "ask" | "trigger" }
+
+/** Without a restart record (crash), open tasks not updated for this long are failed quietly: they predate it. */
 const STALE_TASK_MS = 3600_000;
+export const RESTART_TASK_FAILURE = "interrupted: the UniQlaw daemon restarted before it finished";
 
 export class ChannelManager {
   readonly runtimes = new Map<string, ChannelRuntime>();
@@ -907,7 +911,7 @@ export class ChannelManager {
       let input: QueuedInput;
       try { input = JSON.parse(r.payload) as QueuedInput; } catch { continue; }
       this.rearmTask(input.origin);
-      try { await this.runtime(r.channelKey).enqueue(input); }
+      try { await this.deliverSystemTurn(r.channelKey, "held while UniQlaw restarted", input); }
       catch (e) { this.deps.log.warn("deferred input dropped", { key: r.channelKey, e: String(e) }); }
     }
     if (rows.length) this.deps.log.info("replayed deferred input", { n: rows.length });
@@ -919,27 +923,44 @@ export class ChannelManager {
    *  - re-armed: its request is about to be replayed, or the turn answering it kept running in a reattached session
    *    (inflight-turn) → the answer goes to the asker as usual;
    *  - failed: the turn answering it died with the daemon → the asking session is told (if the task is recent).
-   * Returns the failed tasks that were reported to their askers.
+   * Nothing is sent here (platforms may not be up yet): the failures to report are returned for reportFailedTasks.
+   * `known`: the tasks the restart record listed as open (all of them are reported); without a record only
+   * recently active ones are.
    */
-  resumeTasks(): { taskId: string; from: string; to: string }[] {
+  resumeTasks(known?: Set<string>): FailedTask[] {
     // Call before restore(): reopening a session consumes its inflight-turn key.
     const origins: Origin[] = [];
     for (const [, v] of this.deps.store.entries("inflight-turn:")) { try { origins.push(...(JSON.parse(v) as Origin[])); } catch {} }
     for (const r of this.deps.store.listDeferred()) { try { origins.push((JSON.parse(r.payload) as QueuedInput).origin); } catch {} }
     for (const o of origins) this.rearmTask(o);
     const armed = new Set(this.waiters.keys());
-    const failed: { taskId: string; from: string; to: string }[] = [];
+    const failed: FailedTask[] = [];
     const now = Date.now();
     for (const t of this.deps.store.openTasks()) {
       if (armed.has(t.taskId)) continue;
-      const why = "interrupted: the UniQlaw daemon restarted before it finished";
-      this.deps.store.updateTask(t.taskId, "failed", why);
-      if (now - t.updatedAt > STALE_TASK_MS || !this.deps.store.getSession(t.fromSession)) continue;
-      failed.push({ taskId: t.taskId, from: t.fromSession, to: t.toSession });
-      if (t.mode === "ask") this.deliverAsyncResult(t.fromSession, t.toSession, t.taskId, 0, { ok: false, text: `${why}. Ask again if you still need it.` });
-      else this.deps.store.pushPending(t.fromSession, "peer-result", { label: `your agent_trigger to ${t.toSession} (task ${t.taskId}) failed`, text: why });
+      this.deps.store.updateTask(t.taskId, "failed", RESTART_TASK_FAILURE);
+      const report = known ? known.has(t.taskId) : now - t.updatedAt <= STALE_TASK_MS;
+      if (report && this.deps.store.getSession(t.fromSession)) failed.push({ taskId: t.taskId, from: t.fromSession, to: t.toSession, mode: t.mode });
     }
     return failed;
+  }
+
+  /** Tell the askers of tasks the restart killed (resumeTasks), once platforms are up. */
+  reportFailedTasks(list: FailedTask[]) {
+    for (const t of list) {
+      if (t.mode === "ask") this.deliverAsyncResult(t.from, t.to, t.taskId, 0, { ok: false, text: `${RESTART_TASK_FAILURE}. Ask again if you still need it.` });
+      else this.deps.store.pushPending(t.from, "peer-result", { label: `your agent_trigger to ${t.to} (task ${t.taskId}) failed`, text: RESTART_TASK_FAILURE });
+    }
+  }
+
+  /** Run a system input (restart notice, replayed input) as a turn, unless a human holds the session: a worker
+   *  a human drives gets it as an unread note instead (only the human's own messages go through), and a session
+   *  handed to a terminal is not reopened. */
+  async deliverSystemTurn(key: string, label: string, input: QueuedInput): Promise<void> {
+    const handedOff = this.terminalHold(key)?.live === false;
+    const held = this.workerMeta(key) && this.heldBy(key) && input.origin.kind !== "human";
+    if (handedOff || held) { this.deps.store.pushPending(key, "peer-result", { label, text: input.item.text }); return; }
+    await this.runtime(key).enqueue(input);
   }
 
   /** Register a waiter for a task that survived a restart (replayed or still running). */

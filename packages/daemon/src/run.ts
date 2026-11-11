@@ -21,22 +21,24 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
   if (waitPid && waitPid !== process.pid) for (let i = 0; i < 150 && isAlive(waitPid); i++) await Bun.sleep(100);
 
   let daemon!: Daemon;
-  let reloading: Promise<void> | undefined;
+  let reloading: Promise<boolean> | undefined;
   const onRestart = (kind: RestartKind) => (kind === "reload" ? reload() : restart());
   const start = () => startDaemon(projectDir, { ...opts, onRestart });
 
+  /** false = rejected, nothing was stopped (the coordinator ends the drain). */
   const reload = () => {
     reloading ??= (async () => {
       try {
         loadSettings(projectDir); // validate first: a broken settings.json must not take the daemon down
       } catch (e) {
         console.error(`[uniqlaw] reload rejected, keeping the running config: ${e instanceof Error ? e.message : e}`);
-        return;
+        return false;
       }
       await daemon.stop();
       try {
         daemon = await start();
         console.error("[uniqlaw] reloaded");
+        return true;
       } catch (e) {
         console.error(`[uniqlaw] reload failed to start: ${e instanceof Error ? e.message : e}; exiting`);
         process.exit(1);
@@ -50,13 +52,19 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
     if (process.env.UNIQLAW_RESTART_MODE === "exit") { console.error("[uniqlaw] restarting (exit for the supervisor)"); process.exit(RESTART_EXIT_CODE); }
     const logDir = join(stateDirOf(projectDir), "logs");
     mkdirSync(logDir, { recursive: true });
-    const out = openSync(join(logDir, "stdout.log"), "a");
-    const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], {
-      stdio: ["ignore", out, out], env: { ...process.env, UNIQLAW_WAIT_PID: String(process.pid) }, detached: true,
-    });
-    child.unref();
-    console.error(`[uniqlaw] restarting as pid ${child.pid}`);
-    process.exit(0);
+    try {
+      const out = openSync(join(logDir, "stdout.log"), "a");
+      const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], {
+        stdio: ["ignore", out, out], env: { ...process.env, UNIQLAW_WAIT_PID: String(process.pid) }, detached: true,
+      });
+      child.unref();
+      console.error(`[uniqlaw] restarting as pid ${child.pid}`);
+      process.exit(0);
+    } catch (e) {
+      // Already stopped: the restart record is in state.db, so a manual `uniqlaw start` still sends the notices.
+      console.error(`[uniqlaw] restart could not start the new process: ${e instanceof Error ? e.message : e}; exiting`);
+      process.exit(1);
+    }
   };
 
   daemon = await start();

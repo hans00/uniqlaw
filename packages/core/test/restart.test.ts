@@ -44,7 +44,7 @@ class GatedProvider extends FakeProvider {
   s(key: string) { return this.sessions.get(key) as GatedSession; }
 }
 
-function generation(provider: FakeProvider, platform: FakePlatform, execute: () => void | Promise<void> = () => {}) {
+function generation(provider: FakeProvider, platform: FakePlatform, execute: () => void | boolean | Promise<void | boolean> = () => {}) {
   const m = new ChannelManager({
     log: silentLogger, settings, store, projectDir: dir, instanceId: "test",
     providers: new Map([["fake", provider]]), platforms: new Map([["tg", platform]]), profiles: new Map([["main", prof]]),
@@ -218,35 +218,62 @@ test("while draining: blocking calls fail fast, an ask from a running turn still
   await g1.m.stop();
 });
 
-test("scheduled restart: --in fires later; a pending one survives a reload; a missed one is dropped", async () => {
+test("scheduled restart: --in fires later; a reload before it runs now and keeps it; a missed one is dropped", async () => {
   const platform = new FakePlatform();
-  let executed = 0;
-  const g1 = generation(new GatedProvider(), platform, () => { executed++; });
+  const kinds: string[] = [];
+  const g1 = generation(new GatedProvider(), platform, () => { kinds.push("g1"); });
   g1.c.request({ kind: "restart", requestedBy: "cli", at: Date.now() + 120 });
   await Bun.sleep(40);
-  expect(executed).toBe(0);
+  expect(kinds).toEqual([]);
   expect(g1.c.status()).toMatchObject({ pending: true, phase: "scheduled" });
-  await until(() => executed === 1);
+  await until(() => kinds.length === 1);
 
-  // Scheduled, then the daemon reloads for another reason: the next generation re-arms it.
-  const g2 = generation(new GatedProvider(), platform, () => { executed++; });
+  // A restart scheduled for later, then `uniqlaw reload` now: the reload runs right away as a reload, and the
+  // scheduled restart is still there for the next generation.
+  const got: string[] = [];
+  const g2 = generation(new GatedProvider(), platform, () => {});
+  (g2.c as unknown as { d: { execute: (k: string) => void } }).d.execute = (k) => { got.push(k); };
   await comeBack(g2);
-  g2.c.request({ kind: "restart", requestedBy: "cli", at: Date.now() + 150 });
+  g2.c.request({ kind: "restart", requestedBy: "cli", at: Date.now() + 250 });
+  g2.c.request({ kind: "reload", requestedBy: "SIGHUP" });
+  await until(() => got.length === 1);
+  expect(got).toEqual(["reload"]);
+  expect(store.get("restart-pending")).toBeDefined();
   g2.c.stop();
   await g2.m.stop();
-  const g3 = generation(new GatedProvider(), platform, () => { executed++; });
+  const g3 = generation(new GatedProvider(), platform, () => { kinds.push("g3"); });
   await comeBack(g3);
   g3.c.start();
-  expect(g3.c.status()).toMatchObject({ pending: true, phase: "scheduled" });
-  await until(() => executed === 2);
+  expect(g3.c.status()).toMatchObject({ pending: true, phase: "scheduled", kind: "restart" });
+  await until(() => kinds.length === 2);
+  expect(got).toEqual(["reload"]);
 
   // Scheduled for a time that passed while the daemon was down: dropped, not fired on start.
   store.set("restart-pending", JSON.stringify({ id: "x", kind: "restart", requestedBy: ["cli"], reasons: [], requestedAt: 0, fireAt: Date.now() - 1000, now: false, drainTimeoutSec: 1, targets: {} }));
-  const g4 = generation(new GatedProvider(), platform, () => { executed++; });
+  const g4 = generation(new GatedProvider(), platform, () => { kinds.push("g4"); });
   g4.c.start();
   expect(g4.c.status().pending).toBe(false);
   await Bun.sleep(50);
-  expect(executed).toBe(2);
+  expect(kinds).toHaveLength(2);
+});
+
+test("a restart that could not execute (reload refused) ends the drain, keeps no record and tells the requester", async () => {
+  const platform = new FakePlatform();
+  const p1 = new GatedProvider();
+  const g1 = generation(p1, platform, () => false);
+  await g1.m.handleInbound(msg("4", "hi"));
+  await until(() => p1.s("tg:4")?.sent.length === 1);
+  g1.c.request({ kind: "reload", requestedBy: "tg:4" });
+  await until(() => g1.m.isDraining);
+  await g1.m.handleInbound(msg("4", "during", "60"));
+  p1.s("tg:4").finish("ok");
+  await until(() => !g1.m.isDraining);
+  expect(store.get(RECORD_KEY)).toBeUndefined();
+  expect(g1.c.status().pending).toBe(false);
+  await until(() => p1.s("tg:4").sent.length === 2);
+  expect(p1.s("tg:4").texts).toContain("during");
+  expect(p1.s("tg:4").texts).toContain("your reload was aborted");
+  await g1.m.stop();
 });
 
 test("crash between persist and exit: the next start still replays and notifies, and a second start does neither again", async () => {
@@ -300,6 +327,69 @@ test("a reattached claude-tmux-like session finishes its resumed turn first, the
   await until(() => p2.s("tg:9").sent.length === 1);
   expect(p2.s("tg:9").texts).toContain("Your session survived, so it may have finished on its own");
   await g2.m.stop();
+});
+
+test("a re-armed task whose turn never comes back (it ended while the daemon was down) is failed, not left waiting", async () => {
+  const platform = new FakePlatform();
+  const p1 = new GatedProvider(true);
+  let executed = false;
+  const g1 = generation(p1, platform, () => { executed = true; });
+  await g1.m.handleInbound(msg("1", "ask tg:2"));
+  await until(() => p1.s("tg:1")?.sent.length === 1);
+  const { taskId } = await g1.m.ask("tg:1", "tg:2", "q", false);
+  await until(() => p1.s("tg:2")?.sent.length === 1);
+  p1.s("tg:1").finish("asked");
+  g1.c.request({ kind: "restart", requestedBy: "cli", drainTimeoutSec: 0.05 });
+  await until(() => executed);
+  await g1.m.stop();
+  // Generation 2: tg:2's pane is idle on reattach (no turn events); its restart notice is the next turn.
+  const p2 = new GatedProvider();
+  const g2 = generation(p2, platform);
+  await comeBack(g2);
+  expect(store.getTask(taskId)!.state).toBe("working"); // re-armed, waiting for the resumed turn
+  await until(() => (p2.s("tg:1")?.texts ?? "").includes(`agent_ask ${taskId}`), 6000);
+  expect(p2.s("tg:1").texts).toContain("could not be collected");
+  expect(store.getTask(taskId)!.state).toBe("failed");
+  await g2.m.stop();
+}, 10_000);
+
+test("a worker's notice follows its background routing, not the human chat its task came from", async () => {
+  const platform = new FakePlatform();
+  const p1 = new GatedProvider();
+  let executed = false;
+  const g1 = generation(p1, platform, () => { executed = true; });
+  await g1.m.handleInbound(msg("1", "start a worker"));
+  await until(() => p1.s("tg:1")?.sent.length === 1);
+  await g1.m.startWorker("tg:1", { name: "w", profile: "main", task: "long job", wait: false });
+  await until(() => p1.s("worker:w")?.sent.length === 1);
+  p1.s("tg:1").finish("started");
+  g1.c.request({ kind: "restart", requestedBy: "cli", drainTimeoutSec: 0.05 });
+  await until(() => executed);
+  expect(record().interrupted).toEqual([expect.objectContaining({ channelKey: "worker:w", target: null })]);
+  await g1.m.stop();
+  const p2 = new GatedProvider();
+  const g2 = generation(p2, platform);
+  await comeBack(g2);
+  await until(() => (p2.s("worker:w")?.texts ?? "").includes("[uniqlaw]"));
+  p2.s("worker:w").finish("worker: resuming");
+  await Bun.sleep(50);
+  expect(platform.sent.some((s) => s.text === "worker: resuming")).toBe(false);
+  await g2.m.stop();
+});
+
+test("open tasks: listed in the record → the asker is told even if old; no record (crash) → only recent ones", async () => {
+  const platform = new FakePlatform();
+  const g = generation(new GatedProvider(), platform);
+  store.upsertSession({ channelKey: "tg:1", profile: "main", provider: "fake", providerSessionId: null, multiparty: false, createdAt: 0, lastActivityAt: 0, lastTarget: null, adapterState: null });
+  for (const id of ["old", "older"]) {
+    store.createTask({ taskId: id, fromSession: "tg:1", toSession: "worker:x", mode: "ask", request: "q" });
+    store.db.run("UPDATE tasks SET updated_at = ? WHERE task_id = ?", [Date.now() - 2 * 3600_000, id]);
+  }
+  expect(g.m.resumeTasks(new Set(["old"])).map((t) => t.taskId)).toEqual(["old"]);
+  expect(store.getTask("older")!.state).toBe("failed");
+  store.createTask({ taskId: "new", fromSession: "tg:1", toSession: "worker:x", mode: "ask", request: "q" });
+  expect(g.m.resumeTasks().map((t) => t.taskId)).toEqual(["new"]);
+  await g.m.stop();
 });
 
 test("--in / --at parsing", () => {

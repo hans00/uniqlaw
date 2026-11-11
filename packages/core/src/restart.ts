@@ -5,7 +5,7 @@
 //  4. come back: open tasks re-armed or failed, deferred input replayed, notices to the requester and to every
 //     session whose turn was cut off — delivered as a new turn (a reattached claude-tmux session gets it too).
 import { z } from "zod";
-import type { ChannelManager, InflightTurn } from "./manager.ts";
+import type { ChannelManager, FailedTask, InflightTurn } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
 import type { Target } from "./platform.ts";
 import type { StateStore } from "./state.ts";
@@ -28,7 +28,7 @@ export interface RestartRequest {
   drainTimeoutSec?: number;
 }
 
-/** A pending (scheduled or draining) request; several requests merge into one. */
+/** A scheduled or draining request; several requests merge into one. */
 interface Pending {
   id: string;
   kind: RestartKind;
@@ -69,6 +69,8 @@ export interface RestartRecord {
 
 export interface RestartStatus {
   pending: boolean;
+  /** While draining: a restart also scheduled for later. */
+  scheduled?: { kind: RestartKind; fireAt: number; requestedBy: string[] };
   phase?: "scheduled" | "draining";
   kind?: RestartKind;
   fireAt?: number;
@@ -79,6 +81,8 @@ export interface RestartStatus {
 }
 
 const PENDING_KEY = "restart-pending";
+/** Delay between accepting a request due now and starting the drain (lets the request's own reply go out). */
+const START_DELAY_MS = 50;
 export const RECORD_KEY = "restart-record";
 /** Job name of the notice turn (a scheduler origin, so its reply goes to the chat it names). */
 export const RESTART_NOTICE_JOB = "uniqlaw-restart";
@@ -90,21 +94,30 @@ export interface RestartDeps {
   settings: Settings;
   /** Throws if the on-disk settings are invalid (a restart with them would not come back up). */
   validate?: () => void;
-  /** Stop this daemon and start the next one (in-process reload or a new process). */
-  execute(kind: RestartKind): void | Promise<void>;
+  /** Stop this daemon and start the next one (in-process reload or a new process). Resolve false when nothing
+   *  was stopped (e.g. the reload refused the settings): the drain ends and the daemon carries on. */
+  execute(kind: RestartKind): void | boolean | Promise<void | boolean>;
   pollMs?: number;
 }
 
 export class RestartCoordinator {
-  private pending?: Pending & { phase: "scheduled" | "draining"; timer?: ReturnType<typeof setTimeout> };
+  /** A restart asked for later (--in / --at): persisted, re-armed by the next daemon if it reloads meanwhile. */
+  private scheduled?: Pending & { timer?: ReturnType<typeof setTimeout> };
+  /** The restart being carried out now (draining). */
+  private active?: Pending;
   /** Collected by prepare() (before sessions reopen), used by resume(). */
-  private carried?: { record?: RestartRecord; failedTasks: { taskId: string; from: string; to: string }[] };
+  private carried?: { record?: RestartRecord; failedTasks: FailedTask[] };
   private stopped = false;
 
   constructor(private readonly d: RestartDeps) {}
 
   // ── request ──────────────────────────────────────────────────────────────
 
+  /**
+   * Ask for a restart. Returns at once. Due now → merged into the drain in progress (restart wins over reload) or
+   * a new one. Due later → merged into the scheduled one (restart wins, earliest time wins). The two are separate:
+   * `uniqlaw reload` before a 03:00 restart reloads now and keeps the 03:00 restart.
+   */
   request(r: RestartRequest): RestartStatus {
     if (this.stopped) throw new Error("the daemon is already stopping");
     this.d.validate?.();
@@ -112,43 +125,56 @@ export class RestartCoordinator {
     const fireAt = Math.max(r.at ?? now, now);
     const target = this.requesterTarget(r.requestedBy);
     const timeout = r.drainTimeoutSec ?? this.d.settings.restart.drainTimeoutSec;
-    const p = this.pending;
-    if (p) {
-      // Merge: restart wins over reload, the earliest time wins, "now" sticks.
+    const fresh = (): Pending => ({ id: crypto.randomUUID(), kind: r.kind, requestedBy: [], reasons: [], requestedAt: now, fireAt, now: false,
+      drainTimeoutSec: timeout, targets: {} });
+    const merge = (p: Pending) => {
       if (r.kind === "restart") p.kind = "restart";
       if (!p.requestedBy.includes(r.requestedBy)) p.requestedBy.push(r.requestedBy);
       if (r.reason) p.reasons.push(r.reason);
       p.now ||= !!r.now;
       p.drainTimeoutSec = Math.min(p.drainTimeoutSec, timeout);
       if (target !== undefined) p.targets[r.requestedBy] = target;
-      if (p.phase === "scheduled" && fireAt < p.fireAt) { p.fireAt = fireAt; this.arm(); }
-    } else {
-      this.pending = { id: crypto.randomUUID(), kind: r.kind, requestedBy: [r.requestedBy], reasons: r.reason ? [r.reason] : [], requestedAt: now,
-        fireAt, now: !!r.now, drainTimeoutSec: timeout, targets: target !== undefined ? { [r.requestedBy]: target } : {}, phase: "scheduled" };
+      return p;
+    };
+    if (fireAt > now) {
+      const s = merge(this.scheduled ?? fresh());
+      s.fireAt = Math.min(s.fireAt, fireAt);
+      this.scheduled = s;
       this.arm();
+      this.saveScheduled();
+    } else if (this.active) {
+      merge(this.active);
+    } else {
+      this.active = merge(fresh());
+      // Not synchronously: the caller (an HTTP request, a tool call) must get its answer before the daemon stops.
+      setTimeout(() => void this.run(), START_DELAY_MS);
     }
-    this.savePending();
     this.d.log.info("restart requested", { kind: r.kind, by: r.requestedBy, reason: r.reason, at: new Date(fireAt).toISOString(), now: !!r.now });
     return this.status();
   }
 
-  /** Cancel a scheduled or draining restart; input deferred so far is replayed right away. */
+  /** Cancel the drain in progress (held input is replayed right away) and any scheduled restart. */
   async cancel(): Promise<{ canceled: boolean; replayed: number }> {
-    const p = this.pending;
-    if (!p) return { canceled: false, replayed: 0 };
-    clearTimeout(p.timer);
-    this.pending = undefined;
+    const had = !!(this.active || this.scheduled);
+    clearTimeout(this.scheduled?.timer);
+    this.scheduled = undefined;
     this.d.store.del(PENDING_KEY);
+    this.active = undefined;
     const replayed = await this.d.manager.endDrain();
-    this.d.log.info("restart canceled", { replayed });
-    return { canceled: true, replayed };
+    if (had) this.d.log.info("restart canceled", { replayed });
+    return { canceled: had, replayed };
   }
 
   status(): RestartStatus {
-    const p = this.pending;
-    if (!p) return { pending: false };
-    return { pending: true, phase: p.phase, kind: p.kind, fireAt: p.fireAt, requestedBy: [...p.requestedBy], reasons: [...p.reasons],
-      ...(p.phase === "draining" ? { inflight: this.d.manager.inflightTurns().map((t) => t.channelKey), deferred: this.d.store.countDeferred() } : {}) };
+    const a = this.active;
+    const s = this.scheduled;
+    const sched = s ? { scheduled: { kind: s.kind, fireAt: s.fireAt, requestedBy: [...s.requestedBy] } } : {};
+    if (a) {
+      return { pending: true, phase: "draining", kind: a.kind, fireAt: a.fireAt, requestedBy: [...a.requestedBy], reasons: [...a.reasons],
+        inflight: this.d.manager.inflightTurns().map((t) => t.channelKey), deferred: this.d.store.countDeferred(), ...sched };
+    }
+    if (s) return { pending: true, phase: "scheduled", kind: s.kind, fireAt: s.fireAt, requestedBy: [...s.requestedBy], reasons: [...s.reasons] };
+    return { pending: false };
   }
 
   /** Re-arm a restart scheduled before the last reload. One whose time passed meanwhile is dropped: the daemon
@@ -163,7 +189,7 @@ export class RestartCoordinator {
         this.d.log.info("dropping a scheduled restart whose time passed while the daemon was down", { fireAt: new Date(p.fireAt).toISOString() });
         return;
       }
-      this.pending = { ...p, phase: "scheduled" };
+      this.scheduled = p;
       this.arm();
       this.d.log.info("scheduled restart re-armed", { kind: p.kind, at: new Date(p.fireAt).toISOString() });
     } catch { this.d.store.del(PENDING_KEY); }
@@ -171,65 +197,98 @@ export class RestartCoordinator {
 
   stop() {
     this.stopped = true;
-    clearTimeout(this.pending?.timer);
+    clearTimeout(this.scheduled?.timer);
   }
 
   private arm() {
-    const p = this.pending!;
-    clearTimeout(p.timer);
-    p.timer = setTimeout(() => void this.run(p.id), Math.max(0, p.fireAt - Date.now()));
+    const s = this.scheduled!;
+    clearTimeout(s.timer);
+    s.timer = setTimeout(() => this.fireScheduled(s.id), Math.max(0, s.fireAt - Date.now()));
   }
 
-  private savePending() {
-    const { timer: _t, phase: _p, ...p } = this.pending!;
+  /** The scheduled time came: it becomes (or joins) the drain. */
+  private fireScheduled(id: string) {
+    const s = this.scheduled;
+    if (!s || s.id !== id || this.stopped) return;
+    this.scheduled = undefined;
+    this.d.store.del(PENDING_KEY);
+    const { timer: _t, ...p } = s;
+    if (this.active) {
+      const a = this.active;
+      if (p.kind === "restart") a.kind = "restart";
+      for (const w of p.requestedBy) if (!a.requestedBy.includes(w)) a.requestedBy.push(w);
+      a.reasons.push(...p.reasons);
+      Object.assign(a.targets, p.targets);
+      return;
+    }
+    this.active = p;
+    void this.run();
+  }
+
+  private saveScheduled() {
+    const { timer: _t, ...p } = this.scheduled!;
     this.d.store.set(PENDING_KEY, JSON.stringify(p));
   }
 
+  /** Where a requesting session's notice reply goes: its chat; undefined = not a session (cli, api, signal);
+   *  null = a session without a chat of its own (worker, cron, …: background routing). */
   private requesterTarget(who: string): Target | null | undefined {
     const m = this.d.manager;
-    if (!this.d.store.getSession(who) && !m.runtimes.has(who)) return undefined; // not a session (cli, api, signal)
+    if (!this.d.store.getSession(who) && !m.runtimes.has(who)) return undefined;
+    if (m.kindOf(who) !== "chat") return null;
     return m.runtimes.get(who)?.rootTarget() ?? m.runtimes.get(who)?.lastTarget() ?? null;
   }
 
   // ── drain → persist → execute ─────────────────────────────────────────────
 
-  private async run(id: string) {
-    const p = this.pending;
-    if (!p || p.id !== id || this.stopped) return;
-    p.phase = "draining";
+  private async run() {
+    const p = this.active;
+    if (!p || this.stopped) return;
     const m = this.d.manager;
     m.beginDrain();
-    const deadline = Date.now() + (p.now ? 0 : p.drainTimeoutSec * 1000);
+    const started = Date.now();
     this.d.log.info("restart: draining", { kind: p.kind, inflight: m.inflightTurns().map((t) => t.channelKey), timeoutSec: p.now ? 0 : p.drainTimeoutSec });
-    while (m.inflightTurns().length && Date.now() < deadline) {
+    // p.now / drainTimeoutSec may change while we wait (a merged request): re-read them every poll.
+    while (m.inflightTurns().length && !p.now && Date.now() < started + p.drainTimeoutSec * 1000) {
       await Bun.sleep(this.d.pollMs ?? 200);
-      if (this.pending?.id !== id) return; // canceled
+      if (this.active !== p) return; // canceled
     }
-    if (this.pending?.id !== id || this.stopped) return;
+    if (this.active !== p || this.stopped) return;
     try { this.d.validate?.(); } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.d.log.error("restart aborted: settings are invalid", { msg });
-      for (const who of p.requestedBy) {
-        if (this.d.store.getSession(who)) this.d.store.pushPending(who, "peer-result", { label: "uniqlaw: your restart was aborted", text: `settings.json is invalid, the daemon keeps running: ${msg}` });
-      }
-      await this.cancel();
+      this.tellRequesters(p, `settings.json is invalid, the daemon keeps running: ${msg}`);
+      this.active = undefined;
+      await m.endDrain();
       return;
     }
-    this.persist({ ...p, kind: p.kind });
-    this.d.store.del(PENDING_KEY);
-    this.pending = undefined;
+    this.persist(p);
+    this.active = undefined;
     this.stopped = true;
     this.d.log.info("restart: executing", { kind: p.kind });
-    try { await this.d.execute(p.kind); }
-    catch (e) { this.d.log.error("restart failed", { e: String(e) }); }
+    let done: boolean | void = undefined;
+    try { done = await this.d.execute(p.kind); }
+    catch (e) { this.d.log.error("restart failed", { e: String(e) }); done = false; }
+    if (done === false) {
+      // Nothing was stopped (e.g. the reload refused the settings): take the record back and resume normal work.
+      this.d.store.del(RECORD_KEY);
+      this.stopped = false;
+      this.tellRequesters(p, "the daemon could not restart and keeps running (see the daemon log)");
+      await m.endDrain();
+    }
+  }
+
+  private tellRequesters(p: Pending, text: string) {
+    for (const who of p.requestedBy) {
+      if (this.d.store.getSession(who)) this.d.store.pushPending(who, "peer-result", { label: `uniqlaw: your ${p.kind} was aborted`, text });
+    }
   }
 
   /** Stop without a drain (SIGTERM / `uniqlaw stop`): record what was running so the next start tells them. */
   recordStop(by: string) {
     if (this.d.store.get(RECORD_KEY)) return; // a restart already wrote its record
     this.d.manager.beginDrain();
-    const p = this.pending;
-    this.persist({ id: crypto.randomUUID(), kind: "stop", requestedBy: [by], reasons: p?.reasons ?? [], requestedAt: Date.now(), targets: {} });
+    this.persist({ id: crypto.randomUUID(), kind: "stop", requestedBy: [by], reasons: [], requestedAt: Date.now(), targets: {} });
   }
 
   private persist(p: Pick<Pending, "id" | "requestedBy" | "reasons" | "requestedAt" | "targets"> & { kind: RestartRecord["kind"] }) {
@@ -246,31 +305,34 @@ export class RestartCoordinator {
   }
 
   private interruptedOf(t: InflightTurn): InterruptedTurn {
-    const rt = this.d.manager.runtimes.get(t.channelKey);
-    return { channelKey: t.channelKey, answering: t.origins.map(originLabel), detachable: t.detachable,
-      target: rootOf(t.origins) ?? rt?.lastTarget() ?? null };
+    const m = this.d.manager;
+    // Only a chat's notice reply goes to a chat; workers / internal sessions follow their background routing.
+    const target = m.kindOf(t.channelKey) === "chat" ? rootOf(t.origins) ?? m.runtimes.get(t.channelKey)?.lastTarget() ?? null : null;
+    return { channelKey: t.channelKey, answering: t.origins.map(originLabel), detachable: t.detachable, target };
   }
 
   // ── come back ────────────────────────────────────────────────────────────
 
   /** First half of the comeback, before sessions are restored (reopening one consumes its inflight-turn key):
-   *  re-arm or fail the previous process's open tasks. */
+   *  re-arm or fail the previous process's open tasks. Nothing is sent yet. */
   prepare() {
     const raw = this.d.store.get(RECORD_KEY);
     let record: RestartRecord | undefined;
     if (raw) { try { record = JSON.parse(raw) as RestartRecord; } catch { this.d.log.warn("unreadable restart record; ignored"); } }
-    const failedTasks = this.d.manager.resumeTasks();
+    const failedTasks = this.d.manager.resumeTasks(record ? new Set(record.openTasks.map((t) => t.taskId)) : undefined);
     this.carried = { ...(record ? { record } : {}), failedTasks };
   }
 
-  /** Second half, once platforms are up: replay deferred input and send the notices. The record is deleted
-   *  before anything is sent, so a crash in here never notifies twice (at-most-once, like the replay). */
+  /** Second half, once platforms are up: replay deferred input, tell askers about failed tasks, send the notices.
+   *  The record is deleted before anything is sent, so a crash in here never notifies twice (at-most-once). */
   async resume(): Promise<{ record?: RestartRecord; replayed: number; notified: string[] }> {
     if (!this.carried) this.prepare();
     const { record, failedTasks } = this.carried!;
     this.carried = undefined;
     this.d.store.del(RECORD_KEY);
-    const replayed = await this.d.manager.replayDeferred();
+    const m = this.d.manager;
+    const replayed = await m.replayDeferred();
+    m.reportFailedTasks(failedTasks);
     if (!record) return { replayed, notified: [] };
     const tz = this.d.settings.timezone;
     const verb = record.kind === "reload" ? "reloaded" : record.kind === "stop" ? "was stopped and started again" : "restarted";
@@ -299,7 +361,7 @@ export class RestartCoordinator {
     }
     for (const [key, n] of notices) {
       try {
-        await this.d.manager.runtime(key).enqueue({
+        await m.deliverSystemTurn(key, "uniqlaw: daemon restart notice", {
           origin: { kind: "scheduler", job: RESTART_NOTICE_JOB, ...(n.target ? { deliverTo: n.target } : {}) },
           item: { text: n.text.join("\n"), receivedAt: Date.now(), sourceLine: "[UniQlaw system notice]", raw: true },
           attachments: [],

@@ -63,8 +63,9 @@ export interface Daemon {
 export interface DaemonOptions {
   logToStderr?: boolean;
   /** Called once a graceful restart/reload has drained and written its record: stop this daemon and bring up the
-   *  next one (runForever: reload = in-process, restart = new process). Without it restart requests are refused. */
-  onRestart?: (kind: RestartKind) => void | Promise<void>;
+   *  next one (runForever: reload = in-process, restart = new process). Resolve false if nothing was stopped.
+   *  Without it restart requests are refused. */
+  onRestart?: (kind: RestartKind) => void | boolean | Promise<void | boolean>;
 }
 
 export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}): Promise<Daemon> {

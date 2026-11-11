@@ -144,6 +144,7 @@ export class ChannelRuntime {
   /** After reopening on a turn that was in flight at detach: give the reattached turn a moment to claim its
    *  origins before a queued input could start a turn of its own and take them. */
   private resumeGraceUntil = 0;
+  private resumeTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     readonly channelKey: string,
@@ -289,6 +290,7 @@ export class ChannelRuntime {
       clearTimeout(this.interruptTimer);
       clearTimeout(this.drainTimer);
       clearTimeout(this.stallTimer);
+      clearTimeout(this.resumeTimer);
       this.state = "closed";
       this.turn = undefined;
       s.detach!();
@@ -299,6 +301,7 @@ export class ChannelRuntime {
 
   async close(): Promise<void> {
     clearTimeout(this.retryTimer);
+    clearTimeout(this.resumeTimer);
     this.retrying = undefined;
     clearTimeout(this.stallTimer);
     this.stopTyping();
@@ -359,6 +362,8 @@ export class ChannelRuntime {
         try {
           this.resumeOrigins = { origins: JSON.parse(inflight) as Origin[], until: Date.now() + RESUME_ORIGINS_MS };
           this.resumeGraceUntil = Date.now() + RESUME_GRACE_MS;
+          clearTimeout(this.resumeTimer);
+          this.resumeTimer = setTimeout(() => this.expireResume(), RESUME_ORIGINS_MS);
         } catch {}
       }
       this.session = session;
@@ -472,6 +477,7 @@ export class ChannelRuntime {
 
   private async startTurn(origins: Origin[], input: TurnInput, retries = 0): Promise<void> {
     if (!this.session) return;
+    this.expireResume(); // another turn comes first: the resumed one is not coming back
     this.steerLog = [];
     this.steerCarry = undefined;
     this.turn = { origins, input, retries, startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: false };
@@ -742,8 +748,23 @@ export class ChannelRuntime {
   /** Origins of a turn that was in flight when the daemon detached (once, shortly after reopening). */
   private takeResumeOrigins(): Origin[] | undefined {
     const r = this.resumeOrigins;
+    if (!r || Date.now() >= r.until) { this.expireResume(); return undefined; }
     this.resumeOrigins = undefined;
-    return r && Date.now() < r.until ? r.origins : undefined;
+    clearTimeout(this.resumeTimer);
+    return r.origins;
+  }
+
+  /** The turn in flight at detach never showed up again (it ended while the daemon was down, or another turn came
+   *  first): fail the tasks it was answering, so their askers don't wait forever. */
+  private expireResume() {
+    const r = this.resumeOrigins;
+    this.resumeOrigins = undefined;
+    clearTimeout(this.resumeTimer);
+    for (const o of r?.origins ?? []) {
+      if (o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) {
+        this.host.onTaskResult(o.taskId, false, "the answer was given while UniQlaw was restarting and could not be collected; ask again");
+      }
+    }
   }
 
   private armStall() {
