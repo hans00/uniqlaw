@@ -482,19 +482,36 @@ The unit of control is the channel (chat), not the user. `settings.channels` giv
 core resolves it into `SessionSpec.toolPolicy` when the chat's session opens. One table (`TOOL_GROUPS` in
 `core/src/channel-policy.ts`) maps each group to concrete tools:
 
-| group | UniQlaw MCP tools | Claude Code built-ins |
+| group | UniQlaw MCP tools | Claude Code built-ins (names as of claude 2.1.322) |
 |---|---|---|
-| `chat` | `send_file` (own chat only unless `notify` is granted) | `TodoWrite` |
+| `chat` | `send_file` (own chat only unless `notify` is granted) | `TaskCreate/Get/List/Update`, `ToolSearch`, `AskUserQuestion`, plan mode, `ReportFindings` |
 | `memory` | `memory_write`, `memory_search`, `memory_get` | — |
 | `web` | — | `WebSearch`, `WebFetch` |
-| `files.read` | — | `Read`, `Grep`, `Glob` |
-| `files.write` | — | `Write`, `Edit`, `NotebookEdit` |
-| `bash` | — | `Bash` |
-| `cron` | `cron_list`, `cron_save`, `cron_delete` | — |
-| `worker` | `worker_start`, `worker_stop` | — |
-| `xsession` | `agents_list`, `agent_ask`, `agent_trigger`, `task_status` | — |
-| `notify` | `notify` (and `send_file` to other chats) | — |
+| `files.read` | — | `Read`, `Grep`, `Glob`, `LSP` |
+| `files.write` ⚠ | — | `Write`, `Edit`, `NotebookEdit`, worktrees |
+| `bash` ⚠ | — | `Bash`, `Monitor`, `PowerShell`, `TaskStop` (anything that runs code) |
+| `agents` | — | `Task`/`Agent`, `Workflow`, `Skill` (sub-agents get the session's own tool set) |
+| `cron` ⚠ | `cron_list`, `cron_save`, `cron_delete` | `CronCreate/Delete/List`, `ScheduleWakeup`, `RemoteTrigger` |
+| `worker` ⚠ | `worker_start`, `worker_stop` | — |
+| `xsession` ⚠ | `agents_list`, `agent_ask`, `agent_trigger`, `task_status` | `SendToProject` (`ListAgents` / `SendMessage` are always off) |
+| `notify` | `notify` (and `send_file` to other chats) | `PushNotification`, `Artifact*`, `DesignSync` |
 | `config` | reserved (no tools yet) | — |
+
+**⚠ Admin-level groups (v1).** `bash`, `files.write`, `cron`, `worker` and `xsession` grant effectively full access,
+because each one lets a restricted chat reach something unrestricted:
+- a cron job runs in its own `cron:<job>` session, and a worker runs under its own profile;
+- `agent_ask` / `agent_trigger` reach other chats' sessions;
+- writes to `.uniqlaw/jobs/*.md`, `.uniqlaw/settings.json` or `.claude/settings.json` hooks change what runs next;
+- a shell can do all of the above.
+
+There is no policy inheritance across these hops yet. The daemon logs a warning at startup for every restricted channel
+(or `defaults`) that grants one of them. Give them only to chats whose members you would trust with the machine.
+
+**Sensitive reads.** `.uniqlaw/` holds other chats' transcripts (`state.db`), settings, logs and the per-session MCP
+gateway tokens (`claude-tmux/*/mcp.json`). Every restricted chat on a Claude provider gets
+`Read(./.uniqlaw/**)` / `Grep(…)` / `Glob(…)` deny rules (relative to the session's cwd, the project directory), but
+`files.read` still reaches the rest of the project (including `memory/`) and anything else the OS user can read. A shell
+(`bash`) bypasses these rules entirely.
 
 - `tools: [...]` is an allow list: only those tools exist. Claude gets `--tools <built-ins>` and `--strict-mcp-config`
   (no MCP servers from the user's own config), plus the granted UniQlaw tools named one by one in `--allowedTools`.
@@ -506,13 +523,16 @@ core resolves it into `SessionSpec.toolPolicy` when the chat's session opens. On
 - Only chat sessions take a policy. Internal sessions (heartbeat, `cron:<job>`), workers and A2A sessions keep their own
   settings, also when they post into a chat. A job whose target *is* a chat session runs inside that session, with its tools.
 - A policy change is a launch-flag change, so a claude-tmux process reattached after a reload is respawned (`--resume`)
-  with the new tool set (same fingerprint mechanism as a permission-mode change).
+  with the new tool set (same fingerprint mechanism as a permission-mode change). Until then it keeps its old built-in
+  tools: a turn that was running across the reload finishes with them, and the respawn happens once the pane is idle.
+  UniQlaw MCP tools change at once (the gateway checks every request).
 - Migration: no `channels` section, or no entry and no `defaults` for a chat, means unrestricted (the behavior before `channels` existed).
   Only an explicit `defaults` entry narrows chats without their own entry.
 
 Group chats (`groups`, per channel in `groups.channels`) add wake rules on top of `mode`: `allowFrom` lists the platform
-user ids allowed to wake the agent (`"telegram:<from.id>"`, `"discord:<author.id>"` or a bare id; empty = anyone the
-platform allowlist lets through). The check runs in core on `InboundMessage.sender.id` from the platform payload, before
+user ids allowed to wake the agent (`"telegram:<from.id>"`, `"discord:<author.id>"`; in a per-channel entry a bare id
+means that channel's platform, in the global list it matches no one and is warned about; empty = anyone the platform
+allowlist lets through). The check runs in core on `InboundMessage.sender.id` from the platform payload, before
 the agent sees anything; names and message text never count. `others` decides what happens to messages that don't wake
 the agent: `context` keeps them (up to `historyLimit`) as background for the next woken turn, labelled with the sender's
 id; `ignore` drops them. DMs are never gated.
