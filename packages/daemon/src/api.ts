@@ -2,13 +2,13 @@
 // non-loopback bind. /api/send and /api/trigger stay v2-compatible.
 import { existsSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
-import type { ChannelManager, Logger, RuntimeEvent, StateStore } from "@uniqlaw/core";
+import { parseWhen, type ChannelManager, type Logger, type RestartCoordinator, type RestartKind, type RuntimeEvent, type StateStore } from "@uniqlaw/core";
 import { loadJobs, nextMatch } from "@uniqlaw/scheduler";
 
 export interface ApiOptions {
-  /** Throws if the on-disk settings are invalid (checked before a reload is accepted). */
-  validateSettings?: () => void;
   manager: ChannelManager;
+  /** Graceful restart / reload (POST /api/restart, /api/reload). */
+  restart?: RestartCoordinator;
   store: StateStore;
   host: string;
   port: number;
@@ -98,7 +98,7 @@ export function startApi(o: ApiOptions) {
           if (!path.startsWith("/api/")) return json({ ok: false, error: "not found" }, 404);
           if (!authorized(req)) return json({ ok: false, error: "unauthorized" }, 401);
 
-          if (req.method === "GET" && path === "/api/status") return json({ ok: true, version: o.version, agents: manager.listAgents() });
+          if (req.method === "GET" && path === "/api/status") return json({ ok: true, version: o.version, agents: manager.listAgents(), restart: o.restart?.status() ?? { pending: false } });
           if (req.method === "GET" && path === "/api/agents") return json({ ok: true, agents: agentsDetail() });
           if (req.method === "GET" && path === "/api/jobs") {
             const jobs = loadJobs(o.jobsDir).map((j) => ({ name: j.name, schedule: j.schedule, recurring: j.recurring, target: j.target,
@@ -136,13 +136,24 @@ export function startApi(o: ApiOptions) {
               return json({ ok: true });
             }
           }
-          if (req.method === "POST" && path === "/api/reload") {
-            // Handled by runForever's SIGHUP handler (validates settings, then restarts in-process).
-            try { o.validateSettings?.(); } catch (e) {
-              return json({ ok: false, error: `settings rejected, keeping the running config: ${e instanceof Error ? e.message : String(e)}` }, 400);
+          if (req.method === "GET" && path === "/api/restart") return json({ ok: true, ...(o.restart?.status() ?? { pending: false }) });
+          if (req.method === "POST" && (path === "/api/reload" || path === "/api/restart")) {
+            // Graceful: returns at once; running turns finish (restart.drainTimeoutSec), new input waits and is
+            // replayed, then runForever reloads in-process (reload) or starts a new process (restart).
+            if (!o.restart) return json({ ok: false, error: "restart is not available in this daemon" }, 400);
+            const b = (await req.json().catch(() => ({}))) as { kind?: RestartKind; reason?: string; in?: string; at?: string; now?: boolean;
+              cancel?: boolean; from?: string; fromLabel?: string; drainTimeoutSec?: number };
+            if (b.cancel) return json({ ok: true, ...(await o.restart.cancel()) });
+            const kind: RestartKind = path === "/api/reload" ? "reload" : b.kind === "reload" ? "reload" : "restart";
+            let st;
+            try {
+              const at = parseWhen({ in: b.in, at: b.at }, o.timezone);
+              st = o.restart.request({ kind, requestedBy: b.from || b.fromLabel || "api", ...(b.reason ? { reason: b.reason } : {}), now: !!b.now,
+                ...(at ? { at } : {}), ...(typeof b.drainTimeoutSec === "number" ? { drainTimeoutSec: b.drainTimeoutSec } : {}) });
+            } catch (e) {
+              return json({ ok: false, error: `${kind} rejected, keeping the running daemon: ${e instanceof Error ? e.message : String(e)}` }, 400);
             }
-            setTimeout(() => process.kill(process.pid, "SIGHUP"), 10);
-            return json({ ok: true, reloading: true });
+            return json({ ok: true, ...(kind === "reload" ? { reloading: true } : { restarting: true }), ...st });
           }
           if (req.method === "POST" && path === "/api/send") {
             const b = (await req.json()) as { target?: string; text?: string; fromLabel?: string };

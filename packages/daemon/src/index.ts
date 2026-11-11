@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   BRAND_PROMPT, ChannelManager, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
-  createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, type MemoryOriginKind,
+  createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, RestartCoordinator, type MemoryOriginKind, type RestartKind,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
   type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transcriber, type Transport,
 } from "@uniqlaw/core";
@@ -54,11 +54,20 @@ const BASE_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_A
 export interface Daemon {
   stop(): Promise<void>;
   manager: ChannelManager;
+  /** Graceful restart / reload requests (drain → persist → execute via onRestart). */
+  restart: RestartCoordinator;
   webPort?: number;
   gatewayPort?: number;
 }
 
-export async function startDaemon(projectDirIn: string, opts: { logToStderr?: boolean } = {}): Promise<Daemon> {
+export interface DaemonOptions {
+  logToStderr?: boolean;
+  /** Called once a graceful restart/reload has drained and written its record: stop this daemon and bring up the
+   *  next one (runForever: reload = in-process, restart = new process). Without it restart requests are refused. */
+  onRestart?: (kind: RestartKind) => void | Promise<void>;
+}
+
+export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}): Promise<Daemon> {
   const projectDir = resolve(projectDirIn);
   const stateDir = stateDirOf(projectDir);
   const settings = loadSettings(projectDir);
@@ -155,6 +164,15 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
         return env;
       },
     });
+    const restart = new RestartCoordinator({ manager, store, log: log.child("restart"), settings,
+      validate: () => {
+        if (!opts.onRestart) throw new Error("this daemon was started without a restart handler (run it with `uniqlaw run` / `uniqlaw start`)");
+        loadSettings(projectDir);
+      },
+      execute: (kind) => opts.onRestart!(kind) });
+    gateway.addTools(restart.tools());
+    // Before restore(): reopening a session consumes its inflight-turn key, which re-arms the tasks it answers.
+    restart.prepare();
     await manager.restore();
     manager.start();
     cleanups.push(() => manager.stop());
@@ -210,8 +228,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     if (settings.web.enabled) {
       const token = settings.web.token ? await resolveSecret(settings.web.token as SecretRef) : undefined;
       const cronDir = (settings.plugins.cron as { dir?: string } | undefined)?.dir ?? ".uniqlaw/jobs";
-      const api = startApi({ manager, store, host: settings.web.host, port: settings.web.port, log: log.child("api"), version: VERSION, token,
-        validateSettings: () => { loadSettings(projectDir); },
+      const api = startApi({ manager, store, host: settings.web.host, port: settings.web.port, log: log.child("api"), version: VERSION, token, restart,
         logFile: join(stateDir, "logs", "daemon.log"), jobsDir: resolve(projectDir, cronDir), timezone: settings.timezone,
         ...(memory ? { dream: async ({ dryRun }: { dryRun?: boolean }) => {
           const sch = schedulers.get("dreaming");
@@ -224,6 +241,11 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
       cleanups.push(() => api.stop());
     }
 
+    // Back from a restart: replay deferred input, notify the requester and interrupted sessions (platforms are up).
+    await restart.resume().catch((e) => log.error("restart resume failed", { e: String(e) }));
+    restart.start();
+    cleanups.push(() => restart.stop());
+
     const transportPorts: Record<string, number> = {};
     for (const t of transports.values()) Object.assign(transportPorts, t.ports?.() ?? {});
     writeRuntime(projectDir, { pid: process.pid, instanceId, projectDir, startedAt: Date.now(), webPort, gatewayPort,
@@ -231,7 +253,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     log.info("ready", { webPort, gatewayPort, platforms: [...platforms.keys()], providers: [...providers.keys()], schedulers: [...schedulers.keys()] });
 
     return {
-      manager, webPort, gatewayPort,
+      manager, restart, webPort, gatewayPort,
       stop: async () => {
         log.info("stopping");
         for (const c of cleanups.reverse()) await Promise.resolve(c()).catch((e) => log.warn("cleanup failed", { e: String(e) }));
