@@ -231,6 +231,7 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
       const token = settings.web.token ? await resolveSecret(settings.web.token as SecretRef) : undefined;
       const cronDir = (settings.plugins.cron as { dir?: string } | undefined)?.dir ?? ".uniqlaw/jobs";
       const api = startApi({ manager, store, host: settings.web.host, port: settings.web.port, log: log.child("api"), version: VERSION, token, restart,
+        sessionForToken: (t) => gateway.sessionForToken(t),
         logFile: join(stateDir, "logs", "daemon.log"), jobsDir: resolve(projectDir, cronDir), timezone: settings.timezone,
         ...(memory ? { dream: async ({ dryRun }: { dryRun?: boolean }) => {
           const sch = schedulers.get("dreaming");

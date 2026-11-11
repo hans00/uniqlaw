@@ -9,6 +9,8 @@ export interface ApiOptions {
   manager: ChannelManager;
   /** Graceful restart / reload (POST /api/restart, /api/reload). */
   restart?: RestartCoordinator;
+  /** Gateway token → session (lets a caller prove it speaks for a session without web.token). */
+  sessionForToken?: (token: string) => string | undefined;
   store: StateStore;
   host: string;
   port: number;
@@ -71,6 +73,18 @@ export function startApi(o: ApiOptions) {
   };
   manager.events.on("event", onEvent);
   const keepAlive = setInterval(() => { for (const c of sseClients) { try { c.enqueue(enc.encode(": ping\n\n")); } catch { sseClients.delete(c); } } }, 20_000);
+
+  /** Who asked for a restart. Naming a session (it gets the notice turn, routed to its chat) needs proof: web.token
+   *  was presented, or the session's own gateway token (0600 in .uniqlaw/gateway.json, which the CLI reads). Any
+   *  other caller of a tokenless loopback API is just "api". Labels that aren't sessions (cli, …) are kept. */
+  const requesterOf = (b: { from?: string; fromLabel?: string; fromToken?: string }): string => {
+    const name = (b.from || b.fromLabel || "").trim();
+    if (!name) return "api";
+    const isSession = !!store.getSession(name) || manager.runtimes.has(name);
+    if (!isSession) return /^[\w.:@-]{1,64}$/.test(name) && name !== "api" ? name : "api";
+    if (o.token) return name; // authorized() already checked it on this request
+    return b.fromToken && o.sessionForToken?.(b.fromToken) === name ? name : "api";
+  };
 
   const agentsDetail = () => manager.listAgents().map((a) => {
     const row = store.getSession(a.name);
@@ -142,13 +156,13 @@ export function startApi(o: ApiOptions) {
             // replayed, then runForever reloads in-process (reload) or starts a new process (restart).
             if (!o.restart) return json({ ok: false, error: "restart is not available in this daemon" }, 400);
             const b = (await req.json().catch(() => ({}))) as { kind?: RestartKind; reason?: string; in?: string; at?: string; now?: boolean;
-              cancel?: boolean; from?: string; fromLabel?: string; drainTimeoutSec?: number };
+              cancel?: boolean; from?: string; fromLabel?: string; fromToken?: string; drainTimeoutSec?: number };
             if (b.cancel) return json({ ok: true, ...(await o.restart.cancel()) });
             const kind: RestartKind = path === "/api/reload" ? "reload" : b.kind === "reload" ? "reload" : "restart";
             let st;
             try {
               const at = parseWhen({ in: b.in, at: b.at }, o.timezone);
-              st = o.restart.request({ kind, requestedBy: b.from || b.fromLabel || "api", ...(b.reason ? { reason: b.reason } : {}), now: !!b.now,
+              st = o.restart.request({ kind, requestedBy: requesterOf(b), ...(b.reason ? { reason: b.reason } : {}), now: !!b.now,
                 ...(at ? { at } : {}), ...(typeof b.drainTimeoutSec === "number" ? { drainTimeoutSec: b.drainTimeoutSec } : {}) });
             } catch (e) {
               return json({ ok: false, error: `${kind} rejected, keeping the running daemon: ${e instanceof Error ? e.message : String(e)}` }, 400);

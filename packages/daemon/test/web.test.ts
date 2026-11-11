@@ -134,3 +134,24 @@ test("tailFile reads only the end", () => {
   expect(tailFile(f, 3)).toEqual(["line 49997", "line 49998", "line 49999"]);
   expect(tailFile(join(dir, "missing"), 3)).toEqual([]);
 });
+
+test("restart API: a session is only trusted as the requester with proof (its gateway token, or web.token)", async () => {
+  const dir = project();
+  const d = await startDaemon(dir, { onRestart: () => false });
+  cleanups.push(() => d.stop());
+  const base = `http://127.0.0.1:${d.webPort}`;
+  await sendHi();
+  await until(() => !!d.manager.runtimes.get("tg:100") && d.manager.runtimes.get("tg:100")!.state !== "opening");
+  const { readFileSync } = await import("node:fs");
+  const tok = (JSON.parse(readFileSync(join(dir, ".uniqlaw", "gateway.json"), "utf8")) as { tokens: Record<string, string> }).tokens["tg:100"]!;
+  const ask = async (body: Record<string, unknown>) => {
+    const r = await (await fetch(`${base}/api/restart`, { method: "POST", body: JSON.stringify({ in: "10m", ...body }) })).json() as { requestedBy: string[] };
+    await fetch(`${base}/api/restart`, { method: "POST", body: JSON.stringify({ cancel: true }) });
+    return r.requestedBy;
+  };
+  expect(await ask({ from: "tg:100" })).toEqual(["api"]);                         // a claim alone: ignored
+  expect(await ask({ from: "tg:100", fromToken: "nope" })).toEqual(["api"]);
+  expect(await ask({ fromLabel: "tg:100" })).toEqual(["api"]);
+  expect(await ask({ from: "tg:100", fromToken: tok })).toEqual(["tg:100"]);       // proven
+  expect(await ask({ from: "cli" })).toEqual(["cli"]);                             // not a session: a plain label
+});

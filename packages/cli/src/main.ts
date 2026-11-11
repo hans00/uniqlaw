@@ -141,8 +141,12 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
       }
       if (cmd === "reload" && (flags.in || flags.at)) throw new Error("--in / --at are for restart; reload runs right away");
       const from = typeof flags.from === "string" ? flags.from : process.env.UNIQLAW_SESSION || "cli";
+      // Proof that we speak for that session (the daemon only trusts a session name with it or web.token): its
+      // gateway token, readable only by the daemon's user.
+      let fromToken: string | undefined;
+      try { fromToken = (JSON.parse(readFileSync(join(stateDirOf(projectDir), "gateway.json"), "utf8")) as { tokens?: Record<string, string> }).tokens?.[from]; } catch {}
       const r = await api(projectDir, `/api/${cmd}`, {
-        ...(flags.cancel ? { cancel: true } : {}), from,
+        ...(flags.cancel ? { cancel: true } : {}), from, ...(fromToken ? { fromToken } : {}),
         ...(typeof flags.reason === "string" ? { reason: flags.reason } : {}), ...(flags.now ? { now: true } : {}),
         ...(typeof flags.in === "string" ? { in: flags.in } : {}), ...(typeof flags.at === "string" ? { at: flags.at } : {}),
       });
