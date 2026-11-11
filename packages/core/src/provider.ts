@@ -5,6 +5,9 @@ import type { PermissionPolicy } from "./permissions.ts";
 import type { ToolPolicy } from "./channel-policy.ts";
 
 export interface ProviderCapabilities {
+  /** false: the provider emits no tool_start / tool_end events, so the approval judge's action trace is unavailable
+   *  (default: available). */
+  toolTrace?: boolean;
   /** Output granularity. */
   streaming: "token" | "segment" | "final";
   interrupt: boolean;
@@ -119,6 +122,8 @@ export type AgentEvent =
   | { type: "text"; segmentId: string; delta?: string; final?: string }
   | { type: "thinking"; segmentId: string; text: string }
   | { type: "tool_start"; id: string; name: string; input: unknown }
+  /** summary: an excerpt of the tool's output (core shows it to the approval judge only for read-only diagnostic
+   *  commands). */
   | { type: "tool_end"; id: string; ok: boolean; summary?: string }
   /** A permission_request was settled without us (answered in the provider's own UI, the dialog went away, the
    *  request was aborted): core cancels its chat prompt. */

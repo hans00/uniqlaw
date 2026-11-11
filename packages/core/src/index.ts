@@ -21,3 +21,4 @@ export * from "./a2a-policy.ts";
 export * from "./restart.ts";
 export * from "./approval-judge.ts";
 export * from "./shell.ts";
+export * from "./targets.ts";

@@ -23,6 +23,8 @@ export interface ShellAnalysis extends ShellShape {
   commands: string[][];
   /** Text of `#` comments (outside quotes). */
   comments: string[];
+  /** File redirections and their targets (`> out.txt` overwrites, `>> log` appends, `< in` reads). */
+  redirects: { op: ">" | ">>" | "<"; target: string }[];
 }
 
 interface Word { value: string; dyn: boolean }
@@ -45,17 +47,19 @@ function readParen(src: string, i: number): [string, number] | undefined {
   return undefined;
 }
 
-function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[]; ok: boolean } {
+function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[]; redirects: ShellAnalysis["redirects"]; ok: boolean } {
   const toks: Tok[] = [];
   const comments: string[] = [];
   const subs: string[] = [];
+  const redirects: ShellAnalysis["redirects"] = [];
+  let redirOp: ">" | ">>" | "<" = ">";
   let ok = true;
   let cur: Word | undefined;
   const flush = () => { if (cur) toks.push({ t: "w", w: cur }); cur = undefined; };
   const word = () => (cur ??= { value: "", dyn: false });
   let skipNextWord = false; // a redirection's target is not a command word
   const pushWordOrSkip = () => {
-    if (skipNextWord && cur) { cur = undefined; skipNextWord = false; return; }
+    if (skipNextWord && cur) { redirects.push({ op: redirOp, target: cur.value }); cur = undefined; skipNextWord = false; return; }
     flush();
   };
   const sub = (body: string) => { subs.push(body); const w = word(); w.dyn = true; w.value += "$(…)"; };
@@ -107,6 +111,7 @@ function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[
     if (c === "<" || c === ">") {
       // Redirection: drop a pending fd number ("2>"), skip operator chars, the next word is its target.
       if (cur && /^\d+$/.test(cur.value) && !cur.dyn) cur = undefined; else pushWordOrSkip();
+      redirOp = c === "<" ? "<" : src[i + 1] === ">" ? ">>" : ">";
       while (src[i + 1] === ">" || src[i + 1] === "<" || src[i + 1] === "&" || src[i + 1] === "|") i++;
       if (/^\d$/.test(src[i + 1] ?? "") && src[i] === "&") { i++; continue; } // >&2
       skipNextWord = true;
@@ -122,7 +127,7 @@ function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[
     word().value += c;
   }
   pushWordOrSkip();
-  return { toks, comments, subs, ok };
+  return { toks, comments, subs, redirects, ok };
 }
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "mksh"]);
@@ -186,13 +191,14 @@ function unwrap(name: string, args: Word[]): { rest: Word[]; inner?: Word[] } | 
  * strings, `find -exec`) and return every simple command it would run, with its structure.
  */
 export function analyzeShell(src: string, depth = 0): ShellAnalysis {
-  const out: ShellAnalysis = { commands: [], comments: [], segments: 0, hasSubstitution: false, hasPipeToShell: false, wrappers: [], unresolvable: false };
+  const out: ShellAnalysis = { commands: [], comments: [], redirects: [], segments: 0, hasSubstitution: false, hasPipeToShell: false, wrappers: [], unresolvable: false };
   if (depth > 8) { out.unresolvable = true; return out; }
-  const { toks, comments, subs, ok } = tokenize(src);
+  const { toks, comments, subs, redirects, ok } = tokenize(src);
   out.comments.push(...comments);
+  out.redirects.push(...redirects);
   if (!ok) out.unresolvable = true;
   const merge = (a: ShellAnalysis) => {
-    out.commands.push(...a.commands); out.comments.push(...a.comments);
+    out.commands.push(...a.commands); out.comments.push(...a.comments); out.redirects.push(...a.redirects);
     out.hasSubstitution ||= a.hasSubstitution; out.hasPipeToShell ||= a.hasPipeToShell; out.unresolvable ||= a.unresolvable;
     out.wrappers.push(...a.wrappers);
   };

@@ -10,8 +10,10 @@ import type { RuntimeEvent, TranscriptKind, TranscriptStore } from "./transcript
 import { ModelRouter, agenticSchema } from "./model-router.ts";
 import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
 import { isA2ASession } from "./a2a-policy.ts";
+import { describeTargets, SessionLedger, type TargetReport } from "./targets.ts";
 import {
-  allowBlockers, buildJudgeInput, decideOutcome, hardPolicyDeny, inputFingerprint, inputHash, judgeNote, redactInput, runJudge, strictestKind,
+  allowBlockers, buildJudgeInput, decideOutcome, hardPolicyDeny, inputFingerprint, inputHash, judgeNote, redactInput, runJudge, strictestKind, writeScope,
+  type ObservedAction,
   type ApprovalAuditRecord, type ApprovalDecisionRecord, type ApprovalJudge, type JudgeResult, type SessionKind,
 } from "./approval-judge.ts";
 import {
@@ -114,6 +116,8 @@ interface TurnState {
   unsolicited: boolean;
   /** For task_status while the turn runs: recent activity (texts, tools) and the text being streamed now. */
   progress?: TurnProgress;
+  /** Tool actions observed this turn (for the approval judge's actionTrace), oldest first, bounded. */
+  trace?: ObservedAction[];
 }
 
 /** What task_status shows about a task its session is still working on. */
@@ -167,6 +171,8 @@ const rateLimitBackoffMs = () => Number(process.env.UNIQLAW_RATE_LIMIT_BACKOFF_M
 const INTERRUPT_SETTLE_MS = 8000;
 /** How long a hook-escalated verdict waits for the provider's dialog that follows it. */
 const HOOK_ESCALATED_TTL_MS = 60_000;
+/** Time budget for computing a request's targets (git and filesystem checks). */
+const TARGETS_BUDGET_MS = 3000;
 
 type JudgeStageResult = { id: string; outcome: ReturnType<typeof decideOutcome>["outcome"]; pSafe?: number; note?: string; audit: boolean };
 
@@ -204,6 +210,8 @@ export class ChannelRuntime {
   private hookEscalated: { at: number; tool: string; input: unknown; fingerprint?: string; judged: JudgeStageResult }[] = [];
   /** The provider's permission hook has reached this session (its dialogs follow a hook verdict). */
   private hookActive = false;
+  /** What this session created (files, dirs, branches, packages, processes, …), for the judge's target provenance. */
+  private ledger = new SessionLedger();
   private readonly log: Logger;
   private router?: ModelRouter;
   /** Model the session is on, as far as we know (profile → /model → router → provider "model" events). */
@@ -421,6 +429,7 @@ export class ChannelRuntime {
   /** /new: drop the provider session so the next message starts fresh. */
   async reset(): Promise<void> {
     await this.close();
+    this.ledger = new SessionLedger();
     this.host.store.patchSession(this.channelKey, { providerSessionId: null, adapterState: null });
   }
 
@@ -478,6 +487,25 @@ export class ChannelRuntime {
     return this.opening;
   }
 
+  /** Record a tool action for the approval judge (actionTrace) and the session ledger (what this session created). */
+  private observeTool(ev: Extract<AgentEvent, { type: "tool_start" | "tool_end" }>) {
+    try {
+      const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
+      if (ev.type === "tool_start") {
+        this.ledger.observe(ev.name, ev.input, cwd);
+        if (!this.turn) return;
+        const trace = (this.turn.trace ??= []);
+        trace.push({ id: ev.id, tool: ev.name, input: ev.input });
+        if (trace.length > 60) trace.splice(0, trace.length - 60);
+        return;
+      }
+      const e = this.turn?.trace?.find((x) => x.id === ev.id);
+      if (!e) return;
+      e.ok = ev.ok;
+      if (ev.summary) { e.output = ev.summary; this.ledger.observe(e.tool, e.input, cwd, ev.summary); }
+    } catch (e) { this.log.warn("tool observation failed", { e: String(e) }); }
+  }
+
   private async open(): Promise<void> {
     const row = this.host.store.getSession(this.channelKey);
     const now = Date.now();
@@ -490,6 +518,7 @@ export class ChannelRuntime {
         lastTarget: row?.lastTarget ?? null, adapterState: row && row.provider === this.profile.provider ? row.adapterState : null,
       });
     }
+    this.ledger = new SessionLedger();
     const cur = this.host.store.getSession(this.channelKey)!;
     const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const gw = this.host.gatewayFor(this.channelKey);
@@ -740,11 +769,13 @@ export class ChannelRuntime {
         if (this.host.settings.output.thinking && ev.text.trim()) await this.postVisible(`_${ev.text.trim()}_`);
         return;
       case "tool_start":
+        this.observeTool(ev);
         this.record("tool", formatToolStatus(ev.name, ev.input));
         this.noteProgress({ line: `tool: ${ev.name}` }); // name only: inputs may belong to another asker's work
         if (this.host.settings.output.toolStatus) await this.postToolStatus(formatToolStatus(ev.name, ev.input));
         return;
       case "tool_end":
+        this.observeTool(ev);
         return;
       case "permission_request":
         this.startPermission(ev);
@@ -1232,7 +1263,10 @@ export class ChannelRuntime {
     const structured = typeof ev.input !== "string";
     const hardDeny = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured, policy, toolPolicy, cwd });
     const human = this.trustedHumanText();
-    const { altered, ...input } = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind, ...(human ? { humanRequest: human } : {}) });
+    const trace = this.capabilities.toolTrace === false ? undefined : this.traceBefore(ev);
+    const targets = structured ? await this.targetsOf(ev, cwd) : undefined;
+    const { altered, ...input } = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind,
+      ...(human ? { humanRequest: human } : {}), ...(trace ? { trace } : {}), ...(targets ? { targets } : {}) });
     const blockers = allowBlockers({ tool: ev.tool, input: ev.input, structured, altered, policy });
     if (ev.options?.length && onceOption(ev.options) === undefined) blockers.push("no-once-option");
     let judge: ApprovalJudge | undefined;
@@ -1255,11 +1289,29 @@ export class ChannelRuntime {
         ...(outcome.action === "escalate" ? { reason: outcome.reason } : outcome.action === "deny" ? { reason: outcome.rule } : {}),
         ...(cfg.mode === "shadow" ? { wouldOutcome: would.action, ...(would.action === "escalate" ? { wouldReason: would.reason } : {}) } : {}),
         ...(blockers.length ? { blockers } : {}),
+        actionTrace: input.actionTrace, ...(input.targets ? { targets: input.targets } : {}), ...(input.unrecognized ? { unrecognized: input.unrecognized } : {}),
+        ...(input.agentRationale ? { agentRationale: input.agentRationale } : {}),
         ...(judged ? { latencyMs: judged.latencyMs } : {}), ...(judged && !judged.ok ? { error: judged.error } : {}),
       });
     }
     const note = judgeNote(name, judged, threshold);
     return { id, outcome, ...(pSafe !== undefined ? { pSafe } : {}), ...(note ? { note } : {}), audit: cfg.audit };
+  }
+
+  /** This turn's observed actions before this request (the request's own tool_start, if already seen, left out). */
+  private traceBefore(ev: { tool: string; input: unknown }): ObservedAction[] {
+    const all = this.turn?.trace ?? [];
+    const h = inputHash(ev.input);
+    const i = all.findLastIndex((e) => e.ok === undefined && e.tool === ev.tool && inputHash(e.input) === h);
+    return i >= 0 ? [...all.slice(0, i), ...all.slice(i + 1)] : [...all];
+  }
+
+  /** Targets of the request with provenance; bounded in time (a slow filesystem or git must not hold the request). */
+  private async targetsOf(ev: { tool: string; input: unknown }, cwd: string): Promise<TargetReport | undefined> {
+    const work = describeTargets(ev.tool, ev.input, { cwd, scope: writeScope(this.profile.permissions, cwd), ledger: this.ledger });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<undefined>((res) => { timer = setTimeout(() => res(undefined), TARGETS_BUDGET_MS); });
+    try { return await Promise.race([work, late]); } catch (e) { this.log.warn("target provenance failed", { e: String(e) }); return undefined; } finally { clearTimeout(timer); }
   }
 
   private audit(rec: ApprovalAuditRecord | ApprovalDecisionRecord) {
