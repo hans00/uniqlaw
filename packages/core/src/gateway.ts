@@ -141,11 +141,12 @@ export class McpGateway {
         return mgr.sendFile(caller, a);
       }));
 
-    s.registerTool("task_status", { description: "Status/result of an agent_ask or agent_trigger task.", inputSchema: { taskId: z.string() } },
+    s.registerTool("task_status", { description: "Status/result of an agent_ask or agent_trigger task, with elapsed time. While it is "
+      + "still working: whether it runs or waits in the session's queue, the latest assistant text and its recent activity.", inputSchema: { taskId: z.string() } },
       wrap(async ({ taskId }) => {
         const t = mgr.taskStatus(taskId);
         if (!t || (t.fromSession !== caller && t.toSession !== caller)) throw new Error("unknown task");
-        return { state: t.state, result: t.result };
+        return mgr.taskReport(taskId)!;
       }));
 
     s.registerTool("worker_start", {

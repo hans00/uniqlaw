@@ -22,6 +22,7 @@ First public version.
 - Admin-level tool groups (`bash`, `files.write`, `cron`, `worker`, `xsession`) are documented as full access and warned about at startup when a restricted chat gets one; restricted chats can't read `.uniqlaw/` with Claude's file tools.
 - Group wake rules: `groups.allowFrom` (platform user ids allowed to wake the agent, checked in core on the immutable id) and `groups.others` (`context` / `ignore` for messages that don't wake it).
 - Delegation hops: an async `agent_ask` / `worker_start` result re-enters the asking session at its own hop, and a human message starts a new chain at hop 0, so a chat can do more than two rounds with its worker. Result-driven rounds are capped by `bus.maxRounds` (default 20, reset by a human message); nested ask loops still stop at `bus.maxHops`. Fan-out is capped by `bus.maxPending` (outstanding async tasks per session, default 8) and `bus.maxChainTasks` (delegation calls per human-started chain, default 50).
+- `task_status` reports `elapsedSec` and, while the task is open, `progress`: whether the answering session is running it or has it queued, the latest assistant text (also mid-stream) and its last activity lines.
 - Agent-guided migration from ClaudeClaw v2 (`docs/MIGRATE.md`), including importing Claude auto-memory.
 
 ### Fixes
