@@ -235,6 +235,7 @@ export class ChannelRuntime {
       this.steerLog.push({ origin: input.origin, at: Date.now() });
       try {
         await this.session.steer({ text: prompt, attachments: input.attachments });
+        this.release([input]); // a replayed input is consumed now: its deferred row goes
         return;
       } catch (e) {
         this.log.warn("steer failed; queueing", { e: String(e) });

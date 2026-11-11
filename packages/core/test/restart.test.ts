@@ -17,6 +17,7 @@ afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); 
 const until = async (cond: () => boolean, ms = 3000) => { const end = Date.now() + ms; while (!cond()) { if (Date.now() > end) throw new Error("timeout"); await Bun.sleep(5); } };
 
 const settings = parseSettings({ profiles: { main: { provider: "fake" } }, queue: { debounceMs: 0 }, backgroundNotify: { mode: "off" } });
+const steerSettings = parseSettings({ profiles: { main: { provider: "fake" } }, queue: { debounceMs: 0, mode: "steer" }, backgroundNotify: { mode: "off" } });
 const prof: Profile = { name: "main", provider: "fake", permissions: settings.profiles.main!.permissions, options: {} };
 
 /** Sessions whose turns run until the test ends them (finish), optionally surviving detach (like claude-tmux). */
@@ -44,13 +45,13 @@ class GatedProvider extends FakeProvider {
   s(key: string) { return this.sessions.get(key) as GatedSession; }
 }
 
-function generation(provider: FakeProvider, platform: FakePlatform, execute: () => void | boolean | Promise<void | boolean> = () => {}) {
+function generation(provider: FakeProvider, platform: FakePlatform, execute: () => void | boolean | Promise<void | boolean> = () => {}, cfg = settings) {
   const m = new ChannelManager({
-    log: silentLogger, settings, store, projectDir: dir, instanceId: "test",
+    log: silentLogger, settings: cfg, store, projectDir: dir, instanceId: "test",
     providers: new Map([["fake", provider]]), platforms: new Map([["tg", platform]]), profiles: new Map([["main", prof]]),
     gatewayFor: () => undefined, providerEnv: async () => ({}), systemPrompt: async () => ({ fragments: [] }),
   });
-  const c = new RestartCoordinator({ manager: m, store, log: silentLogger, settings, execute, pollMs: 5 });
+  const c = new RestartCoordinator({ manager: m, store, log: silentLogger, settings: cfg, execute, pollMs: 5 });
   return { m, c };
 }
 /** Daemon start order: prepare (before restore) → restore → resume (after platforms). */
@@ -459,5 +460,20 @@ test("daemon_restart tool: only in an operator's own chat, in a turn the operato
   expect(await tool.handler({ reason: "r", in: "10m" }, "tg:1")).toMatchObject({ pending: true, phase: "scheduled", kind: "restart", requestedBy: ["tg:1"] });
   expect(await tool.handler({ cancel: true }, "tg:1")).toEqual({ canceled: true, replayed: 0 });
   g.c.stop();
+  await g.m.stop();
+});
+
+test("a replayed input steered into a running turn is released (not replayed again on the next start)", async () => {
+  const platform = new FakePlatform();
+  const p = new GatedProvider();
+  const g = generation(p, platform, () => {}, steerSettings);
+  await g.m.handleInbound(msg("3", "working on it"));
+  await until(() => p.s("tg:3")?.sent.length === 1);
+  store.pushDeferred("tg:3", { origin: { kind: "human", platform: "tg", channelKey: "tg:3", sender: { id: "3", name: "u" },
+    replyTarget: { platform: "tg", chatId: "3" }, ref: { platform: "tg", chatId: "3", messageId: "9" }, trusted: true },
+    item: { text: "held during a canceled restart", receivedAt: Date.now(), sourceLine: "[x]" }, attachments: [] });
+  expect(await g.m.replayDeferred()).toBe(1);
+  expect(p.s("tg:3").steered).toHaveLength(1);
+  expect(store.listDeferred()).toEqual([]);
   await g.m.stop();
 });
