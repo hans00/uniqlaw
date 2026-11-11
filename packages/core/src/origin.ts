@@ -10,6 +10,12 @@ export type Origin =
        *  result: an async ask result arriving back at the asker (routed like background output). */
       mode: "ask" | "trigger" | "result"; taskId: string;
       deliverTo?: Target;
+      /** result: how many async results in a row have driven this session without a human message
+       *  (bounds ask → result → ask rounds, which don't deepen the hop). */
+      rounds?: number;
+      /** Delegation chain this input belongs to (budget key, see bus.maxChainTasks): started by a human message,
+       *  else by the turn that first asked. */
+      chain?: string;
       /** Human target at the root of the delegation chain (for permission prompts). */
       rootTarget?: Target }
   | { kind: "scheduler"; job: string; deliverTo?: Target;

@@ -463,6 +463,45 @@ export class ChannelManager {
     return hop;
   }
 
+  /** Rounds of the result an ask from `from` would bring back (see Origin.rounds). */
+  private checkRounds(from: string): number {
+    const rounds = (this.runtimes.get(from)?.currentRounds() ?? 0) + 1;
+    const max = this.deps.settings.bus.maxRounds;
+    if (rounds > max) throw new Error(`too many agent_ask rounds without a human message (${rounds} > ${max}); report back instead`);
+    return rounds;
+  }
+
+  /** Outstanding async tasks per asking session (bus.maxPending) and calls per delegation chain (bus.maxChainTasks). */
+  private pendingAsync = new Map<string, number>();
+  private chainUse = new Map<string, number>();
+
+  /** Fan-out limits for a delegation call from `from`; throws before anything is sent. The caller must run
+   *  `commit()` once it goes ahead, and (async calls) `release()` exactly once when the task's result is in. */
+  private admitFanOut(from: string, async: boolean) {
+    const { maxPending, maxChainTasks } = this.deps.settings.bus;
+    const chain = this.runtimes.get(from)?.currentChain() ?? `caller:${from}:${crypto.randomUUID()}`;
+    const used = this.chainUse.get(chain) ?? 0;
+    if (used + 1 > maxChainTasks) throw new Error(`delegation budget used up: this chain already made ${used} agent_ask/agent_trigger/worker_start calls (max ${maxChainTasks}); answer directly instead`);
+    const pending = this.pendingAsync.get(from) ?? 0;
+    if (async && pending + 1 > maxPending) throw new Error(`too many outstanding async tasks (${pending}, max ${maxPending}); wait for their results (task_status) before starting more`);
+    let released = !async;
+    return {
+      chain,
+      commit: () => {
+        this.chainUse.delete(chain); // re-insert: Map order = least recently used first
+        this.chainUse.set(chain, used + 1);
+        if (this.chainUse.size > 2000) this.chainUse.delete(this.chainUse.keys().next().value!);
+        if (async) this.pendingAsync.set(from, (this.pendingAsync.get(from) ?? 0) + 1);
+      },
+      release: () => {
+        if (released) return;
+        released = true;
+        const n = (this.pendingAsync.get(from) ?? 1) - 1;
+        if (n > 0) this.pendingAsync.set(from, n); else this.pendingAsync.delete(from);
+      },
+    };
+  }
+
   private resolveAgent(to: string): string {
     // Existing sessions: chats, internal sessions (heartbeat, cron:<job>, …), A2A contexts, workers.
     if (this.runtimes.has(to) || this.deps.store.getSession(to) || this.workerMeta(to)) return to;
@@ -486,15 +525,21 @@ export class ChannelManager {
     if (target === from) throw new Error("cannot ask yourself");
     this.checkNotHeld(target);
     const hop = this.checkHop(from);
+    const rounds = wait ? 0 : this.checkRounds(from);
+    const fan = this.admitFanOut(from, !wait);
+    const { chain } = fan;
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: target, mode: "ask", request: message });
+    fan.commit();
     const done = wait ? this.waitTask(taskId) : undefined;
-    if (!wait) this.waiters.set(taskId, { resolve: (r) => this.deliverAsyncResult(from, target, taskId, hop, r) });
-    await this.runtime(target).enqueue({
-      origin: { kind: "peer", fromSession: from, hop, mode: "ask", taskId, rootTarget: this.runtimes.get(from)?.rootTarget() },
-      item: { text: message, receivedAt: Date.now(), sourceLine: `[Agent message from session ${from} — reply here; your reply is returned to that agent, no human sees it]`, raw: true },
-      attachments: [],
-    });
+    if (!wait) this.waiters.set(taskId, { resolve: (r) => { fan.release(); this.deliverAsyncResult(from, target, taskId, { hop: hop - 1, rounds, chain }, r); } });
+    try {
+      await this.runtime(target).enqueue({
+        origin: { kind: "peer", fromSession: from, hop, mode: "ask", taskId, chain, rootTarget: this.runtimes.get(from)?.rootTarget() },
+        item: { text: message, receivedAt: Date.now(), sourceLine: `[Agent message from session ${from} — reply here; your reply is returned to that agent, no human sees it]`, raw: true },
+        attachments: [],
+      });
+    } catch (e) { fan.release(); throw e; }
     this.deps.store.updateTask(taskId, "working");
     if (!done) return { taskId };
     const timeout = this.deps.settings.bus.askTimeoutSec * 1000;
@@ -504,13 +549,17 @@ export class ChannelManager {
 
   private async askRemote(from: string, remote: RemoteAgent, message: string, wait: boolean) {
     const hop = this.checkHop(from);
+    const rounds = wait ? 0 : this.checkRounds(from);
+    const fan = this.admitFanOut(from, !wait);
+    const { chain } = fan;
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: remote.name, mode: "ask", request: message });
+    fan.commit();
     this.deps.store.updateTask(taskId, "working");
     const run = remote.ask({ from, message, hop }).catch((e) => ({ ok: false, text: e instanceof Error ? e.message : String(e) }))
       .then((r) => { this.deps.store.updateTask(taskId, r.ok ? "completed" : "failed", r.text); return r; });
     if (wait) return { taskId, result: await run };
-    void run.then((r) => this.deliverAsyncResult(from, remote.name, taskId, hop, r));
+    void run.then((r) => { fan.release(); this.deliverAsyncResult(from, remote.name, taskId, { hop: hop - 1, rounds, chain }, r); });
     return { taskId };
   }
 
@@ -537,20 +586,26 @@ export class ChannelManager {
     const target = this.resolveAgent(to);
     this.checkNotHeld(target);
     const hop = this.checkHop(from);
+    const fan = this.admitFanOut(from, true);
+    const { chain } = fan;
     const rt = this.runtime(target);
     const deliverTo = replyTo ?? rt.lastTarget() ?? this.targetForChannel(target);
     if (!deliverTo) throw new Error(`"${target}" has no chat to answer on; pass replyTo`);
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: target, mode: "trigger", request: prompt });
+    fan.commit();
     this.waiters.set(taskId, { resolve: (r) => {
+      fan.release();
       // Only sessions get the echo; CLI/API callers ("cli", "api", …) are not sessions.
       if (this.deps.store.getSession(from)) this.deps.store.pushPending(from, "peer-result", { label: `trigger response from ${target}`, text: r.text });
     } });
-    await rt.enqueue({
-      origin: { kind: "peer", fromSession: from, hop, mode: "trigger", taskId, deliverTo },
-      item: { text: prompt, receivedAt: Date.now(), sourceLine: `[Triggered by session ${from} — your reply goes to this channel's chat]`, raw: true },
-      attachments: [],
-    });
+    try {
+      await rt.enqueue({
+        origin: { kind: "peer", fromSession: from, hop, mode: "trigger", taskId, chain, deliverTo },
+        item: { text: prompt, receivedAt: Date.now(), sourceLine: `[Triggered by session ${from} — your reply goes to this channel's chat]`, raw: true },
+        attachments: [],
+      });
+    } catch (e) { fan.release(); throw e; }
     return { taskId };
   }
 
@@ -877,7 +932,9 @@ export class ChannelManager {
     w?.resolve({ ok, text: text || "(empty reply)" });
   }
 
-  private deliverAsyncResult(asker: string, answerer: string, taskId: string, hop: number, r: { ok: boolean; text: string }) {
+  /** `at.hop` is the asker's own hop when it asked (not the callee's): a result is the answer to the asker's chain,
+   *  not a step deeper, so a chat can keep working with its worker. `at.rounds` bounds result → ask → result … */
+  private deliverAsyncResult(asker: string, answerer: string, taskId: string, at: { hop: number; rounds: number; chain: string }, r: { ok: boolean; text: string }) {
     // CLI / API callers ("cli", "api") are not sessions: the result stays in the task (task_status).
     if (!this.runtimes.has(asker) && !this.deps.store.getSession(asker)) return;
     if (this.workerMeta(asker) && this.heldBy(asker)) {
@@ -885,9 +942,8 @@ export class ChannelManager {
       this.deps.store.pushPending(asker, "peer-result", { label: `result of your agent_ask ${taskId} to ${answerer}${r.ok ? "" : " (failed)"}`, text: r.text });
       return;
     }
-    // The result turn keeps the ask's hop, so ask → result → ask ping-pong still hits maxHops.
     void this.runtime(asker).enqueue({
-      origin: { kind: "peer", fromSession: answerer, hop, mode: "result", taskId },
+      origin: { kind: "peer", fromSession: answerer, hop: at.hop, rounds: at.rounds, chain: at.chain, mode: "result", taskId },
       item: { text: r.text, receivedAt: Date.now(), sourceLine: `[Result of your agent_ask ${taskId} to ${answerer}${r.ok ? "" : " (failed)"}]`, raw: true },
       attachments: [],
     }).catch((e) => this.deps.log.error("async result delivery failed", { e: String(e) }));

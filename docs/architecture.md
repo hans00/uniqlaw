@@ -359,7 +359,21 @@ Providers that can only configure MCP through a file and do not expand environme
 `uniqlaw mcp-shim`, and the shim takes its identity from the inherited environment variable `UNIQLAW_TOKEN` and forwards to the Gateway.
 The contract tests must include "two sessions with MCP attached at the same time, each able to see and call only with its own token".
 
-**Loop prevention:** a `hop` limit (default 4), plus rate limiting of back-and-forth between the same pair of sessions over a short period.
+**Loop prevention:** a `hop` limit (`bus.maxHops`, default 4), plus rate limiting of back-and-forth between the same pair of sessions over a short period.
+- A turn's hop is the highest hop among its peer / A2A origins; a human message in the turn makes it 0 (a new chain).
+- An async `agent_ask` result (wait=false, or `worker_start` with a task) re-enters the asker at the asker's *own* hop
+  from when it asked, not the callee's: the answer closes that step instead of deepening the chain, so a chat can work
+  with its worker for many rounds. Nested asks (A asks B asks A …) still deepen the hop and stop at `maxHops`.
+- Result → ask → result rounds are bounded separately: each result carries `rounds` (results in a row since the last
+  human message), and an async ask that would bring back more than `bus.maxRounds` (default 20) is refused.
+- Fan-out is bounded too, since rounds and hops only bound depth (a turn that fires two asks on every result would
+  otherwise reach 2^maxRounds turns):
+  - `bus.maxPending` (default 8): async `agent_ask` / `agent_trigger` / `worker_start` tasks one session may have
+    outstanding; the next one is refused until a result comes back. Waiting asks don't count.
+  - `bus.maxChainTasks` (default 50): every delegation call (waiting or not) is charged to a chain, across all the
+    sessions it reaches. A human message starts a chain; peer inputs and results carry it; a turn with neither (cron,
+    heartbeat, A2A) starts its own. Once used up, further calls in that chain are refused.
+  - The counters live in memory: a daemon restart resets them.
 The system prompt of an `origin=peer` turn injects "reply once and stop".
 
 ### 8.4 Output routing (decided by core based on origin)

@@ -154,11 +154,30 @@ export class ChannelRuntime {
   get queueLength() { return this.queue.length; }
   get currentOrigins(): Origin[] { return this.turn?.origins ?? []; }
 
-  /** Max peer hop in the current turn (for delegation hop counting). */
+  /** Max peer hop in the current turn (for delegation hop counting). A human message in the turn starts a new
+   *  chain at hop 0: only a person can add one, so it can't feed an agent loop. */
   currentHop(): number {
+    if (this.currentOrigins.some((o) => o.kind === "human")) return 0;
     let h = 0;
     for (const o of this.currentOrigins) if (o.kind === "peer" || o.kind === "a2a") h = Math.max(h, o.hop);
     return h;
+  }
+
+  /** Delegation chain the current turn works for (bus.maxChainTasks budget): the latest human message in the turn
+   *  starts its own; otherwise the chain a peer input carried; otherwise one for this turn. */
+  currentChain(): string {
+    const os = this.currentOrigins;
+    for (const o of [...os].reverse()) if (o.kind === "human") return `human:${this.channelKey}:${o.ref.messageId}:${o.ref.chatId}`;
+    for (const o of os) if (o.kind === "peer" && o.chain) return o.chain;
+    return `turn:${this.channelKey}:${this.turn?.startedAt ?? Date.now()}`;
+  }
+
+  /** Async results in a row that drove this session since the last human message (0 with a human in the turn). */
+  currentRounds(): number {
+    if (this.currentOrigins.some((o) => o.kind === "human")) return 0;
+    let r = 0;
+    for (const o of this.currentOrigins) if (o.kind === "peer" && o.mode === "result") r = Math.max(r, o.rounds ?? 0);
+    return r;
   }
 
   /** Human target at the root of whatever the current turn is serving. */
