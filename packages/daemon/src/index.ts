@@ -253,12 +253,14 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
       ...(Object.keys(transportPorts).length ? { transportPorts } : {}), version: VERSION });
     log.info("ready", { webPort, gatewayPort, platforms: [...platforms.keys()], providers: [...providers.keys()], schedulers: [...schedulers.keys()] });
 
+    let stopped: Promise<void> | undefined;
     return {
       manager, restart, webPort, gatewayPort,
-      stop: async () => {
+      // Idempotent and single-flight: a second call (SIGTERM during a restart) waits for the first.
+      stop: () => (stopped ??= (async () => {
         log.info("stopping");
         for (const c of cleanups.reverse()) await Promise.resolve(c()).catch((e) => log.warn("cleanup failed", { e: String(e) }));
-      },
+      })()),
     };
   } catch (e) {
     log.error("startup failed", { e: e instanceof Error ? e.message : String(e) });

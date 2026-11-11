@@ -84,6 +84,8 @@ const PENDING_KEY = "restart-pending";
 /** Delay between accepting a request due now and starting the drain (lets the request's own reply go out). */
 const START_DELAY_MS = 50;
 export const RECORD_KEY = "restart-record";
+/** kv: why the last restart could not start the new process and the old code was started again instead. */
+export const RESTART_FALLBACK_KEY = "restart-fallback";
 /** Job name of the notice turn (a scheduler origin, so its reply goes to the chat it names). */
 export const RESTART_NOTICE_JOB = "uniqlaw-restart";
 
@@ -332,12 +334,14 @@ export class RestartCoordinator {
     const { record, failedTasks } = this.carried!;
     this.carried = undefined;
     this.d.store.del(RECORD_KEY);
+    const fallback = this.d.store.get(RESTART_FALLBACK_KEY);
+    this.d.store.del(RESTART_FALLBACK_KEY);
     const m = this.d.manager;
     const replayed = await m.replayDeferred();
     m.reportFailedTasks(failedTasks);
     if (!record) return { replayed, notified: [] };
     const tz = this.d.settings.timezone;
-    const verb = record.kind === "reload" ? "reloaded" : record.kind === "stop" ? "was stopped and started again" : "restarted";
+    const verb = fallback ? `restart FAILED (${fallback}); the previous code was started again` : record.kind === "reload" ? "reloaded" : record.kind === "stop" ? "was stopped and started again" : "restarted";
     const why = record.reasons.length ? record.reasons.join("; ") : "none given";
     const interrupted = record.interrupted.length
       ? record.interrupted.map((i) => `${i.channelKey} (answering ${i.answering.join(", ") || "background"}${i.detachable ? "; its process survived, the turn may have finished on its own" : "; cut off"})`).join(", ")

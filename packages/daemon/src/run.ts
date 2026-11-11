@@ -1,29 +1,45 @@
-// Foreground runner. Graceful restart / reload (docs §11.4): a request (SIGHUP, POST /api/reload|restart,
+// Foreground runner. Graceful restart / reload (docs §11.3): a request (SIGHUP, POST /api/reload|restart,
 // `uniqlaw reload|restart`, the daemon_restart tool) drains first; then
 //  - reload: restart in-process with fresh settings (already-loaded code stays);
-//  - restart: a new process (new code too). The old one releases its lock and ports, starts the new one detached
-//    and exits; the new one waits for the old pid to be gone. UNIQLAW_RESTART_MODE=exit: just exit 75 and let a
-//    supervisor (systemd Restart=on-failure, …) start the new one.
+//  - restart: a new process (new code too). The old one stops (lock, ports, bot claims released), starts the
+//    same command detached and waits until it is up (runtime.json names it) before exiting. If it doesn't come
+//    up, the old process starts the daemon again in-process (old code) rather than leave nothing running.
+//    Under a supervisor (systemd service, or UNIQLAW_RESTART_MODE=exit) it exits 75 instead and lets the
+//    supervisor start the new process: systemd's KillMode=control-group would kill a detached child.
 // stop() detaches provider sessions (claude-tmux keeps tmux alive), so conversations survive both.
-import { mkdirSync, openSync } from "node:fs";
+import { mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { RestartKind } from "@uniqlaw/core";
+import { RESTART_FALLBACK_KEY, StateStore, type RestartKind } from "@uniqlaw/core";
 import { startDaemon, loadSettings, type Daemon } from "./index.ts";
-import { isAlive, stateDirOf } from "./instance.ts";
+import { isAlive, readRuntime, stateDirOf } from "./instance.ts";
 
-/** Exit code of a restart left to the supervisor (UNIQLAW_RESTART_MODE=exit). */
+/** Exit code of a restart left to the supervisor. */
 export const RESTART_EXIT_CODE = 75;
 
-export async function runForever(projectDir: string, opts: { logToStderr?: boolean } = {}): Promise<void> {
-  // Started by a restart: the old process may still be closing its ports.
-  const waitPid = Number(process.env.UNIQLAW_WAIT_PID);
-  delete process.env.UNIQLAW_WAIT_PID;
-  if (waitPid && waitPid !== process.pid) for (let i = 0; i < 150 && isAlive(waitPid); i++) await Bun.sleep(100);
+/**
+ * spawn: start the new process ourselves. exit: exit 75 for a supervisor. UNIQLAW_RESTART_MODE wins; otherwise
+ * a systemd service (INVOCATION_ID / NOTIFY_SOCKET set and our cgroup is a *.service unit) means exit. A process
+ * merely started from a systemd-managed terminal has its own scope, not a .service cgroup.
+ */
+export function restartMode(env: Record<string, string | undefined> = process.env, cgroup = readOwnCgroup()): "spawn" | "exit" {
+  const m = env.UNIQLAW_RESTART_MODE;
+  if (m === "exit" || m === "spawn") return m;
+  const unit = cgroup.trim().split("\n").map((l) => l.split(":").slice(2).join(":")).find(Boolean)?.split("/").filter(Boolean).at(-1) ?? "";
+  return (env.INVOCATION_ID || env.NOTIFY_SOCKET) && unit.endsWith(".service") ? "exit" : "spawn";
+}
 
+function readOwnCgroup(): string {
+  try { return readFileSync("/proc/self/cgroup", "utf8"); } catch { return ""; }
+}
+
+export async function runForever(projectDir: string, opts: { logToStderr?: boolean } = {}): Promise<void> {
   let daemon!: Daemon;
   let reloading: Promise<boolean> | undefined;
+  /** Single-flight stop of the current daemon (a SIGTERM during a restart must not stop it twice). */
+  let stopping: Promise<void> | undefined;
+  const stopOnce = () => (stopping ??= daemon.stop());
   const onRestart = (kind: RestartKind) => (kind === "reload" ? reload() : restart());
-  const start = () => startDaemon(projectDir, { ...opts, onRestart });
+  const start = async () => { const d = await startDaemon(projectDir, { ...opts, onRestart }); daemon = d; stopping = undefined; return d; };
 
   /** false = rejected, nothing was stopped (the coordinator ends the drain). */
   const reload = () => {
@@ -34,9 +50,9 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
         console.error(`[uniqlaw] reload rejected, keeping the running config: ${e instanceof Error ? e.message : e}`);
         return false;
       }
-      await daemon.stop();
+      await stopOnce();
       try {
-        daemon = await start();
+        await start();
         console.error("[uniqlaw] reloaded");
         return true;
       } catch (e) {
@@ -48,26 +64,46 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
   };
 
   const restart = async () => {
-    await daemon.stop();
-    if (process.env.UNIQLAW_RESTART_MODE === "exit") { console.error("[uniqlaw] restarting (exit for the supervisor)"); process.exit(RESTART_EXIT_CODE); }
+    const mode = restartMode();
+    await stopOnce();
+    if (mode === "exit") { console.error("[uniqlaw] restarting: exiting for the supervisor"); process.exit(RESTART_EXIT_CODE); }
     const logDir = join(stateDirOf(projectDir), "logs");
     mkdirSync(logDir, { recursive: true });
+    let why: string;
     try {
       const out = openSync(join(logDir, "stdout.log"), "a");
-      const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], {
-        stdio: ["ignore", out, out], env: { ...process.env, UNIQLAW_WAIT_PID: String(process.pid) }, detached: true,
-      });
+      const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], { stdio: ["ignore", out, out], env: process.env, detached: true });
       child.unref();
-      console.error(`[uniqlaw] restarting as pid ${child.pid}`);
-      process.exit(0);
+      const readyMs = Number(process.env.UNIQLAW_RESTART_READY_MS ?? 60_000);
+      const until = Date.now() + readyMs;
+      while (Date.now() < until && child.exitCode === null && readRuntime(projectDir)?.pid !== child.pid) await Bun.sleep(200);
+      if (readRuntime(projectDir)?.pid === child.pid && isAlive(child.pid)) {
+        console.error(`[uniqlaw] restarted as pid ${child.pid}`);
+        process.exit(0);
+      }
+      why = child.exitCode !== null ? `the new process exited with code ${child.exitCode}` : `the new process was not up after ${readyMs / 1000}s`;
+      if (child.exitCode === null) {
+        child.kill("SIGTERM");
+        for (let i = 0; i < 30 && isAlive(child.pid); i++) await Bun.sleep(100);
+        if (isAlive(child.pid)) child.kill("SIGKILL");
+      }
     } catch (e) {
-      // Already stopped: the restart record is in state.db, so a manual `uniqlaw start` still sends the notices.
-      console.error(`[uniqlaw] restart could not start the new process: ${e instanceof Error ? e.message : e}; exiting`);
+      why = `could not start the new process: ${e instanceof Error ? e.message : e}`;
+    }
+    console.error(`[uniqlaw] RESTART FAILED: ${why} (see ${join(logDir, "stdout.log")}). Starting the current code again in this process.`);
+    try {
+      const st = new StateStore(join(stateDirOf(projectDir), "state.db"));
+      try { st.set(RESTART_FALLBACK_KEY, why); } finally { st.close(); }
+      await start();
+      console.error("[uniqlaw] running again on the previous code");
+      return true;
+    } catch (e) {
+      console.error(`[uniqlaw] could not start again either: ${e instanceof Error ? e.message : e}; exiting`);
       process.exit(1);
     }
   };
 
-  daemon = await start();
+  await start();
 
   process.on("SIGHUP", () => {
     try { daemon.restart.request({ kind: "reload", requestedBy: "SIGHUP" }); }
@@ -75,8 +111,8 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
   });
   const shutdown = async (signal: string) => {
     await reloading;
-    daemon.restart.recordStop(signal); // the next start tells sessions whose turn this cut off
-    await daemon.stop();
+    if (!stopping) daemon.restart.recordStop(signal); // the next start tells sessions whose turn this cut off
+    await stopOnce();
     process.exit(0);
   };
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
