@@ -312,6 +312,14 @@ export class SlackAdapter implements PlatformAdapter {
         resolve(null);
       }, req.timeoutMs) : undefined;
       this.pending.set(token, { ...pend, resolve, timer });
+      // Settled elsewhere (provider UI, turn ended): drop the buttons and say so.
+      const cancel = async () => {
+        if (!this.pending.delete(token)) return;
+        clearTimeout(timer);
+        await this.finishChoice({ ...pend, resolve, timer }, "↩️ Cancelled — resolved elsewhere").catch(() => {});
+        resolve(null);
+      };
+      if (req.signal?.aborted) void cancel(); else req.signal?.addEventListener("abort", () => void cancel(), { once: true });
     });
   }
 

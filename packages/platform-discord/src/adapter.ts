@@ -430,6 +430,14 @@ export class DiscordAdapter implements PlatformAdapter {
         resolve(null);
       }, req.timeoutMs) : undefined;
       this.pending.set(token, { channelId, messageId, req: { ...req, approverIds }, content, resolve, timer });
+      // Settled elsewhere (provider UI, turn ended): drop the buttons and say so.
+      const cancel = async () => {
+        if (!this.pending.delete(token)) return;
+        clearTimeout(timer);
+        await this.rest("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: clip(`↩️ Cancelled — resolved elsewhere\n\n${content}`), components: [] }).catch(() => {});
+        resolve(null);
+      };
+      if (req.signal?.aborted) void cancel(); else req.signal?.addEventListener("abort", () => void cancel(), { once: true });
     });
   }
 

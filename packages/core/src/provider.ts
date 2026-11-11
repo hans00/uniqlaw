@@ -120,6 +120,9 @@ export type AgentEvent =
   | { type: "thinking"; segmentId: string; text: string }
   | { type: "tool_start"; id: string; name: string; input: unknown }
   | { type: "tool_end"; id: string; ok: boolean; summary?: string }
+  /** A permission_request was settled without us (answered in the provider's own UI, the dialog went away, the
+   *  request was aborted): core cancels its chat prompt. */
+  | { type: "permission_withdrawn"; id: string }
   | { type: "permission_request"; id: string; tool: string; input: unknown; title: string;
       kind?: "permission" | "model-switch" | "question"; options?: string[] }
   | { type: "input_request"; id: string; title: string; schema?: unknown; url?: string;

@@ -566,6 +566,8 @@ export class ClaudeTmuxSession implements AgentSession {
     const d = parsePermissionDialog(pane);
     if (!d) {
       if (this.activeDialog && ++this.dialogMiss >= this.t.dialogGonePolls) {
+        // Gone without our answer (answered in the terminal, or the request went away): core cancels its prompt.
+        this.emit({ type: "permission_withdrawn", id: this.activeDialog.id });
         this.activeDialog = null;
         await this.flushSteers();
       }
@@ -589,6 +591,8 @@ export class ClaudeTmuxSession implements AgentSession {
       return;
     }
     if (this.activeDialog?.id === d.fingerprint) return;
+    // A different dialog replaced the one still waiting for us: that one was settled elsewhere.
+    if (this.activeDialog) this.emit({ type: "permission_withdrawn", id: this.activeDialog.id });
     if (this.state !== "running") { this.state = "running"; this.beginTurn(true); }
     this.activeDialog = { id: d.fingerprint, dialog: d };
     this.clearTimer("slashTimer");

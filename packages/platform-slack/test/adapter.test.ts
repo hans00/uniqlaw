@@ -134,6 +134,15 @@ describe("askChoice", () => {
     expect(fake.callsOf("chat.update").at(-1)!.body.text).toContain("Timed out");
   });
 
+  test("signal abort (settled elsewhere): resolves null and marks the message cancelled", async () => {
+    const ac = new AbortController();
+    const p = adapter.askChoice({ platform: "slack", chatId: "C1" }, { title: "Q", options: ["a"], approverIds: [], timeoutMs: 0, signal: ac.signal });
+    await Bun.sleep(50);
+    ac.abort();
+    expect(await p).toBeNull();
+    await waitFor(() => fake.callsOf("chat.update").some((c) => /Cancelled/.test(String(c.body?.text))));
+  });
+
   test("timeoutMs 0 (approval.timeoutSec 0) never times out", async () => {
     let settled = false;
     const p = adapter.askChoice({ platform: "slack", chatId: "C1" }, { title: "Q", options: ["a"], approverIds: [FRIEND], timeoutMs: 0 });

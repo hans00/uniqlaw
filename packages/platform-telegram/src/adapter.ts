@@ -197,6 +197,14 @@ export class TelegramAdapter implements PlatformAdapter {
       // Empty approverIds = this platform's configured operators (core doesn't know platform user ids).
       const approverIds = req.approverIds.length ? req.approverIds : this.opts.operatorUserIds;
       this.pending.set(token, { chatId: target.chatId, messageId, req: { ...req, approverIds }, html: text, resolve, timer });
+      // Settled elsewhere (provider UI, turn ended): drop the buttons and say so.
+      const cancel = async () => {
+        if (!this.pending.delete(token)) return;
+        clearTimeout(timer);
+        await this.finishChoice(target.chatId, messageId, text, "↩️ Cancelled — resolved elsewhere").catch(() => {});
+        resolve(null);
+      };
+      if (req.signal?.aborted) void cancel(); else req.signal?.addEventListener("abort", () => void cancel(), { once: true });
     });
   }
 

@@ -287,6 +287,14 @@ export class LineAdapter implements PlatformAdapter {
         resolve(null);
       }, req.timeoutMs) : undefined;
       this.pending.set(token, { to: target.chatId, req: { ...req, approverIds }, resolve, timer });
+      // Settled elsewhere (provider UI, turn ended): LINE can't edit, so say so in a new message.
+      const cancel = async () => {
+        if (!this.pending.delete(token)) return;
+        clearTimeout(timer);
+        await this.pushMessages(target.chatId, [{ type: "text", text: `↩️ Cancelled — resolved elsewhere: ${clip(req.title, 200)}` }]).catch(() => {});
+        resolve(null);
+      };
+      if (req.signal?.aborted) void cancel(); else req.signal?.addEventListener("abort", () => void cancel(), { once: true });
     });
   }
 

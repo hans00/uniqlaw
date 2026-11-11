@@ -70,6 +70,8 @@ export interface ChoiceRequest {
   approverIds: string[];
   /** Resolve null after this long without an answer; 0 = no deadline (wait until answered). */
   timeoutMs: number;
+  /** Aborted: the question was settled elsewhere. The adapter resolves null, marks the message cancelled and drops it. */
+  signal?: AbortSignal;
 }
 
 export interface PlatformCapabilities {

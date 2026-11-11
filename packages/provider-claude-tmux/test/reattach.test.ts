@@ -132,3 +132,28 @@ test("claude exited while the daemon was down: the --resume respawn still emits 
   expect(events.map((e) => e.type).filter((t) => t === "unsolicited_turn" || t === "text" || t === "turn_end")).toEqual(["unsolicited_turn", "text", "turn_end"]);
   expect(events.find((e) => e.type === "text")).toMatchObject({ final: "finished, then claude exited" });
 }, 15_000);
+
+test("a dialog answered in the terminal (or replaced by another) is reported withdrawn, so core cancels its prompt", async () => {
+  const tmux = new FakeTmux();
+  tmux.pane = DIALOG;
+  const { s, events } = make(tmux);
+  await s.start({ reattach: true });
+  await until(() => events.some((e) => e.type === "permission_request"));
+  const req = events.find((e) => e.type === "permission_request") as Extract<AgentEvent, { type: "permission_request" }>;
+  tmux.pane = READY; // someone answered it in the attached terminal
+  await until(() => events.some((e) => e.type === "permission_withdrawn"));
+  expect(events.find((e) => e.type === "permission_withdrawn")).toEqual({ type: "permission_withdrawn", id: req.id });
+});
+
+test("a dialog we answered is not reported withdrawn", async () => {
+  const tmux = new FakeTmux();
+  tmux.pane = DIALOG;
+  const { s, events } = make(tmux);
+  await s.start({ reattach: true });
+  await until(() => events.some((e) => e.type === "permission_request"));
+  const req = events.find((e) => e.type === "permission_request") as Extract<AgentEvent, { type: "permission_request" }>;
+  await s.respondPermission!(req.id, { behavior: "allow" }, 1);
+  tmux.pane = READY;
+  await Bun.sleep(100);
+  expect(events.some((e) => e.type === "permission_withdrawn")).toBe(false);
+});

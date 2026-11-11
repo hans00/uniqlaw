@@ -140,7 +140,7 @@ export class ClaudeSdkSession implements AgentSession {
     return new Promise<PermissionResult>((resolve) => {
       this.pending.set(id, { resolve, input, suggestions: o.suggestions });
       o.signal?.addEventListener("abort", () => {
-        if (this.pending.delete(id)) resolve({ behavior: "deny", message: "aborted" });
+        if (this.pending.delete(id)) { resolve({ behavior: "deny", message: "aborted" }); this.events.push({ type: "permission_withdrawn", id }); }
       });
       this.events.push({
         type: "permission_request", id, tool: toolName, input,
