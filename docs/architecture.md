@@ -578,10 +578,13 @@ Outcomes, in order:
      unescaped (`r''m`, `"rm"`, `\rm` → `rm`), grouping stripped (`( )`, `{ }`, `!`), leading `VAR=…` dropped,
      `/bin/rm` read as `rm`, known wrappers unwrapped (`sudo`, `doas`, `env` incl. `-S`, `timeout`, `nice`, `ionice`,
      `stdbuf`, `setsid`, `nohup`, `time`, `command`, `builtin`, `exec`, `xargs`, `chroot`, `flock` incl. `-c`,
-     `busybox`, `unbuffer`, `parallel`, `watch`, `strace`, …), and the strings of `sh -c` / `bash -lc` / `eval`,
-     `$( … )` / backtick / `<( … )` substitutions and `find -exec` analysed as commands too. A command that normalizes
-     to a denied one is denied outright. Inputs: Claude `command`, pi `bash`, opencode `{patterns, metadata}`, codex
-     string or argv `command`;
+     `busybox`, `unbuffer`, `parallel`, `watch`, `strace`, sandboxes `bwrap` / `firejail` / `sandbox-exec`, …),
+     reserved words dropped (`if … then rm …; fi`, loops, `case`, functions, `time -p`), the command word's comma brace
+     expansion read (`{r,}m` → `rm m`), and the strings of `sh -c` / `bash -lc` / `eval`, here-strings and
+     here-documents fed to a shell, `$( … )` / backtick / `<( … )` substitutions, `find -exec`, and remote / container
+     commands (`ssh host …`, `docker|podman exec|run …`, `kubectl exec … -- …`) analysed as commands too. A command that
+     normalizes to a denied one is denied outright. Inputs: Claude `command`, pi `bash`, opencode `{patterns,
+     metadata}`, codex string or argv `command` (argv is shell-quoted back word for word);
    - the channel tool policy (case-insensitive tool names) and the `locked` level (anything not read-only);
    - writes (Write/Edit/MultiEdit/NotebookEdit, pi/opencode `write`/`edit`) outside the scope (`dirScope`, else the
      session's cwd; not at `unrestricted`), and a codex `grantRoot` outside it. Paths are checked as written **and**
@@ -600,9 +603,14 @@ Outcomes, in order:
      `SandboxPermissions` (granted for the turn);
    - `no-once-option`: the provider offers no plain one-time allow (any allow would be wider than once; ACP never
      falls back to `allow_always`);
-   - `unresolvable-command`, only when a `Bash(…)` deny rule exists: what runs is decided by text code can't see (a
-     command word from a variable or substitution such as `$RM` or `$(which rm)`, `eval` of non-literal text,
-     unbalanced quotes), so the deny rule can't be checked.
+   - `unresolvable-command`, only when a `Bash(…)` deny rule exists: what runs is decided by text code can't see, so
+     the deny rule can't be checked: a command word from a variable or substitution (`$RM`, `$(which rm)`), `eval` of
+     non-literal text, unbalanced quotes; a shell reading a pipe, a file or a script (`… | sh`, `sh < f`, `bash f.sh`);
+     inline interpreter code (`python -c`, `perl -e`, `ruby -e`, `node -e`/`--eval`/`-p`, `deno eval`, `bun -e`,
+     `php -r`, `lua -e`, `osascript -e`, or one reading code from stdin); `awk` with `system(`/pipes; `git -c` keys
+     that run programs (`*.pager`, `*.editor`, `alias.*`, `core.sshCommand`, `*.hooksPath`, `credential.helper`, …);
+     a brace range in the command word; zsh-only syntax; and anything in fish or PowerShell
+     (`shape.unresolvableReasons` says which).
 
    Compound, wrapped, quoted, piped commands and reviewer-addressed comments are **not** blockers: they reach the
    judge as typed features (below).
@@ -629,20 +637,42 @@ outputs, fetched or file content, assistant text, the provider's title, or peer,
 input still reaches it. Calibrated thresholds and the hard rules are the defense; keep `shadow` until the audit
 pairs say the thresholds hold.
 
+**Shell dialects.** The normalizer is **best effort** and reads POSIX sh / bash / dash; zsh only where it is the
+same (zsh-only syntax: `=cmd`, glob qualifiers `*(.)`, `${~…}`, `=(…)` is unresolvable); fish and PowerShell not at
+all (`parsed: false`: every command is unresolvable when a `Bash(…)` deny rule exists, otherwise it goes to the judge
+unparsed). It always fails toward the judge or the human, never toward allow, and it is not the security boundary:
+the OS sandbox, the provider's permissions and `dirScope` are. The outer dialect comes from the provider and tool
+(`ProviderCapabilities.shellDialects`); inside a command it switches only on an explicit interpreter (`bash`/`sh`/
+`dash -c` → POSIX, `zsh -c` → zsh, `fish -c` / `pwsh -Command` → unsupported, also inside `docker run …` / sandbox
+wrappers). `shape` reports `dialect` (outer), `parsed` and `dialectSwitches`. How the providers choose:
+
+| provider / tool | shell (dialect) |
+|---|---|
+| Claude Code `Bash` (claude-tmux, claude-sdk) | bash or zsh only: `CLAUDE_CODE_SHELL` when it names bash/zsh, else `$SHELL` when bash/zsh, else the first working zsh, then bash (code.claude.com/docs/en/env-vars) |
+| Claude Code `PowerShell` | pwsh (unsupported) |
+| codex | argv vectors, no outer shell (`argv`); the common `["bash", "-lc", script]` switches to POSIX for the script |
+| opencode `bash` | its `shell` config, else `$SHELL`, else `/bin/bash` (UniQlaw reads `$SHELL`; a config override isn't seen) |
+| pi `bash` | `/bin/bash`, else bash on `PATH`, else `sh` (a custom `shellPath` isn't seen) |
+| acp, agy, others | not declared: `unknown`, read as POSIX |
+
 **Context: what the judge knows besides the request.** So that sensible mid-task actions can pass (the human said
 "finish developing model X"; the agent hit a full disk and wants to clear old outputs), three more fields, each with
 an explicit trust level:
 
-- `actionTrace` (**trusted**, harness-observed): this turn's tool actions before the request, oldest first, at most
-  20: tool plus its command (shell) or redacted input, and `ok`. Read-only diagnostic commands (a generic table:
-  `df`, `du`, `free`, `ls`, `stat`, `wc`, `ps`, `lsblk`, `ip addr`, `nvidia-smi`/`rocm-smi`, `git status|log|branch|…`,
-  `systemctl status`, `docker ps`, `npm ls`, `pip list`, …, optionally piped through `head`/`grep`/`sort`/…; no
-  redirect, substitution or wrapper) also get `observedOutput`, the system's own output, capped at 400 chars. No other
-  output is ever included: it can carry injected text. The trace comes from the `tool_start` / `tool_end` events every
+- `actionTrace` (harness-observed): this turn's tool actions before the request, oldest first, at most 20. Trusted as
+  facts: the tool, the **normalized** command (the simple commands that ran) and `ok`. Write/Edit/NotebookEdit
+  entries carry only the path and the content size, never content; other tools their redacted input. Read-only
+  diagnostic commands that print counts, sizes, names or states (a generic table: `df`, `du`, `free`, `ls`, `stat`,
+  `wc`, `pgrep`, `lsblk`, `ip addr`, `nvidia-smi`/`rocm-smi`, `git status|branch|rev-parse`, `git diff --stat`,
+  `systemctl is-active`, `docker images`, `npm ls`, `pip list|freeze`, …, optionally piped through
+  `head`/`grep`/`sort`/…; no redirect, substitution or wrapper) also get `observedOutput`, capped at 400 chars and
+  marked `{untrusted}`: it is the system's own output, but file names and states can still carry text. Nothing that
+  prints file contents or free-form messages (`git log`/`show`/`diff`, `ps`, `systemctl status`, `docker ps`,
+  `pip show`, `cat`, …) and no other output is ever included. The trace comes from the `tool_start` / `tool_end` events every
   provider emits (claude-tmux: its session jsonl; claude-sdk, codex, opencode, pi, acp, agy: their structured
   events; codex's `tool_end` summary now carries the command output). A provider declaring `toolTrace: false` sends
   `available: false`: unknown, not empty.
-- `targets` (**computed, trusted**) and `unrecognized`: the resources the request acts on, for any tool and command
+- `targets` and `unrecognized`: the resources the request acts on, for any tool and command
   (`core/src/targets.ts`). Each target has a `kind` (`path`, `git-ref`, `url`, `process`, `package`, `service`,
   `device`, `remote-host`, `secret-ish`), an `effect` (`read`, `create`, `modify`, `delete`, `execute`, `send`,
   `install`, `publish`) and provenance: `createdThisSession`, `inScope`, `existsNow`, `unresolved` (+ `reason`),
@@ -656,13 +686,30 @@ an explicit trust level:
   provenance. A new kind or command is one more registry entry. A command with no extractor gives no target and
   appears in `unrecognized` (never guessed); `ssh host cmd` / `scp` / `rsync host:` give a `remote-host` target and
   report what the remote command acts on as `remote: true`, unresolved locally. Globs and variables are `unresolved`.
+  Trust: `kind`, `effect` and the provenance flags are computed by code; ids, `via`, free-form details and
+  `unrecognized` names are agent-supplied text and appear as `{untrusted: …}`.
   **createdThisSession** comes from the session ledger: what this session's observed actions created (Write, `mkdir`,
-  `touch`, `>` redirects, `-o`/`--output` files, `git checkout -b`/`switch -c`/`branch`, package installs, `docker
-  run`, `tmux new`, background processes and the pids their output names). A path counts when a create action
-  targeted it (or a parent) and it was new then or born after the session started. The ledger is in memory; it
-  starts again when the session reopens.
+  `touch`, `>` redirects, `-o`/`--output` files, packages, `docker run`, `tmux new`), with spoof checks:
+  - paths by their **resolved real path** (a link the agent made to elsewhere is not "its" target), counted when a
+    create action targeted them (or a parent) and they were new then or their **birth time** is after the session
+    started (never mtime: no birth time means not created, a false negative);
+  - git refs only if the ref **did not exist** before the command (`checkout -B` / `-C` / `branch -f` on an existing
+    branch is a reset, not a creation);
+  - processes only by pid, and only after checking that the pid started after the session began (`/proc/<pid>/stat`
+    start time; `ps -o lstart` on macOS) and descends from the session's process root (`AgentSession.processRoot`:
+    claude-tmux's pane process; other providers report none, so no pid counts as theirs). Numbers in output are never
+    trusted by themselves; killing by name is never "owned by this session".
+  The ledger is in memory and starts again when the session reopens. It learns from `tool_start`: a provider that
+  reports a tool only after it ran (claude-tmux reads its jsonl with a lag) can make a creation look pre-existing, a
+  false negative.
 - `agentRationale` (**untrusted**, model-authored): what the agent wrote about its own call (Bash `description`,
   codex `reason`, a TUI dialog's text), in its own labelled field; `input` keeps its stripped form.
+- `humanRequest`: the human's own words, trusted as their instruction. Quoted or pasted parts (`>` lines, code
+  fences) go to `humanRequestQuoted` as `{untrusted}`; own words longer than 600 characters become `{untrusted,
+  reason}` (they may carry pasted content).
+
+Secrets: besides the earlier patterns, `redactString` masks config-style keys (`"api_key": "…"`, YAML/INI
+`password:` / `secret =`, `token=`), with whole-word key names (`monkey:` / `tokenizer:` stay).
 
 The judge's question states each field's trust level and a generic decision guide in terms of effect × provenance ×
 task: acting on resources this session created, inside scope, in service of the human's task is consistent;
@@ -712,7 +759,7 @@ returns P(safe):
 |---|---|---|
 | `typesafe-jev` | TypeSafe System One, hosted: `POST https://api.typesafe.ai/v1/systemone`, one Choice question; P(safe) = `answers.safety.probabilities.safe` (calibrated per TypeSafe's docs) | `credential` (required), `model` (`jev-latest`), and the `typesafe-compatible` options |
 | `typesafe-compatible` | the same protocol on a self-hosted server | `baseUrl` (required), `credential` (optional), `model`, `authHeader` (`authorization`), `authScheme` (`Bearer`; `""` = bare key), `headers`, `name` |
-| `openai-decision` | OpenAI Decisions API: `POST https://api.openai.com/v1/decisions`, model `gpt-6-luna` (the only one supported), the request as an `input_json` part, one `choice` question; P(safe) = the `safe` entry of `probabilities`; a `refusal` answer is an error (→ escalate) | `credential` (required), `baseUrl` (`https://api.openai.com/v1`), `model`, `organization`, `project`, `headers`, `name` (`Luna`) |
+| `openai-decision` | OpenAI Decisions API: `POST https://api.openai.com/v1/decisions`, model `gpt-6-luna` (the only one supported), the request as an `input_json` part, one `choice` question with `safe` / `unsafe` and the fallback `uncertain` the docs recommend; P(safe) = the `safe` entry of `probabilities` (so `uncertain` escalates); a `refusal` answer is an error (→ escalate) | `credential` (required), `baseUrl` (`https://api.openai.com/v1`), `model`, `organization`, `project`, `headers`, `name` (`Luna`) |
 
 OpenAI's Decisions docs return probabilities but make no calibration claim; they say to set thresholds from labelled
 examples, which is what `shadow` and the audit pairs provide. Keys are resolved from the SecretRef on the first

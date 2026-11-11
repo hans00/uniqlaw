@@ -6,7 +6,7 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
-import { analyzeShell, type ShellAnalysis } from "./shell.ts";
+import { analyzeShell, shellQuote, type ShellAnalysis, type ShellDialect } from "./shell.ts";
 
 export type TargetKind = "path" | "git-ref" | "url" | "process" | "package" | "service" | "device" | "remote-host" | "secret-ish";
 export type Effect = "read" | "create" | "modify" | "delete" | "execute" | "send" | "install" | "publish";
@@ -34,21 +34,28 @@ export interface TargetReport { targets: RequestTarget[]; unrecognized: string[]
 // ── session ledger ─────────────────────────────────────────────────────────
 
 /** Resources this session created, recorded from the actions the harness observed. In memory, per session. */
+export interface LedgerOptions {
+  /** The session's process root (e.g. claude-tmux's pane pid): a pid counts as started by this session only when
+   *  it descends from it. undefined = pids are never recorded. */
+  processRoot?: () => number | undefined;
+}
+
 export class SessionLedger {
   readonly startedAt: number;
   private items = new Map<string, { at: number; existedBefore?: boolean }>();
-  constructor(startedAt = Date.now()) { this.startedAt = startedAt; }
+  constructor(startedAt = Date.now(), private readonly opts: LedgerOptions = {}) { this.startedAt = startedAt; }
 
+  /** Paths are recorded by their resolved real path (a symlink to elsewhere is not "this session's"). */
   record(kind: TargetKind, id: string, existedBefore?: boolean) {
-    const key = `${kind}:${kind === "path" ? normPath(id) : id}`;
+    const key = `${kind}:${kind === "path" ? normPath(realish(id)) : id}`;
     if (!this.items.has(key)) this.items.set(key, { at: Date.now(), ...(existedBefore !== undefined ? { existedBefore } : {}) });
   }
   has(kind: TargetKind, id: string): boolean { return this.items.has(`${kind}:${id}`); }
 
-  /** A path this session created: recorded by a create action (and new then, or born after the session started),
-   *  or inside a directory this session created. */
+  /** A path this session created: a create action targeted it (or a parent directory), and it was new then or
+   *  its birth time (never mtime) is after the session started. Checked on the resolved real path. */
   createdPath(abs: string): boolean {
-    const p = normPath(abs);
+    const p = normPath(realish(abs));
     for (let cur = p; ; cur = dirname(cur)) {
       const it = this.items.get(`path:${cur}`);
       if (it && (it.existedBefore === false || bornAfter(cur, this.startedAt))) return true;
@@ -57,28 +64,77 @@ export class SessionLedger {
   }
   /** How many recorded created paths lie under `abs`. */
   createdInside(abs: string): number {
-    const p = normPath(abs) + "/";
+    const p = normPath(realish(abs)) + "/";
     let n = 0;
     for (const k of this.items.keys()) if (k.startsWith(`path:${p}`)) n++;
     return n;
   }
-  /** Feed one observed action: record what it creates. `output` (tool result) is used for background pids. */
+  /** Feed one observed action: record what it creates. `output` (tool result) may name background pids; each is
+   *  recorded only after verifying it started after the session began and descends from the session's process
+   *  root. */
   observe(tool: string, input: unknown, cwd: string, output?: string) {
     for (const t of extractRaw(tool, input, cwd).targets) {
       if (t.remote || t.unresolved) continue;
       if (t.kind === "path" && t.effect === "create") { const abs = absPath(t.id, cwd); this.record("path", abs, existsSync(abs)); }
-      else if (t.effect === "create" || t.effect === "install" || (t.kind === "process" && t.effect === "execute")) this.record(t.kind, t.id);
+      // A ref counts as created only if it did not exist before (checkout -B / branch -f on an existing ref resets it).
+      else if (t.kind === "git-ref" && t.effect === "create") { if (!refExists(t.id, cwd)) this.record("git-ref", t.id); }
+      else if (t.kind !== "process" && (t.effect === "create" || t.effect === "install")) this.record(t.kind, t.id);
     }
-    // Background processes: remember their pids when the output names them ("[1] 4242", "pid 4242").
-    const cmds = shellCommands(tool, input);
-    if (output && cmds.some((c) => /&\s*$|&\s*[;)]|\bnohup\b|\bsetsid\b|\bdisown\b/.test(c))) {
-      for (const m of output.matchAll(/\[\d+\]\s+(\d+)|\bpid[\s:=]+(\d+)/gi)) this.record("process", m[1] ?? m[2]!);
+    const root = this.opts.processRoot?.();
+    if (output && root) {
+      for (const m of output.matchAll(/\b(\d{2,8})\b/g)) {
+        const pid = Number(m[1]);
+        if (pid !== root && startedAfter(pid, this.startedAt) && descendsFrom(pid, root)) this.record("process", String(pid));
+      }
     }
   }
 }
 
+/** Birth time after `t`. No birth time (filesystem or platform without it): false, never mtime (a false negative is fine). */
 function bornAfter(p: string, t: number): boolean {
-  try { const s = statSync(p); return (s.birthtimeMs > 0 ? s.birthtimeMs : s.mtimeMs) >= t; } catch { return false; }
+  try { const s = statSync(p); return s.birthtimeMs > 0 && s.birthtimeMs >= t; } catch { return false; }
+}
+
+function refExists(ref: string, cwd: string): boolean {
+  const name = ref.startsWith("tags/") ? `refs/tags/${ref.slice(5)}` : `refs/heads/${ref}`;
+  try {
+    const r = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", name], { cwd: nearestDir(cwd), stdout: "ignore", stderr: "ignore", env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+    return r.exitCode === 0;
+  } catch { return true; } // can't tell: not a creation
+}
+
+/** /proc/<pid>/stat fields after the command name: [state, ppid, …, starttime (field 22)]. */
+function procStat(pid: number): { ppid: number; startTicks: number } | undefined {
+  try {
+    const s = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const f = s.slice(s.lastIndexOf(")") + 2).split(" ");
+    return { ppid: Number(f[1]), startTicks: Number(f[19]) };
+  } catch { return undefined; }
+}
+let bootMs: number | undefined;
+function processStartMs(pid: number): number | undefined {
+  const st = procStat(pid);
+  if (st) {
+    bootMs ??= (() => { try { return Number(/^btime (\d+)/m.exec(readFileSync("/proc/stat", "utf8"))?.[1]) * 1000; } catch { return NaN; } })();
+    return Number.isFinite(bootMs) ? bootMs + (st.startTicks / 100) * 1000 : undefined; // USER_HZ is 100 on Linux
+  }
+  try { // macOS / BSD
+    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+    const t = Date.parse(r.stdout.toString().trim());
+    return Number.isFinite(t) ? t : undefined;
+  } catch { return undefined; }
+}
+function parentOf(pid: number): number | undefined {
+  const st = procStat(pid);
+  if (st) return st.ppid;
+  try { const r = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" }); const n = Number(r.stdout.toString().trim()); return n > 0 ? n : undefined; } catch { return undefined; }
+}
+/** Started at or after `t` (1 s tolerance for clock-tick rounding). */
+export function startedAfter(pid: number, t: number): boolean { const s = processStartMs(pid); return s !== undefined && s >= t - 1000; }
+export function descendsFrom(pid: number, root: number): boolean {
+  let cur: number | undefined = pid;
+  for (let i = 0; i < 64 && cur && cur > 1; i++) { cur = parentOf(cur); if (cur === root) return true; }
+  return false;
 }
 
 // ── extraction ─────────────────────────────────────────────────────────────
@@ -352,22 +408,23 @@ registerToolExtractor(["webfetch", "fetch"], (i) => strs(i, "url").map((u) => ur
 registerToolExtractor(["websearch"], () => []);
 function strs(i: Record<string, unknown>, ...keys: string[]) { return keys.map((k) => i[k]).filter((v): v is string => typeof v === "string" && !!v); }
 
-const SHELL_TOOLS = new Set(["bash", "shell", "local_shell", "exec", "exec_command", "run_command"]);
+const SHELL_TOOLS = new Set(["bash", "shell", "local_shell", "exec", "exec_command", "run_command", "powershell"]);
 /** Raw shell commands of a request (Claude `command`, codex string or argv, opencode patterns / metadata.command). */
 export function shellCommands(tool: string, input: unknown): string[] {
   const o = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : undefined;
   if (!o || !SHELL_TOOLS.has(tool.toLowerCase())) return [];
   const out: string[] = [];
   if (typeof o.command === "string") out.push(o.command);
-  else if (Array.isArray(o.command)) out.push(o.command.filter((x) => typeof x === "string").join(" "));
+  else if (Array.isArray(o.command)) out.push(o.command.filter((x): x is string => typeof x === "string").map(shellQuote).join(" "));
   if (Array.isArray(o.patterns)) out.push(...o.patterns.filter((x): x is string => typeof x === "string"));
   const meta = o.metadata as Record<string, unknown> | undefined;
   if (typeof meta?.command === "string") out.push(meta.command);
   return [...new Set(out)];
 }
 
-function extractShell(line: string, cwd: string): { targets: Raw[]; unrecognized: string[] } {
-  const analysis = analyzeShell(line);
+function extractShell(line: string, cwd: string, dialect: ShellDialect = "unknown"): { targets: Raw[]; unrecognized: string[] } {
+  const analysis = analyzeShell(line, dialect);
+  if (!analysis.parsed) return { targets: [], unrecognized: [`(${dialect} command: not parsed)`] };
   const targets: Raw[] = [];
   const unrecognized: string[] = [];
   for (const words of analysis.commands) {
@@ -392,10 +449,10 @@ function extractShell(line: string, cwd: string): { targets: Raw[]; unrecognized
 }
 
 /** Raw targets (no provenance) of a request: structured tool extractors, or the shell extractors for shell tools. */
-export function extractRaw(tool: string, input: unknown, cwd: string): { targets: Raw[]; unrecognized: string[] } {
+export function extractRaw(tool: string, input: unknown, cwd: string, dialect?: ShellDialect): { targets: Raw[]; unrecognized: string[] } {
   const cmds = shellCommands(tool, input);
   if (cmds.length) {
-    const all = cmds.map((c) => extractShell(c, cwd));
+    const all = cmds.map((c) => extractShell(c, cwd, dialect));
     return { targets: all.flatMap((x) => x.targets), unrecognized: [...new Set(all.flatMap((x) => x.unrecognized))] };
   }
   const o = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : undefined;
@@ -422,6 +479,8 @@ export interface ProvenanceContext {
   /** Write scope (dirScope, else cwd); undefined at the unrestricted level (inScope then uses cwd). */
   scope?: string[];
   ledger: SessionLedger;
+  /** The request's shell dialect (requestDialect). */
+  dialect?: ShellDialect;
 }
 type Enricher = (t: RequestTarget, ctx: ProvenanceContext, cache: Map<string, Promise<unknown>>) => Promise<void>;
 export const KIND_PROVENANCE = new Map<TargetKind, Enricher>();
@@ -557,9 +616,9 @@ KIND_PROVENANCE.set("process", async (t, ctx) => {
     }
     d.ownedBySession = ctx.ledger.has("process", pid) || (typeof d.name === "string" && ctx.ledger.has("process", d.name));
   } else if (/^%\d+$/.test(t.id)) {
-    d.ownedBySession = true; d.jobSpec = true; // a job of this shell: started by this session
+    d.jobSpec = true; d.ownedBySession = false; // a job of some shell: which one can't be checked
   } else {
-    d.ownedBySession = ctx.ledger.has("process", t.id);
+    d.ownedBySession = false; // by name: may match processes this session did not start
   }
   t.createdThisSession = !!d.ownedBySession;
   t.details = d;
@@ -576,7 +635,7 @@ KIND_PROVENANCE.set("remote-host", async (t) => { t.remote = true; });
  * bounded); paths that look like secrets also get a `secret-ish` target.
  */
 export async function describeTargets(tool: string, input: unknown, ctx: ProvenanceContext, max = 12): Promise<TargetReport> {
-  const raw = extractRaw(tool, input, ctx.cwd);
+  const raw = extractRaw(tool, input, ctx.cwd, ctx.dialect);
   const targets: RequestTarget[] = raw.targets.map((t) => ({ via: tool, ...t }));
   for (const t of [...targets]) {
     if (t.kind === "path" && !t.remote && SECRETISH.test(t.id)) targets.push({ kind: "secret-ish", effect: t.effect, id: t.id, via: t.via });

@@ -8,6 +8,9 @@ export interface ProviderCapabilities {
   /** false: the provider emits no tool_start / tool_end events, so the approval judge's action trace is unavailable
    *  (default: available). */
   toolTrace?: boolean;
+  /** Shell dialect of each shell tool (lowercase tool name → dialect), for the approval judge's command normalizer
+   *  (see shell.ts). Tools not listed are read as POSIX ("unknown"); a `PowerShell` tool is always powershell. */
+  shellDialects?: Readonly<Record<string, import("./shell.ts").ShellDialect>>;
   /** Output granularity. */
   streaming: "token" | "segment" | "final";
   interrupt: boolean;
@@ -159,6 +162,9 @@ export interface AgentSession {
   /** Stop watching without stopping the provider process (daemon restart). The next
    *  open() with the same providerSessionId reattaches. Optional: core falls back to close(). */
   detach?(): void;
+  /** The pid every command of this session descends from (e.g. claude-tmux's pane process), so core can tell a
+   *  process this session started from others (approval judge provenance). undefined = unknown. */
+  processRoot?(): number | undefined;
   /** Process/connection is alive (used by health checks + reattach). */
   alive(): Promise<boolean>;
 }

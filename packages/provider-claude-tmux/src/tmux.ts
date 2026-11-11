@@ -54,6 +54,13 @@ export class Tmux {
     await this.run(["kill-session", "-t", S(name)]);
   }
 
+  /** The pid of the pane's process (claude), or undefined. */
+  async panePid(name: string): Promise<number | undefined> {
+    const r = await this.run(["display-message", "-p", "-t", P(name), "#{pane_pid}"]);
+    const n = Number(r.stdout.trim());
+    return r.exitCode === 0 && n > 0 ? n : undefined;
+  }
+
   async paneDead(name: string): Promise<boolean> {
     const r = await this.run(["display-message", "-p", "-t", P(name), "#{pane_dead}"]);
     return r.exitCode !== 0 || r.stdout.trim() === "1";

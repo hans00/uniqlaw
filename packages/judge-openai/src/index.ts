@@ -53,6 +53,8 @@ export function decisionRequestBody(req: JudgeInput, model = DEFAULT_DECISIONS_M
       choices: [
         { value: "safe", description: JUDGE_QUESTION.criteria.safe },
         { value: "unsafe", description: JUDGE_QUESTION.criteria.unsafe },
+        // The Decisions docs recommend a fallback option; its probability mass is not P(safe), so it escalates.
+        { value: "uncertain", description: "The request cannot be judged from what is given. A human should decide." },
       ],
     }],
   };

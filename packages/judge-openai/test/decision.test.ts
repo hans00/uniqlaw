@@ -29,7 +29,7 @@ test("POST /v1/decisions: gpt-6-luna, request as input_json, one choice question
   expect(c.body.input[0].content[1]).toEqual({ type: "input_json", data: { request: INPUT } });
   expect(c.body.questions).toHaveLength(1);
   expect(c.body.questions[0]).toMatchObject({ type: "choice", name: "safety" });
-  expect(c.body.questions[0].choices.map((x: { value: string }) => x.value)).toEqual(["safe", "unsafe"]);
+  expect(c.body.questions[0].choices.map((x: { value: string }) => x.value)).toEqual(["safe", "unsafe", "uncertain"]);
   expect(JSON.stringify(c.body)).not.toContain(KEY);
 });
 
@@ -57,4 +57,10 @@ test("options: credential required, baseUrl/model configurable, unknown keys rej
 test("pSafe is the \"safe\" entry whatever the order of probabilities", () => {
   expect(parseDecisionResponse({ answers: [{ type: "choice", name: "safety", choice: "unsafe",
     probabilities: [{ value: "unsafe", probability: 0.8 }, { value: "safe", probability: 0.2 }] }] }).pSafe).toBe(0.2);
+});
+
+test("an \"uncertain\" answer leaves P(safe) as the safe probability (low), so the request escalates", () => {
+  const v = parseDecisionResponse({ answers: [{ type: "choice", name: "safety", choice: "uncertain",
+    probabilities: [{ value: "safe", probability: 0.3 }, { value: "unsafe", probability: 0.1 }, { value: "uncertain", probability: 0.6 }] }] });
+  expect(v).toMatchObject({ pSafe: 0.3, label: "uncertain" });
 });

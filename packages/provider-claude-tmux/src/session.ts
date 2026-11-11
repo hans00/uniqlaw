@@ -7,6 +7,7 @@ import type {
   AgentEvent, AgentSession, Logger, PermissionDecision, ProviderCapabilities, TurnInput,
 } from "@uniqlaw/core";
 import {
+  claudeShellDialects,
   JsonlTailer, locateJsonl, expectedJsonlPath, classifyInternalOutput, isInterruptMarker,
   isRejectionText, isCrossSessionMessage, type JsonlEvent,
 } from "@uniqlaw/claude-common";
@@ -18,6 +19,8 @@ import { isReady, looksActivelyBusy, isRecoverableApiError, isUsageLimit, waitFo
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export const CLAUDE_TMUX_CAPABILITIES: ProviderCapabilities = {
+  // Bash tool: bash or zsh as Claude Code picks it; PowerShell tool: pwsh (approval judge normalizer).
+  shellDialects: claudeShellDialects(),
   streaming: "segment",
   interrupt: true,
   steer: true,
@@ -160,8 +163,13 @@ export class ClaudeTmuxSession implements AgentSession {
   // ───────────────────────── lifecycle ─────────────────────────
 
   /** Called by the provider after spawn/reattach. */
+  private rootPid?: number;
+  /** claude's pid in the pane: every Bash command this session runs descends from it. */
+  processRoot(): number | undefined { return this.rootPid; }
+
   async start(o: { reattach: boolean; readyTimeoutMs?: number; staleLaunch?: boolean }): Promise<void> {
     this.emit({ type: "session", providerSessionId: this.providerSessionId });
+    void (this.init.tmux.panePid?.(this.name) ?? Promise.resolve(undefined)).then((p) => { this.rootPid = p; }).catch(() => {});
     if (o.reattach) {
       this.staleLaunch = !!o.staleLaunch && !!this.init.respawn;
       const saved = this.takeTailState();

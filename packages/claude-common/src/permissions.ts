@@ -2,7 +2,7 @@
 // M0 rules: ALWAYS pin --permission-mode (user settings may say "auto"), and
 // ALWAYS disallow the native cross-session tools.
 import { chmodSync, writeFileSync } from "node:fs";
-import { claudeToolLists, type PermissionPolicy, type ToolPolicy } from "@uniqlaw/core";
+import { claudeToolLists, dialectOfShell, type PermissionPolicy, type ShellDialect, type ToolPolicy } from "@uniqlaw/core";
 
 export const NATIVE_CROSS_SESSION_TOOLS = ["ListAgents", "SendMessage"];
 
@@ -112,4 +112,13 @@ export function claudeSettingsArgs(o: { nativeMemory: boolean | undefined; permi
 /** SDK `settings` option for SessionSpec.nativeMemory (claude-sdk). */
 export function nativeMemorySettings(nativeMemory: boolean | undefined): { settings?: { autoMemoryEnabled: false; autoDreamEnabled: false } } {
   return nativeMemory === false ? { settings: { ...NO_NATIVE_MEMORY_SETTINGS } } : {};
+}
+
+/** The shell Claude Code's Bash tool runs commands in (code.claude.com/docs/en/env-vars, CLAUDE_CODE_SHELL): only bash
+ *  or zsh. CLAUDE_CODE_SHELL when it names bash or zsh, else $SHELL when it is bash or zsh, else the first working
+ *  zsh, then bash. The PowerShell tool is pwsh. */
+export function claudeShellDialects(env: Record<string, string | undefined> = process.env, which: (b: string) => string | null = (b) => Bun.which(b)): Record<string, ShellDialect> {
+  const pick = (v: string | undefined) => { const d = dialectOfShell(v); return d === "bash" || d === "zsh" ? d : undefined; };
+  const bash = pick(env.CLAUDE_CODE_SHELL) ?? pick(env.SHELL) ?? (which("zsh") ? "zsh" : "bash");
+  return { bash, powershell: "powershell" };
 }

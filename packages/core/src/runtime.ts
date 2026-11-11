@@ -11,6 +11,7 @@ import { ModelRouter, agenticSchema } from "./model-router.ts";
 import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
 import { isA2ASession } from "./a2a-policy.ts";
 import { describeTargets, SessionLedger, type TargetReport } from "./targets.ts";
+import { requestDialect } from "./shell.ts";
 import {
   allowBlockers, buildJudgeInput, decideOutcome, hardPolicyDeny, inputFingerprint, inputHash, judgeNote, redactInput, runJudge, strictestKind, writeScope,
   type ObservedAction,
@@ -211,7 +212,7 @@ export class ChannelRuntime {
   /** The provider's permission hook has reached this session (its dialogs follow a hook verdict). */
   private hookActive = false;
   /** What this session created (files, dirs, branches, packages, processes, …), for the judge's target provenance. */
-  private ledger = new SessionLedger();
+  private ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
   private readonly log: Logger;
   private router?: ModelRouter;
   /** Model the session is on, as far as we know (profile → /model → router → provider "model" events). */
@@ -429,7 +430,7 @@ export class ChannelRuntime {
   /** /new: drop the provider session so the next message starts fresh. */
   async reset(): Promise<void> {
     await this.close();
-    this.ledger = new SessionLedger();
+    this.ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
     this.host.store.patchSession(this.channelKey, { providerSessionId: null, adapterState: null });
   }
 
@@ -518,7 +519,7 @@ export class ChannelRuntime {
         lastTarget: row?.lastTarget ?? null, adapterState: row && row.provider === this.profile.provider ? row.adapterState : null,
       });
     }
-    this.ledger = new SessionLedger();
+    this.ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
     const cur = this.host.store.getSession(this.channelKey)!;
     const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const gw = this.host.gatewayFor(this.channelKey);
@@ -1239,7 +1240,7 @@ export class ChannelRuntime {
     const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
     const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const rule = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured: false, policy, toolPolicy, cwd })
-      ?? (hit ? hardPolicyDeny({ tool: hit.tool, input: hit.input, structured: true, policy, toolPolicy, cwd }) : undefined);
+      ?? (hit ? hardPolicyDeny({ tool: hit.tool, input: hit.input, structured: true, policy, toolPolicy, cwd, dialect: requestDialect(hit.tool, hit.input, this.capabilities.shellDialects) }) : undefined);
     if (rule && cfg.mode === "enforce") return { id: hit?.judged.id ?? crypto.randomUUID(), outcome: { action: "deny", rule }, audit: false };
     if (hit) return hit.judged;
     const id = crypto.randomUUID();
@@ -1261,13 +1262,14 @@ export class ChannelRuntime {
     const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
     const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const structured = typeof ev.input !== "string";
-    const hardDeny = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured, policy, toolPolicy, cwd });
+    const dialect = requestDialect(ev.tool, ev.input, this.capabilities.shellDialects);
+    const hardDeny = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured, policy, toolPolicy, cwd, dialect });
     const human = this.trustedHumanText();
     const trace = this.capabilities.toolTrace === false ? undefined : this.traceBefore(ev);
     const targets = structured ? await this.targetsOf(ev, cwd) : undefined;
-    const { altered, ...input } = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind,
+    const { altered, ...input } = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind, dialect,
       ...(human ? { humanRequest: human } : {}), ...(trace ? { trace } : {}), ...(targets ? { targets } : {}) });
-    const blockers = allowBlockers({ tool: ev.tool, input: ev.input, structured, altered, policy });
+    const blockers = allowBlockers({ tool: ev.tool, input: ev.input, structured, altered, policy, dialect });
     if (ev.options?.length && onceOption(ev.options) === undefined) blockers.push("no-once-option");
     let judge: ApprovalJudge | undefined;
     try { judge = this.host.approvalJudge?.(this.profile); } catch (e) { this.log.warn("approval judge unavailable", { e: String(e) }); }
@@ -1308,7 +1310,8 @@ export class ChannelRuntime {
 
   /** Targets of the request with provenance; bounded in time (a slow filesystem or git must not hold the request). */
   private async targetsOf(ev: { tool: string; input: unknown }, cwd: string): Promise<TargetReport | undefined> {
-    const work = describeTargets(ev.tool, ev.input, { cwd, scope: writeScope(this.profile.permissions, cwd), ledger: this.ledger });
+    const work = describeTargets(ev.tool, ev.input, { cwd, scope: writeScope(this.profile.permissions, cwd), ledger: this.ledger,
+      dialect: requestDialect(ev.tool, ev.input, this.capabilities.shellDialects) });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<undefined>((res) => { timer = setTimeout(() => res(undefined), TARGETS_BUDGET_MS); });
     try { return await Promise.race([work, late]); } catch (e) { this.log.warn("target provenance failed", { e: String(e) }); return undefined; } finally { clearTimeout(timer); }

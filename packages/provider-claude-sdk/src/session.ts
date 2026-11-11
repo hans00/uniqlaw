@@ -5,6 +5,7 @@ import type {
   AgentEvent, AgentSession, Logger, PermissionDecision, ProviderCapabilities, SessionSpec, TurnInput,
 } from "@uniqlaw/core";
 import {
+  claudeShellDialects,
   MCP_SERVER_NAME, claudeToolSets, baseChildEnv, claudeEnvForCredential, composeAppendSystemPrompt,
   mcpToolId, permissionModeFor, nativeMemorySettings, ISOLATED_SDK_OPTIONS,
 } from "@uniqlaw/claude-common";
@@ -13,6 +14,8 @@ import { SdkMapper } from "./mapper.ts";
 import { EventQueue } from "./queue.ts";
 
 export const CLAUDE_SDK_CAPABILITIES: ProviderCapabilities = {
+  // Bash tool: bash or zsh as Claude Code picks it; PowerShell tool: pwsh (approval judge normalizer).
+  shellDialects: claudeShellDialects(),
   streaming: "token",
   interrupt: true,
   steer: true,

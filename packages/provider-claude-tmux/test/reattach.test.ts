@@ -190,3 +190,11 @@ test("a different request replacing the dialog withdraws the old one at once", a
   await until(() => events.filter((e) => e.type === "permission_request").length === 2);
   expect(events.some((e) => e.type === "permission_withdrawn")).toBe(true);
 });
+
+test("processRoot is claude's pane pid (the approval judge checks process ownership against it)", async () => {
+  const tmux = new FakeTmux() as FakeTmux & { panePid: () => Promise<number> };
+  tmux.panePid = async () => 4242;
+  const { s } = make(tmux);
+  await s.start({ reattach: true });
+  await until(() => s.processRoot() === 4242);
+});
