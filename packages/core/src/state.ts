@@ -73,12 +73,14 @@ CREATE TABLE IF NOT EXISTS deferred_input (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   channel_key TEXT NOT NULL,
   payload TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  claimed INTEGER NOT NULL DEFAULT 0
 );
 `;
 
-/** Input held back while the daemon drains for a restart (replayed after it). */
-export interface DeferredInput { id: number; channelKey: string; payload: string; createdAt: number }
+/** Input held back while the daemon drains for a restart (replayed after it). A row stays until the turn that
+ *  consumes it starts (at-least-once); `claimed` = handed to a session queue by this process. */
+export interface DeferredInput { id: number; channelKey: string; payload: string; createdAt: number; claimed: boolean }
 
 export class StateStore {
   readonly db: Database;
@@ -158,16 +160,24 @@ export class StateStore {
   }
   listDeferred(): DeferredInput[] {
     return (this.db.query("SELECT * FROM deferred_input ORDER BY id").all() as Record<string, unknown>[])
-      .map((r) => ({ id: r.id as number, channelKey: r.channel_key as string, payload: r.payload as string, createdAt: r.created_at as number }));
+      .map((r) => ({ id: r.id as number, channelKey: r.channel_key as string, payload: r.payload as string, createdAt: r.created_at as number, claimed: !!r.claimed }));
   }
   countDeferred(): number { return (this.db.query("SELECT COUNT(*) AS n FROM deferred_input").get() as { n: number }).n; }
-  /** Read and delete every deferred input in one transaction (replay is at-most-once). */
-  takeDeferred(): DeferredInput[] {
+  /** Claim every unclaimed deferred input (to replay it). The rows stay until deleteDeferred. */
+  claimDeferred(): DeferredInput[] {
     return this.db.transaction(() => {
-      const rows = this.listDeferred();
-      this.db.query("DELETE FROM deferred_input").run();
-      return rows;
+      const rows = this.listDeferred().filter((r) => !r.claimed);
+      this.db.query("UPDATE deferred_input SET claimed = 1 WHERE claimed = 0").run();
+      return rows.map((r) => ({ ...r, claimed: true }));
     })();
+  }
+  /** Give claimed rows back (one row, or all: claims left by a previous process are stale). */
+  unclaimDeferred(id?: number) {
+    if (id === undefined) this.db.query("UPDATE deferred_input SET claimed = 0").run();
+    else this.db.query("UPDATE deferred_input SET claimed = 0 WHERE id = ?").run(id);
+  }
+  deleteDeferred(ids: number[]) {
+    for (const id of ids) this.db.query("DELETE FROM deferred_input WHERE id = ?").run(id);
   }
   /** Run fn in one SQLite transaction. */
   tx<T>(fn: () => T): T { return this.db.transaction(fn)(); }

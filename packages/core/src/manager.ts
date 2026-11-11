@@ -105,6 +105,7 @@ export class ChannelManager {
       cwdFor: (k) => deps.store.get(`session-cwd:${k}`),
       workerOf: (k) => { const m = this.workerMeta(k); return m ? { owner: m.owner } : undefined; },
       deferInput: (k, input) => this.deferInput(k, input),
+      releaseDeferred: (ids) => deps.store.deleteDeferred(ids),
       backgroundTarget: (k) => {
         if (!k.startsWith(WORKER_PREFIX)) return undefined;
         // Workers have no chat: background output (e.g. a human typing in its terminal) goes to the
@@ -882,7 +883,7 @@ export class ChannelManager {
   flushQueuesForRestart(): number {
     let n = 0;
     for (const rt of this.runtimes.values()) {
-      for (const q of rt.takeQueue()) { this.deps.store.pushDeferred(rt.channelKey, q); n++; }
+      for (const q of rt.takeQueue()) { this.storeDeferred(rt.channelKey, q); n++; }
       const dropped = rt.takeDropped();
       if (dropped.length) this.deps.store.pushPending(rt.channelKey, "peer-result", { label: "messages dropped while your queue was full", text: dropped.join("\n") });
     }
@@ -893,7 +894,7 @@ export class ChannelManager {
     if (!this.draining) return false;
     // The running turn of the asker is waiting for this answer (agent_ask): let it run, the drain waits for it.
     if (input.origin.kind === "peer" && input.origin.mode === "ask" && this.isBusy(input.origin.fromSession)) return false;
-    this.deps.store.pushDeferred(channelKey, input);
+    this.storeDeferred(channelKey, input);
     const o = input.origin;
     if (o.kind === "human" && !this.draining.acked.has(channelKey)) {
       this.draining.acked.add(channelKey);
@@ -903,16 +904,26 @@ export class ChannelManager {
     return true;
   }
 
-  /** Replay input deferred during a drain (also after a crash mid-drain). At-most-once: rows are deleted as they
-   *  are read, so a crash right after this does not replay them twice. Returns how many were replayed. */
+  /** A replayed input deferred again keeps its row (unclaimed); a new one gets a row. */
+  private storeDeferred(channelKey: string, input: QueuedInput) {
+    if (input.deferredId !== undefined) { this.deps.store.unclaimDeferred(input.deferredId); return; }
+    this.deps.store.pushDeferred(channelKey, input);
+  }
+
+  /** Replay input deferred during a drain (also after a crash mid-drain). At-least-once: a row is only claimed
+   *  here and deleted when the turn that consumes it starts (ChannelRuntime → releaseDeferred), so a crash
+   *  before that replays it again on the next start (prepare() unclaims stale claims). Returns how many. */
   async replayDeferred(): Promise<number> {
-    const rows = this.deps.store.takeDeferred();
+    const rows = this.deps.store.claimDeferred();
     for (const r of rows) {
       let input: QueuedInput;
-      try { input = JSON.parse(r.payload) as QueuedInput; } catch { continue; }
+      try { input = { ...(JSON.parse(r.payload) as QueuedInput), deferredId: r.id }; }
+      catch { this.deps.store.deleteDeferred([r.id]); continue; }
       this.rearmTask(input.origin);
-      try { await this.deliverSystemTurn(r.channelKey, "held while UniQlaw restarted", input); }
-      catch (e) { this.deps.log.warn("deferred input dropped", { key: r.channelKey, e: String(e) }); }
+      try {
+        const ran = await this.deliverSystemTurn(r.channelKey, "held while UniQlaw restarted", input);
+        if (!ran) this.deps.store.deleteDeferred([r.id]); // parked as an unread note: durable there
+      } catch (e) { this.deps.log.warn("deferred input not replayed; kept for the next start", { key: r.channelKey, e: String(e) }); }
     }
     if (rows.length) this.deps.log.info("replayed deferred input", { n: rows.length });
     return rows.length;
@@ -956,11 +967,13 @@ export class ChannelManager {
   /** Run a system input (restart notice, replayed input) as a turn, unless a human holds the session: a worker
    *  a human drives gets it as an unread note instead (only the human's own messages go through), and a session
    *  handed to a terminal is not reopened. */
-  async deliverSystemTurn(key: string, label: string, input: QueuedInput): Promise<void> {
+  /** Returns false when it was parked as a note instead of queued. */
+  async deliverSystemTurn(key: string, label: string, input: QueuedInput): Promise<boolean> {
     const handedOff = this.terminalHold(key)?.live === false;
     const held = this.workerMeta(key) && this.heldBy(key) && input.origin.kind !== "human";
-    if (handedOff || held) { this.deps.store.pushPending(key, "peer-result", { label, text: input.item.text }); return; }
+    if (handedOff || held) { this.deps.store.pushPending(key, "peer-result", { label, text: input.item.text }); return false; }
     await this.runtime(key).enqueue(input);
+    return true;
   }
 
   /** Register a waiter for a task that survived a restart (replayed or still running). */

@@ -301,6 +301,36 @@ test("crash between persist and exit: the next start still replays and notifies,
   await g3.m.stop();
 });
 
+test("replayed input is at-least-once: a crash after the replay but before its turn starts replays it again", async () => {
+  const platform = new FakePlatform();
+  const p1 = new GatedProvider();
+  let executed = false;
+  const g1 = generation(p1, platform, () => { executed = true; });
+  await g1.m.handleInbound(msg("6", "busy"));
+  await until(() => p1.s("tg:6")?.sent.length === 1);
+  g1.c.request({ kind: "restart", requestedBy: "cli" });
+  await until(() => g1.m.isDraining);
+  await g1.m.handleInbound(msg("7", "please don't lose me", "70"));
+  p1.s("tg:6").finish("ok");
+  await until(() => executed);
+  await g1.m.stop();
+
+  // Generation 2 replays (claims the row) but dies before the session is up: open() never returns.
+  const p2 = new GatedProvider();
+  p2.open = () => new Promise(() => {});
+  const g2 = generation(p2, platform);
+  void comeBack(g2);
+  await until(() => store.listDeferred().every((r) => r.claimed) && store.listDeferred().length === 1);
+
+  // Generation 3: the stale claim is released and the message runs; its row goes once the turn starts.
+  const p3 = new GatedProvider();
+  const g3 = generation(p3, platform);
+  expect((await comeBack(g3)).replayed).toBe(1);
+  await until(() => p3.s("tg:7")?.texts.includes("please don't lose me"));
+  expect(store.listDeferred()).toEqual([]);
+  await g3.m.stop();
+});
+
 test("a reattached claude-tmux-like session finishes its resumed turn first, then gets the notice", async () => {
   const platform = new FakePlatform();
   const p1 = new GatedProvider(true);

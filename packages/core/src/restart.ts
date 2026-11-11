@@ -316,6 +316,7 @@ export class RestartCoordinator {
   /** First half of the comeback, before sessions are restored (reopening one consumes its inflight-turn key):
    *  re-arm or fail the previous process's open tasks. Nothing is sent yet. */
   prepare() {
+    this.d.store.unclaimDeferred(); // claims of a previous process: its queues are gone, replay those rows again
     const raw = this.d.store.get(RECORD_KEY);
     let record: RestartRecord | undefined;
     if (raw) { try { record = JSON.parse(raw) as RestartRecord; } catch { this.d.log.warn("unreadable restart record; ignored"); } }
@@ -324,7 +325,8 @@ export class RestartCoordinator {
   }
 
   /** Second half, once platforms are up: replay deferred input, tell askers about failed tasks, send the notices.
-   *  The record is deleted before anything is sent, so a crash in here never notifies twice (at-most-once). */
+   *  Replayed input is at-least-once (see replayDeferred). The record is deleted before any notice is sent, so a
+   *  crash in here never notifies twice: notices are at-most-once. */
   async resume(): Promise<{ record?: RestartRecord; replayed: number; notified: string[] }> {
     if (!this.carried) this.prepare();
     const { record, failedTasks } = this.carried!;

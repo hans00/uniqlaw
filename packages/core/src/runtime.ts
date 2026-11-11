@@ -19,6 +19,8 @@ export interface QueuedInput {
   origin: Origin;
   item: PromptItem;
   attachments: Attachment[];
+  /** Replayed after a restart: its deferred_input row, deleted once a turn consumes it (or it is dropped). */
+  deferredId?: number;
 }
 
 /** What the system prompt builder knows about the session. */
@@ -61,6 +63,8 @@ export interface RuntimeHost {
   /** Graceful restart: return true to take this input away (it is persisted and replayed after the restart)
    *  instead of letting it start a turn now. */
   deferInput?(channelKey: string, input: QueuedInput): boolean;
+  /** Replayed inputs left the queue for good (a turn started with them, or they were dropped). */
+  releaseDeferred?(ids: number[]): void;
   /** Optional: bounded transcript for UIs. */
   transcript?: TranscriptStore;
   /** Optional: live runtime events (dashboard SSE). */
@@ -242,8 +246,9 @@ export class ChannelRuntime {
     const { cap, dropPolicy } = this.host.settings.queue;
     this.lastEnqueuedAt = Date.now();
     if (this.queue.length >= cap) {
-      if (dropPolicy === "new") return;
+      if (dropPolicy === "new") { this.release([input]); return; }
       const removed = this.queue.splice(0, this.queue.length - cap + 1);
+      this.release(removed);
       if (dropPolicy === "summarize") for (const d of removed) this.dropped.push(d.item.text.replace(/\s+/g, " ").slice(0, 160));
     }
     this.queue.push(input);
@@ -251,6 +256,7 @@ export class ChannelRuntime {
 
   /** /stop: interrupt and clear the queue. */
   async stop(): Promise<boolean> {
+    this.release(this.queue);
     this.queue = [];
     this.dropped = [];
     if (this.state !== "running") return false;
@@ -376,6 +382,7 @@ export class ChannelRuntime {
       const msg = e instanceof Error ? e.message : String(e);
       this.log.error("open failed", { msg });
       const failed = this.queue.splice(0);
+      this.release(failed);
       for (const q of failed) await this.notifyFailure(q.origin, `⚠️ Agent session failed to start: ${msg}`);
     }
   }
@@ -404,6 +411,7 @@ export class ChannelRuntime {
     const first = this.queue[0]!;
     if (isPassthroughSlashCommand(first.item.text) && first.origin.kind === "human") {
       this.queue.shift();
+      this.release([first]);
       return this.startTurn([first.origin], { text: first.item.text.trim(), attachments: [], slashCommand: true });
     }
     const batch: QueuedInput[] = [];
@@ -416,6 +424,7 @@ export class ChannelRuntime {
     await this.routeModel(batch);
     const body = mergeQueued(batch.map((b) => b.item), tz, this.dropped.splice(0));
     const text = [...handoff, formatPendingForPrompt(pending, tz), body].filter(Boolean).join("\n\n");
+    this.release(batch);
     await this.startTurn(batch.map((b) => b.origin), { text, attachments: batch.flatMap((b) => b.attachments) });
   }
 
@@ -456,6 +465,12 @@ export class ChannelRuntime {
 
   /** Queued inputs not yet sent (moved to the new runtime when the chat switches profile). */
   takeQueue(): QueuedInput[] { return this.queue.splice(0); }
+  /** These inputs are gone from the queue for good: their deferred_input rows (if replayed) can go. */
+  private release(items: QueuedInput[]) {
+    const ids = items.map((q) => q.deferredId).filter((x): x is number => x !== undefined);
+    if (ids.length) this.host.releaseDeferred?.(ids);
+  }
+
   /** Summaries of inputs dropped because the queue was full (not yet shown to the agent). */
   takeDropped(): string[] { return this.dropped.splice(0); }
 
