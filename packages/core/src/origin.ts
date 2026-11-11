@@ -11,7 +11,8 @@ export type Origin =
       mode: "ask" | "trigger" | "result"; taskId: string;
       deliverTo?: Target;
       /** result: how many async results in a row have driven this session without a human message
-       *  (bounds ask → result → ask rounds, which don't deepen the hop). */
+       *  (bounds ask → result → ask rounds, which don't deepen the hop). ask: the rounds its result will carry
+       *  (kept so a task re-armed after a restart answers with the same count). */
       rounds?: number;
       /** Delegation chain this input belongs to (budget key, see bus.maxChainTasks): started by a human message,
        *  else by the turn that first asked. */

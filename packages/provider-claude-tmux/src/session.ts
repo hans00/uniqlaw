@@ -2,6 +2,7 @@
 // instance socket. Output comes from the session jsonl (segment granularity);
 // dialogs, readiness and busy state come from pane snapshots.
 import { randomUUID, createHash } from "node:crypto";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type {
   AgentEvent, AgentSession, Logger, PermissionDecision, ProviderCapabilities, TurnInput,
 } from "@uniqlaw/core";
@@ -79,6 +80,9 @@ export interface SessionInit {
   /** Kill and restart claude with the current profile flags (--resume); used for a stale reattached process. */
   respawn?: () => Promise<void>;
   readyTimeoutMs?: number;
+  /** Where detach() saves the jsonl read position; a reattach continues from it, so a reply written while the
+   *  daemon was down is still emitted (as an unsolicited turn) instead of skipped. */
+  tailStateFile?: string;
 }
 
 const fp = (s: string) => createHash("sha1").update(s).digest("hex").slice(0, 12);
@@ -148,9 +152,10 @@ export class ClaudeTmuxSession implements AgentSession {
   /** Called by the provider after spawn/reattach. */
   async start(o: { reattach: boolean; readyTimeoutMs?: number; staleLaunch?: boolean }): Promise<void> {
     this.emit({ type: "session", providerSessionId: this.providerSessionId });
-    this.tailer.start();
     if (o.reattach) {
       this.staleLaunch = !!o.staleLaunch && !!this.init.respawn;
+      const saved = this.takeTailState();
+      if (saved) this.tailer.resumeFrom(saved);
       const pane = await this.tmux.capture(this.name).catch(() => "");
       if (looksActivelyBusy(pane)) {
         this.state = "running";
@@ -158,8 +163,15 @@ export class ClaudeTmuxSession implements AgentSession {
       } else if (isReady(pane)) {
         this.setIdle();
       }
+      // Only now: output written while the daemon was down starts a turn of its own (idle) or joins the running one.
+      this.tailer.start();
       // Otherwise (e.g. sitting on a permission dialog: neither busy nor ready) the first poll classifies it.
     } else {
+      // Respawned with --resume after claude exited while the daemon was down: same session id, same jsonl. Continue
+      // from the saved position once it is ready (idle), so a reply written before it exited still comes out.
+      const saved = this.takeTailState();
+      if (saved) this.tailer.resumeFrom(saved);
+      else this.tailer.start();
       const r = await waitForReady(this.tmux, this.name, {
         timeoutMs: o.readyTimeoutMs,
         onPrompt: (label) => this.log.info(`startup prompt handled: ${label}`),
@@ -172,6 +184,7 @@ export class ClaudeTmuxSession implements AgentSession {
       }
       if (r.status === "ready") this.setIdle();
       else this.log.warn("claude needs login; waiting for operator");
+      if (saved) this.tailer.start();
     }
     this.schedulePoll(0);
   }
@@ -189,7 +202,19 @@ export class ClaudeTmuxSession implements AgentSession {
   detach() {
     this.closed = true;
     this.stopAll();
+    const pos = this.tailer.position();
+    if (pos && this.init.tailStateFile) {
+      try { writeFileSync(this.init.tailStateFile, JSON.stringify(pos)); } catch (e) { this.log.warn("could not save jsonl position", { e: String(e) }); }
+    }
     this.events.end();
+  }
+
+  private takeTailState(): { path: string; pos: number } | undefined {
+    const f = this.init.tailStateFile;
+    if (!f || !existsSync(f)) return undefined;
+    try { return JSON.parse(readFileSync(f, "utf8")) as { path: string; pos: number }; }
+    catch { return undefined; }
+    finally { try { rmSync(f); } catch {} }
   }
 
   async alive(): Promise<boolean> {

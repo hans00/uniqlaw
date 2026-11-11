@@ -65,6 +65,9 @@ export class McpGateway {
 
   get port() { return this.server?.port; }
 
+  /** The session a gateway token belongs to (proof that a caller runs as that session, e.g. `uniqlaw restart`). */
+  sessionForToken(token: string): string | undefined { return this.tokens.get(token); }
+
   /** Stable per-channel token (kept across restarts when a state file is set). */
   endpointFor(channelKey: string) {
     if (!this.server) return undefined;

@@ -43,6 +43,8 @@ export interface SchedulerApi {
   memory?: MemoryStore;
   /** Leave a note for every open chat session (delivered with its next turn). */
   noteToOpenChats?(label: string, text: string): number;
+  /** Set when this start follows a recorded restart / reload / stop (the previous process's restart record). */
+  lastRestart?: { kind: "restart" | "reload" | "stop"; stoppedAt: number };
 }
 
 /** A tool a plugin contributes to the MCP Gateway. `caller` is the calling session (from its token). */

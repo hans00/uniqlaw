@@ -1,0 +1,159 @@
+// `uniqlaw restart` end to end on a real process (isolated temp project, fake provider/platform): the daemon
+// drains, writes its record, starts a new process and exits; the new one comes up on the same project.
+import { afterAll, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { isAlive } from "../src/instance.ts";
+import { restartMode } from "../src/run.ts";
+
+const FIX = join(import.meta.dir, "fixtures");
+const CLI = join(import.meta.dir, "..", "..", "cli", "src", "main.ts");
+const xdg = mkdtempSync(join(tmpdir(), "uq-restart-xdg-"));
+const dirs: string[] = [];
+const pids = new Set<number>();
+afterAll(() => {
+  // Re-exec'd daemons are not our children: also kill whatever each project's runtime.json names.
+  for (const d of dirs) { const pid = runtime(d)?.pid; if (pid) pids.add(pid); }
+  for (const pid of pids) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  for (const d of [...dirs, xdg]) rmSync(d, { recursive: true, force: true });
+});
+
+function project(token: string) {
+  const dir = mkdtempSync(join(tmpdir(), "uq-restart-"));
+  dirs.push(dir);
+  mkdirSync(join(dir, ".uniqlaw"), { recursive: true });
+  writeFileSync(join(dir, ".uniqlaw", "settings.json"), JSON.stringify({
+    profiles: { main: { provider: "fake" } }, web: { port: 0 },
+    plugins: { fake: { module: join(FIX, "fake-provider.ts") }, tg: { module: join(FIX, "fake-platform.ts"), token },
+      "flaky-start": { module: join(FIX, "flaky-start.ts") } } }));
+  return dir;
+}
+const runtime = (dir: string) => { try { return JSON.parse(readFileSync(join(dir, ".uniqlaw", "runtime.json"), "utf8")) as { pid: number; webPort: number }; } catch { return undefined; } };
+const waitFor = async (c: () => boolean, ms = 15_000, what = "condition") => { const e = Date.now() + ms; while (!c()) { if (Date.now() > e) throw new Error(`timeout: ${what}`); await Bun.sleep(50); } };
+const env = (extra: Record<string, string> = {}) => {
+  const e: Record<string, string | undefined> = { ...process.env, XDG_STATE_HOME: xdg, UNIQLAW_SESSION: "", ...extra };
+  if (!extra.INVOCATION_ID) { delete e.INVOCATION_ID; delete e.NOTIFY_SOCKET; } // not under systemd here
+  return e;
+};
+async function cli(dir: string, ...args: string[]) {
+  const p = Bun.spawn([process.execPath, CLI, ...args, "--project", dir], { env: env(), stdout: "pipe", stderr: "pipe" });
+  const [out, err] = [await new Response(p.stdout).text(), await new Response(p.stderr).text()];
+  return { code: await p.exited, out: out + err };
+}
+function run(dir: string, extra: Record<string, string> = {}) {
+  const child = Bun.spawn([process.execPath, CLI, "run", "--project", dir], { env: env(extra), stdout: "ignore", stderr: "pipe" });
+  pids.add(child.pid);
+  const out = { stderr: "" };
+  void (async () => { for await (const c of child.stderr) out.stderr += new TextDecoder().decode(c); })();
+  return Object.assign(child, { out });
+}
+
+test("restart: drains, starts a new process on the same project, exits; --in schedules one; status shows it", async () => {
+  const dir = project("restart-tok-1");
+  const child = run(dir);
+  await waitFor(() => runtime(dir)?.pid === child.pid, 15_000, "first start");
+
+  const r = await cli(dir, "restart", "--reason", "test", "--from", "cli-test");
+  expect(r.code).toBe(0);
+  expect(r.out).toContain("restart");
+  expect(await child.exited).toBe(0);
+  await waitFor(() => !!runtime(dir) && runtime(dir)!.pid !== child.pid && isAlive(runtime(dir)!.pid), 15_000, "new process");
+  const second = runtime(dir)!.pid;
+  pids.add(second);
+  // The new process takes over only after the old one acked it as up.
+  await waitFor(() => readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8").includes("back from restart"), 10_000, "resume");
+  expect(readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8")).toContain("restart record written");
+
+  // Scheduled: --in 2s shows up in status, then fires.
+  const s = await cli(dir, "restart", "--in", "2s");
+  expect(s.out).toContain("scheduled (at ");
+  expect((await cli(dir, "status")).out).toContain("restart scheduled at");
+  await waitFor(() => !isAlive(second), 15_000, "scheduled restart");
+  await waitFor(() => !!runtime(dir) && runtime(dir)!.pid !== second && isAlive(runtime(dir)!.pid), 15_000, "third process");
+  pids.add(runtime(dir)!.pid);
+  // Invalid settings: refused, the daemon keeps running.
+  writeFileSync(join(dir, ".uniqlaw", "settings.json"), "{ nope");
+  const bad = await cli(dir, "restart");
+  expect(bad.code).toBe(1);
+  expect(bad.out).toContain("refused");
+  expect(isAlive(runtime(dir)!.pid)).toBe(true);
+}, 60_000);
+
+test("UNIQLAW_RESTART_MODE=exit leaves the restart to a supervisor (exit 75)", async () => {
+  const dir = project("restart-tok-2");
+  const child = run(dir, { UNIQLAW_RESTART_MODE: "exit" });
+  await waitFor(() => runtime(dir)?.pid === child.pid, 15_000, "start");
+  const r = await fetch(`http://127.0.0.1:${runtime(dir)!.webPort}/api/restart`, { method: "POST", body: JSON.stringify({ reason: "supervised" }) });
+  expect(((await r.json()) as { ok: boolean }).ok).toBe(true);
+  expect(await child.exited).toBe(75);
+  expect(runtime(dir)).toBeUndefined(); // released: the supervisor's new process can take the project
+}, 30_000);
+
+test("a new process that fails to start: the old one starts again in-process, never exits 0, and says so", async () => {
+  const dir = project("restart-tok-3");
+  const child = run(dir);
+  await waitFor(() => runtime(dir)?.pid === child.pid, 15_000, "start");
+  writeFileSync(join(dir, ".fail-next-start"), "");
+  const r = await fetch(`http://127.0.0.1:${runtime(dir)!.webPort}/api/restart`, { method: "POST", body: JSON.stringify({ reason: "will fail" }) });
+  expect(((await r.json()) as { ok: boolean }).ok).toBe(true);
+  await waitFor(() => child.out.stderr.includes("running again on the previous code"), 30_000, "fallback");
+  expect(child.out.stderr).toContain("RESTART FAILED: the new process exited with code 1");
+  expect(child.exitCode).toBeNull();
+  expect(runtime(dir)!.pid).toBe(child.pid);
+  const log = readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8");
+  expect(log).toContain("back from restart");
+  const st = await (await fetch(`http://127.0.0.1:${runtime(dir)!.webPort}/api/status`)).json() as { ok: boolean };
+  expect(st.ok).toBe(true);
+}, 60_000);
+
+test("restart mode: only a service systemd started directly exits for its supervisor; everything else spawns", () => {
+  const svc = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/uniqlaw.service\n";
+  const term = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-1.scope\n";
+  const sys = "0::/system.slice/uniqlaw.service\n";
+  // Started by systemd itself (pid 1) as a service: exit for the supervisor.
+  expect(restartMode({ INVOCATION_ID: "x" }, sys, 1)).toBe("exit");
+  expect(restartMode({ NOTIFY_SOCKET: "/run/x" }, sys, 1)).toBe("exit");
+  // Any other .service cgroup (a cron.service job, a CI runner, the user manager's units): spawn — exit mode
+  // there could leave nothing running (Restart=no, or not our unit at all).
+  expect(restartMode({ INVOCATION_ID: "x" }, sys, 4242)).toBe("spawn");
+  expect(restartMode({ INVOCATION_ID: "x" }, svc, 4242)).toBe("spawn");
+  expect(restartMode({ INVOCATION_ID: "x" }, term, 1)).toBe("spawn");
+  expect(restartMode({}, sys, 1)).toBe("spawn");
+  expect(restartMode({ INVOCATION_ID: "x", UNIQLAW_RESTART_MODE: "spawn" }, sys, 1)).toBe("spawn");
+  expect(restartMode({ UNIQLAW_RESTART_MODE: "exit" }, term, 4242)).toBe("exit");
+});
+
+const stdoutLog = (dir: string) => { try { return readFileSync(join(dir, ".uniqlaw", "logs", "stdout.log"), "utf8"); } catch { return ""; } };
+const daemonLog = (dir: string) => readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8");
+
+test("a new process that never comes up is killed and reaped before the old one starts again (not left with nothing)", async () => {
+  const dir = project("restart-tok-4");
+  const child = run(dir, { UNIQLAW_RESTART_READY_MS: "1500", UNIQLAW_RESTART_KILL_GRACE_MS: "1000" });
+  await waitFor(() => runtime(dir)?.pid === child.pid, 15_000, "start");
+  writeFileSync(join(dir, ".hang-next-start"), "");
+  await fetch(`http://127.0.0.1:${runtime(dir)!.webPort}/api/restart`, { method: "POST", body: JSON.stringify({ reason: "will hang" }) });
+  await waitFor(() => child.out.stderr.includes("running again on the previous code") || child.exitCode !== null, 30_000, "fallback");
+  expect(child.out.stderr).toContain("RESTART FAILED: the new process was not up after 1.5s");
+  expect(child.out.stderr).toContain("running again on the previous code");
+  expect(child.exitCode).toBeNull();
+  expect(runtime(dir)!.pid).toBe(child.pid);
+  expect(stdoutLog(dir)).toContain("SIGTERM during start"); // the hung child had its handler, then got SIGKILL
+  await waitFor(() => daemonLog(dir).includes("back from restart"), 5000, "resume");
+  expect(daemonLog(dir)).toMatch(/back from restart.*restart FAILED|back from restart.*fallback/);
+}, 60_000);
+
+test("a new process that comes up too late honours SIGTERM after its start and takes nothing over", async () => {
+  const dir = project("restart-tok-5");
+  const child = run(dir, { UNIQLAW_RESTART_READY_MS: "1000", UNIQLAW_RESTART_KILL_GRACE_MS: "10000" });
+  await waitFor(() => runtime(dir)?.pid === child.pid, 15_000, "start");
+  writeFileSync(join(dir, ".slow-next-start"), "2500");
+  await fetch(`http://127.0.0.1:${runtime(dir)!.webPort}/api/restart`, { method: "POST", body: JSON.stringify({ reason: "too slow" }) });
+  await waitFor(() => child.out.stderr.includes("running again on the previous code") || child.exitCode !== null, 30_000, "fallback");
+  expect(child.out.stderr).toContain("RESTART FAILED: the new process was not up after 1s");
+  expect(stdoutLog(dir)).toContain("SIGTERM during start: stopping once the start has finished");
+  expect(daemonLog(dir)).toContain("not taking over from the previous process");
+  // The record was left for the old process, which reports the failed restart.
+  await waitFor(() => /back from restart.*fallback/.test(daemonLog(dir)), 5000, "resume with the record");
+  expect(runtime(dir)!.pid).toBe(child.pid);
+}, 60_000);

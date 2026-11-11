@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
 import {
@@ -96,6 +96,7 @@ export class ClaudeTmuxProvider implements AgentProvider {
       return argv;
     };
     const launchFile = join(dir, "launch.sha");
+    const tailStateFile = join(dir, "tail.json");
     const spawn = async (resume: boolean) => {
       const argv = launchArgs(resume);
       await tmux.newSession(name, { cwd: spec.cwd, env, argv, width: this.cfg.width, height: this.cfg.height });
@@ -116,7 +117,7 @@ export class ClaudeTmuxProvider implements AgentProvider {
         await spawn(!!locateJsonl(providerSessionId, env));
       };
       const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings,
-        respawn, readyTimeoutMs: this.cfg.readyTimeoutMs }, "end");
+        respawn, readyTimeoutMs: this.cfg.readyTimeoutMs, tailStateFile }, "end");
       await s.start({ reattach: true, staleLaunch: stale });
       this.sessions.set(spec.sessionId, s);
       return s;
@@ -130,7 +131,10 @@ export class ClaudeTmuxProvider implements AgentProvider {
 
     log.info("spawning claude", { name, resume: !!existing, providerSessionId });
     await spawn(!!existing);
-    const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings },
+    // A fresh session id: an old position means nothing. --resume (claude exited while the daemon was down) keeps
+    // appending to the same jsonl, so the saved position still applies.
+    if (!existing) rmSync(tailStateFile, { force: true });
+    const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings, tailStateFile },
       existing ? "end" : "start");
     await s.start({ reattach: false, readyTimeoutMs: this.cfg.readyTimeoutMs });
     this.sessions.set(spec.sessionId, s);

@@ -34,8 +34,8 @@ export const TOOL_GROUPS: Record<ToolGroup, ToolGroupDef> = {
   xsession: { mcp: ["agents_list", "agent_ask", "agent_trigger", "task_status"], claude: ["SendToProject", "SendToProjectContext", "ListAgents", "SendMessage"] },
   // Reaching people outside this chat: other chats, push notifications, published pages.
   notify: { mcp: ["notify"], claude: ["PushNotification", "Artifact", "ArtifactData", "ArtifactComments", "DesignSync", "SendFeedback"] },
-  // Reserved for tools that change UniQlaw's own settings; none exist yet.
-  config: { mcp: [], claude: [] },
+  // Tools that change or restart UniQlaw itself (daemon_restart: also limited to the operator's own chat).
+  config: { mcp: ["daemon_restart"], claude: [] },
 };
 
 /** Groups that let a restricted chat reach an unrestricted session or UniQlaw's own config (a cron job in its own

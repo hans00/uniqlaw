@@ -134,3 +134,47 @@ test("tailFile reads only the end", () => {
   expect(tailFile(f, 3)).toEqual(["line 49997", "line 49998", "line 49999"]);
   expect(tailFile(join(dir, "missing"), 3)).toEqual([]);
 });
+
+test("restart API: a session is only trusted as the requester with proof (its gateway token, or web.token)", async () => {
+  const dir = project();
+  const d = await startDaemon(dir, { onRestart: () => false });
+  cleanups.push(() => d.stop());
+  const base = `http://127.0.0.1:${d.webPort}`;
+  await sendHi();
+  await until(() => !!d.manager.runtimes.get("tg:100") && d.manager.runtimes.get("tg:100")!.state !== "opening");
+  const { readFileSync } = await import("node:fs");
+  const tok = (JSON.parse(readFileSync(join(dir, ".uniqlaw", "gateway.json"), "utf8")) as { tokens: Record<string, string> }).tokens["tg:100"]!;
+  const ask = async (body: Record<string, unknown>) => {
+    const r = await (await fetch(`${base}/api/restart`, { method: "POST", body: JSON.stringify({ in: "10m", ...body }) })).json() as { requestedBy: string[] };
+    await fetch(`${base}/api/restart`, { method: "POST", body: JSON.stringify({ cancel: true }) });
+    return r.requestedBy;
+  };
+  expect(await ask({ from: "tg:100" })).toEqual(["api"]);                         // a claim alone: ignored
+  expect(await ask({ from: "tg:100", fromToken: "nope" })).toEqual(["api"]);
+  expect(await ask({ fromLabel: "tg:100" })).toEqual(["api"]);
+  expect(await ask({ from: "tg:100", fromToken: tok })).toEqual(["tg:100"]);       // proven
+  expect(await ask({ from: "cli" })).toEqual(["cli"]);                             // not a session: a plain label
+});
+
+test("a start takes nothing over from the previous process before runtime.json is written and beforeResume agrees", async () => {
+  const dir = project();
+  const { StateStore, RECORD_KEY } = await import("@uniqlaw/core");
+  const { existsSync, readFileSync } = await import("node:fs");
+  const seed = new StateStore(join(dir, ".uniqlaw", "state.db"));
+  seed.set(RECORD_KEY, JSON.stringify({ id: "r", kind: "restart", requestedBy: ["cli"], reasons: [], requestedAt: 0, stoppedAt: 0, targets: {},
+    interrupted: [], deferred: 1, openTasks: [] }));
+  seed.pushDeferred("tg:100", { origin: { kind: "human", platform: "tg", channelKey: "tg:100", sender: { id: "7", name: "Hans" }, replyTarget: { platform: "tg", chatId: "100" },
+    ref: { platform: "tg", chatId: "100", messageId: "1" }, trusted: true }, item: { text: "held", receivedAt: 0, sourceLine: "[x]" }, attachments: [] });
+  seed.close();
+  let release!: (go: boolean) => void;
+  const gate = new Promise<boolean>((r) => { release = r; });
+  const starting = startDaemon(dir, { onRestart: () => false, beforeResume: () => gate });
+  await until(() => existsSync(join(dir, ".uniqlaw", "runtime.json")), 5000);
+  const peek = () => { const st = new StateStore(join(dir, ".uniqlaw", "state.db")); try { return { record: !!st.get(RECORD_KEY), deferred: st.listDeferred().length }; } finally { st.close(); } };
+  expect(peek()).toEqual({ record: true, deferred: 1 });   // up, but nothing consumed yet
+  release(false);                                            // abandoned (the parent gave up on us)
+  const d = await starting;
+  cleanups.push(() => d.stop());
+  expect(peek()).toEqual({ record: true, deferred: 1 });   // still there for the process that takes over
+  expect(JSON.parse(readFileSync(join(dir, ".uniqlaw", "runtime.json"), "utf8")).pid).toBe(process.pid);
+});

@@ -2,13 +2,15 @@
 // non-loopback bind. /api/send and /api/trigger stay v2-compatible.
 import { existsSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
-import type { ChannelManager, Logger, RuntimeEvent, StateStore } from "@uniqlaw/core";
+import { parseWhen, type ChannelManager, type Logger, type RestartCoordinator, type RestartKind, type RuntimeEvent, type StateStore } from "@uniqlaw/core";
 import { loadJobs, nextMatch } from "@uniqlaw/scheduler";
 
 export interface ApiOptions {
-  /** Throws if the on-disk settings are invalid (checked before a reload is accepted). */
-  validateSettings?: () => void;
   manager: ChannelManager;
+  /** Graceful restart / reload (POST /api/restart, /api/reload). */
+  restart?: RestartCoordinator;
+  /** Gateway token → session (lets a caller prove it speaks for a session without web.token). */
+  sessionForToken?: (token: string) => string | undefined;
   store: StateStore;
   host: string;
   port: number;
@@ -72,6 +74,18 @@ export function startApi(o: ApiOptions) {
   manager.events.on("event", onEvent);
   const keepAlive = setInterval(() => { for (const c of sseClients) { try { c.enqueue(enc.encode(": ping\n\n")); } catch { sseClients.delete(c); } } }, 20_000);
 
+  /** Who asked for a restart. Naming a session (it gets the notice turn, routed to its chat) needs proof: web.token
+   *  was presented, or the session's own gateway token (0600 in .uniqlaw/gateway.json, which the CLI reads). Any
+   *  other caller of a tokenless loopback API is just "api". Labels that aren't sessions (cli, …) are kept. */
+  const requesterOf = (b: { from?: string; fromLabel?: string; fromToken?: string }): string => {
+    const name = (b.from || b.fromLabel || "").trim();
+    if (!name) return "api";
+    const isSession = !!store.getSession(name) || manager.runtimes.has(name);
+    if (!isSession) return /^[\w.:@-]{1,64}$/.test(name) && name !== "api" ? name : "api";
+    if (o.token) return name; // authorized() already checked it on this request
+    return b.fromToken && o.sessionForToken?.(b.fromToken) === name ? name : "api";
+  };
+
   const agentsDetail = () => manager.listAgents().map((a) => {
     const row = store.getSession(a.name);
     return { ...a, providerSessionId: row?.providerSessionId ?? null, lastTarget: row?.lastTarget ? JSON.parse(row.lastTarget) : null,
@@ -98,7 +112,7 @@ export function startApi(o: ApiOptions) {
           if (!path.startsWith("/api/")) return json({ ok: false, error: "not found" }, 404);
           if (!authorized(req)) return json({ ok: false, error: "unauthorized" }, 401);
 
-          if (req.method === "GET" && path === "/api/status") return json({ ok: true, version: o.version, agents: manager.listAgents() });
+          if (req.method === "GET" && path === "/api/status") return json({ ok: true, version: o.version, agents: manager.listAgents(), restart: o.restart?.status() ?? { pending: false } });
           if (req.method === "GET" && path === "/api/agents") return json({ ok: true, agents: agentsDetail() });
           if (req.method === "GET" && path === "/api/jobs") {
             const jobs = loadJobs(o.jobsDir).map((j) => ({ name: j.name, schedule: j.schedule, recurring: j.recurring, target: j.target,
@@ -136,13 +150,24 @@ export function startApi(o: ApiOptions) {
               return json({ ok: true });
             }
           }
-          if (req.method === "POST" && path === "/api/reload") {
-            // Handled by runForever's SIGHUP handler (validates settings, then restarts in-process).
-            try { o.validateSettings?.(); } catch (e) {
-              return json({ ok: false, error: `settings rejected, keeping the running config: ${e instanceof Error ? e.message : String(e)}` }, 400);
+          if (req.method === "GET" && path === "/api/restart") return json({ ok: true, ...(o.restart?.status() ?? { pending: false }) });
+          if (req.method === "POST" && (path === "/api/reload" || path === "/api/restart")) {
+            // Graceful: returns at once; running turns finish (restart.drainTimeoutSec), new input waits and is
+            // replayed, then runForever reloads in-process (reload) or starts a new process (restart).
+            if (!o.restart) return json({ ok: false, error: "restart is not available in this daemon" }, 400);
+            const b = (await req.json().catch(() => ({}))) as { kind?: RestartKind; reason?: string; in?: string; at?: string; now?: boolean;
+              cancel?: boolean; from?: string; fromLabel?: string; fromToken?: string; drainTimeoutSec?: number };
+            if (b.cancel) return json({ ok: true, ...(await o.restart.cancel()) });
+            const kind: RestartKind = path === "/api/reload" ? "reload" : b.kind === "reload" ? "reload" : "restart";
+            let st;
+            try {
+              const at = parseWhen({ in: b.in, at: b.at }, o.timezone);
+              st = o.restart.request({ kind, requestedBy: requesterOf(b), ...(b.reason ? { reason: b.reason } : {}), now: !!b.now,
+                ...(at ? { at } : {}), ...(typeof b.drainTimeoutSec === "number" ? { drainTimeoutSec: b.drainTimeoutSec } : {}) });
+            } catch (e) {
+              return json({ ok: false, error: `${kind} rejected, keeping the running daemon: ${e instanceof Error ? e.message : String(e)}` }, 400);
             }
-            setTimeout(() => process.kill(process.pid, "SIGHUP"), 10);
-            return json({ ok: true, reloading: true });
+            return json({ ok: true, ...(kind === "reload" ? { reloading: true } : { restarting: true }), ...st });
           }
           if (req.method === "POST" && path === "/api/send") {
             const b = (await req.json()) as { target?: string; text?: string; fromLabel?: string };

@@ -4,7 +4,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { A2A_DENIED_GROUPS, ChannelManager, a2aSessionDir, StateStore, a2aPermissions, parseSettings, silentLogger, type SessionContext } from "../src/index.ts";
+import { A2A_DENIED_GROUPS, A2A_DENIED_MCP_TOOLS, A2A_TOOL_POLICY, TOOL_GROUPS, mcpToolAllowed, ChannelManager, a2aSessionDir, StateStore, a2aPermissions, parseSettings, silentLogger, type SessionContext } from "../src/index.ts";
 import { CAPS, FakePlatform, FakeProvider } from "./fakes.ts";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -94,4 +94,15 @@ test("session directory: 0700, and a pre-created world-writable one (shared temp
   mkdirSync(join(base, "uniqlaw-a2a-i2"));
   chmodSync(join(base, "uniqlaw-a2a-i2"), 0o777); // planted by another user
   expect(() => a2aSessionDir("i2", "a2a:main:alice:c", base)).toThrow(/refusing A2A session directory/);
+});
+
+test("daemon_restart sits in the config tool group, which inbound A2A sessions never get", () => {
+  expect(TOOL_GROUPS.config.mcp).toContain("daemon_restart");
+  expect(A2A_DENIED_GROUPS).toContain("config");
+  expect(A2A_DENIED_MCP_TOOLS.has("daemon_restart")).toBe(true);
+  expect(mcpToolAllowed(A2A_TOOL_POLICY, "daemon_restart")).toBe(false);
+  // A restricted chat needs the group explicitly.
+  expect(mcpToolAllowed({ mode: "allow", groups: ["chat", "memory"] }, "daemon_restart")).toBe(false);
+  expect(mcpToolAllowed({ mode: "deny", groups: ["config"] }, "daemon_restart")).toBe(false);
+  expect(mcpToolAllowed({ mode: "allow", groups: ["config"] }, "daemon_restart")).toBe(true);
 });

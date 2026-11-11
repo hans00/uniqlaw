@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// uniqlaw CLI: init | doctor | start | stop | reload | status | logs | ls | send | trigger | workers | worker | attach | run | mcp-shim
+// uniqlaw CLI: init | doctor | start | stop | reload | restart | status | logs | ls | send | trigger | workers | worker | attach | run | mcp-shim
 import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { findProjectDir } from "./project.ts";
@@ -14,7 +14,13 @@ const USAGE = `uniqlaw <command> [options]
   run      [--project DIR]                     run the daemon in the foreground
   start    [--project DIR]                     start the daemon in the background
   stop     [--project DIR]                     stop the daemon
-  reload   [--project DIR]                     re-read settings.json (rejected if invalid; old config keeps running)
+  reload   [--project DIR] [--reason R] [--now] re-read settings.json, gracefully (rejected if invalid; old config keeps running)
+  restart  [--project DIR] [--reason R] [--in DUR | --at TIME] [--now] [--cancel]
+                                               restart the daemon process (new code + settings), gracefully: returns at once,
+                                               running turns finish first (restart.drainTimeoutSec), new messages wait and
+                                               are replayed; the asking session gets a notice when it is back.
+                                               --in 90s|10m|1h30m, --at HH:MM|ISO; --now: don't wait for running turns;
+                                               --from SESSION names the asking session (default: $UNIQLAW_SESSION)
   status   [--project DIR]                     show daemon + session status
   ls                                           list UniQlaw instances on this machine
   send     <target> <text...> [--project DIR]  post text to a chat (e.g. telegram:<chatId>)
@@ -30,7 +36,7 @@ const USAGE = `uniqlaw <command> [options]
   mcp-shim                                     stdio⇄HTTP MCP bridge to the gateway (env UNIQLAW_MCP_URL, UNIQLAW_TOKEN)
 `;
 
-const BOOL_FLAGS = new Set(["dry-run", "forget", "force", "json", "yes", "no-web", "heartbeat", "allow-empty", "telegram", "discord", "slack", "line"]);
+const BOOL_FLAGS = new Set(["now", "cancel", "graceful", "dry-run", "forget", "force", "json", "yes", "no-web", "heartbeat", "allow-empty", "telegram", "discord", "slack", "line"]);
 
 function parse(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
@@ -123,16 +129,33 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
       await runForever(projectDir, { logToStderr: true });
       return;
     }
-    case "reload": {
-      // /api/reload is fire-and-forget (the daemon validates after replying), so validate here
-      // first and report a broken settings.json instead of silently keeping the old config.
-      try { loadSettings(projectDir); } catch (e) {
-        console.error(`reload refused — settings.json is invalid, the running config is unchanged:\n${e instanceof Error ? e.message : String(e)}`);
-        process.exit(1);
+    case "reload":
+    case "restart": {
+      // Validate here too and report a broken settings.json instead of silently keeping the old config.
+      // The request returns at once: an agent running this in its own turn must be able to finish that turn.
+      if (!flags.cancel) {
+        try { loadSettings(projectDir); } catch (e) {
+          console.error(`${cmd} refused — settings.json is invalid, the running daemon is unchanged:\n${e instanceof Error ? e.message : String(e)}`);
+          process.exit(1);
+        }
       }
-      const r = await api(projectDir, "/api/reload", {});
-      console.log(JSON.stringify(r));
-      if (r.ok === false) process.exit(1);
+      if (cmd === "reload" && (flags.in || flags.at)) throw new Error("--in / --at are for restart; reload runs right away");
+      const from = typeof flags.from === "string" ? flags.from : process.env.UNIQLAW_SESSION || "cli";
+      // Proof that we speak for that session (the daemon only trusts a session name with it or web.token): its
+      // gateway token, readable only by the daemon's user.
+      let fromToken: string | undefined;
+      try { fromToken = (JSON.parse(readFileSync(join(stateDirOf(projectDir), "gateway.json"), "utf8")) as { tokens?: Record<string, string> }).tokens?.[from]; } catch {}
+      const r = await api(projectDir, `/api/${cmd}`, {
+        ...(flags.cancel ? { cancel: true } : {}), from, ...(fromToken ? { fromToken } : {}),
+        ...(typeof flags.reason === "string" ? { reason: flags.reason } : {}), ...(flags.now ? { now: true } : {}),
+        ...(typeof flags.in === "string" ? { in: flags.in } : {}), ...(typeof flags.at === "string" ? { at: flags.at } : {}),
+      });
+      if (r.ok === false) { console.error(String(r.error)); process.exit(1); }
+      if (flags.json) { console.log(JSON.stringify(r)); return; }
+      if (flags.cancel) { console.log(r.canceled ? `canceled; ${r.replayed} held message(s) released` : "nothing pending"); return; }
+      const when = typeof r.fireAt === "number" && r.fireAt > Date.now() + 1000 ? `at ${new Date(r.fireAt).toLocaleString()}` : "now";
+      console.log(`${r.kind} ${r.phase === "draining" ? "in progress" : "scheduled"} (${when}), requested by ${(r.requestedBy as string[]).join(", ")}. `
+        + (flags.now ? "Running turns are not waited for." : "Running turns finish first; new messages wait and are replayed after it."));
       return;
     }
     case "start": {
@@ -168,6 +191,12 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
       const s = await api(projectDir, "/api/status");
       const tp = Object.entries(rt.transportPorts ?? {}).map(([k, v]) => ` · ${k} :${v}`).join("");
       console.log(`UniQlaw ${s.version} · pid ${rt.pid} · instance ${rt.instanceId} · api :${rt.webPort} · mcp :${rt.gatewayPort}${tp}`);
+      const rs = s.restart as { pending: boolean; phase?: string; kind?: string; fireAt?: number; requestedBy?: string[]; inflight?: string[]; deferred?: number } | undefined;
+      if (rs?.pending) {
+        console.log(rs.phase === "draining"
+          ? `  ${rs.kind} draining: waiting for ${rs.inflight?.join(", ") || "nothing"} · ${rs.deferred ?? 0} message(s) held`
+          : `  ${rs.kind} scheduled at ${new Date(rs.fireAt!).toLocaleString()} (requested by ${rs.requestedBy?.join(", ")})`);
+      }
       for (const a of (s.agents as { name: string; profile: string; provider: string; state: string; queue: number; lastActivityAt: number }[])) {
         console.log(`  ${a.name.padEnd(28)} ${a.profile}/${a.provider}  ${a.state}${a.queue ? ` (+${a.queue} queued)` : ""}  ${a.lastActivityAt ? new Date(a.lastActivityAt).toLocaleString() : ""}`);
       }

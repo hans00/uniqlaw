@@ -18,3 +18,4 @@ export * from "./dreaming.ts";
 export * from "./pairing.ts";
 export * from "./channel-policy.ts";
 export * from "./a2a-policy.ts";
+export * from "./restart.ts";
