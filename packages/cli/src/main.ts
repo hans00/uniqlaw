@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { findProjectDir } from "./project.ts";
 import { isAlive, listInstances, loadSettings, readRuntime, runForever, stateDirOf } from "@uniqlaw/daemon";
 import { resolveSecret, type DreamReport, type SecretRef } from "@uniqlaw/core";
+import { PLATFORM_SECRETS, PLATFORMS } from "./init.ts";
 
 const USAGE = `uniqlaw <command> [options]
 
@@ -36,13 +37,56 @@ const USAGE = `uniqlaw <command> [options]
   mcp-shim                                     stdio⇄HTTP MCP bridge to the gateway (env UNIQLAW_MCP_URL, UNIQLAW_TOKEN)
 `;
 
-const BOOL_FLAGS = new Set(["now", "cancel", "graceful", "dry-run", "forget", "force", "json", "yes", "no-web", "heartbeat", "allow-empty", "telegram", "discord", "slack", "line"]);
+const BOOL_FLAGS = new Set(["help", "now", "cancel", "graceful", "dry-run", "forget", "force", "json", "yes", "no-web", "heartbeat", "allow-empty", "telegram", "discord", "slack", "line"]);
 
-function parse(argv: string[]) {
+const INIT_HELP = `uniqlaw init [--project DIR] [--force]                       interactive setup wizard
+uniqlaw init --yes [options]                                   non-interactive (for scripts)
+
+  --provider claude-tmux|claude-sdk|codex|opencode|agy|pi   --model M
+  --credential KIND   (+ --key REF --base-url U --region R --aws-profile P --gcp-project P
+                       --location L --service-account FILE --endpoint U --deployment D)
+  --<platform>        enable telegram|discord|slack|line with default env var names
+  --<platform>-users ID,ID            allowlist (required unless --allow-empty)
+  --telegram-token REF  --discord-token REF  --slack-bot-token REF  --slack-app-token REF
+  --line-channel-access-token REF  --line-channel-secret REF
+  --no-web  --heartbeat  --force
+
+REF = ENV_VAR | env:VAR | file:/path | cmd:<command>. Secrets are never stored inline.
+An empty platform allowlist is refused unless --allow-empty is given.`;
+
+/** The --flags each command accepts (--help and --project are accepted everywhere). Anything else is an error:
+ *  a typo must not be silently ignored by a command that changes things. */
+const COMMAND_FLAGS: Record<string, string[]> = {
+  init: ["yes", "force", "provider", "model", "credential", "key", "base-url", "region", "aws-profile", "gcp-project",
+    "location", "service-account", "endpoint", "deployment", "allow-empty", "no-web", "heartbeat",
+    ...PLATFORMS.flatMap((p) => [p, `${p}-users`, ...Object.keys(PLATFORM_SECRETS[p]).map((k) => `${p}-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`)])],
+  doctor: [], logs: ["lines"], run: [], start: [], stop: [],
+  reload: ["reason", "now", "cancel", "from", "json", "in", "at", "graceful"],
+  restart: ["reason", "now", "cancel", "from", "json", "in", "at", "graceful"],
+  status: [], ls: [], send: [], trigger: [], pairing: [], workers: [],
+  worker: ["profile", "cwd", "forget"], attach: [], release: [], dream: ["dry-run", "json"], "mcp-shim": [],
+};
+
+/** A command's lines from USAGE (with its continuation lines), or init's own longer help. */
+export function usageFor(cmd: string): string {
+  if (cmd === "init") return INIT_HELP;
+  const lines = USAGE.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i]!.startsWith(`  ${cmd} `)) continue;
+    out.push(`uniqlaw ${lines[i]!.slice(2)}`);
+    while (i + 1 < lines.length && /^ {20,}\S/.test(lines[i + 1]!)) out.push(lines[++i]!);
+  }
+  return out.length ? out.join("\n") : USAGE;
+}
+
+/** Argument parsing. Everything after a bare `--` is positional (to send text that looks like a flag). */
+export function parse(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
   const pos: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
+    if (a === "--") { pos.push(...argv.slice(i + 1)); break; }
     if (a.startsWith("--")) {
       const k = a.slice(2);
       const next = argv[i + 1];
@@ -51,6 +95,12 @@ function parse(argv: string[]) {
     } else pos.push(a);
   }
   return { flags, pos };
+}
+
+/** `--help` / `-h` anywhere before a bare `--`. Checked before anything else runs. */
+export function wantsHelp(args: string[]): boolean {
+  const dd = args.indexOf("--");
+  return (dd < 0 ? args : args.slice(0, dd)).some((a) => a === "--help" || a === "-h");
 }
 
 async function api(projectDir: string, path: string, body?: unknown) {
@@ -68,28 +118,25 @@ async function api(projectDir: string, path: string, body?: unknown) {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
+  // Help first: no daemon contact, no file writes, no side effects of any kind.
+  if (cmd === undefined || cmd === "help" || cmd === "--help" || cmd === "-h") {
+    const topic = cmd === "help" ? rest[0] : undefined;
+    console.log(topic && topic in COMMAND_FLAGS ? usageFor(topic) : USAGE);
+    return;
+  }
+  if (!(cmd in COMMAND_FLAGS)) { console.error(`unknown command "${cmd}"\n\n${USAGE}`); process.exit(1); }
+  if (wantsHelp(rest)) { console.log(usageFor(cmd)); return; }
   const { flags, pos } = parse(rest);
+  const allowed = new Set(["project", ...COMMAND_FLAGS[cmd]!]);
+  const unknown = Object.keys(flags).filter((k) => !allowed.has(k));
+  if (unknown.length) {
+    console.error(`unknown option${unknown.length > 1 ? "s" : ""} ${unknown.map((k) => `--${k}`).join(", ")} for \`uniqlaw ${cmd}\`\n\n${usageFor(cmd)}`);
+    process.exit(2);
+  }
   const projectDir = flags.project !== undefined ? resolve(String(flags.project)) : cmd === "init" ? process.cwd() : findProjectDir(process.cwd());
 
   switch (cmd) {
     case "init": {
-      if (flags.help || flags.h) {
-        console.log(`uniqlaw init [--project DIR] [--force]                       interactive setup wizard
-uniqlaw init --yes [options]                                   non-interactive (for scripts)
-
-  --provider claude-tmux|claude-sdk|codex|opencode|agy|pi   --model M
-  --credential KIND   (+ --key REF --base-url U --region R --aws-profile P --gcp-project P
-                       --location L --service-account FILE --endpoint U --deployment D)
-  --<platform>        enable telegram|discord|slack|line with default env var names
-  --<platform>-users ID,ID            allowlist (required unless --allow-empty)
-  --telegram-token REF  --discord-token REF  --slack-bot-token REF  --slack-app-token REF
-  --line-channel-access-token REF  --line-channel-secret REF
-  --no-web  --heartbeat  --force
-
-REF = ENV_VAR | env:VAR | file:/path | cmd:<command>. Secrets are never stored inline.
-An empty platform allowlist is refused unless --allow-empty is given.`);
-        return;
-      }
       const init = await import("./init.ts");
       const available = init.detectProviders();
       if (init.hasV2(projectDir) && !flags.force) {
@@ -308,11 +355,11 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
     }
     default:
       console.log(USAGE);
-      if (cmd && cmd !== "help" && cmd !== "--help") process.exit(1);
+      process.exit(1);
   }
 }
 
-main().catch((e) => { console.error(`error: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); });
+if (import.meta.main) main().catch((e) => { console.error(`error: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); });
 
 function formatDreamReport(r: DreamReport): string {
   const out = [`${r.dryRun ? "Dry run" : "Sweep"} ${r.day}: ${r.considered} recent entries, ${r.candidates.length} candidate(s).`];
