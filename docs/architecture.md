@@ -456,16 +456,30 @@ UniQlaw has its own long-term memory so it survives provider changes (Claude Cod
   - The A2A server binds to 127.0.0.1 by default and speaks plain HTTP / insecure gRPC (no TLS yet; put a TLS proxy in front for
     anything beyond loopback).
   - Auth is bearer tokens (`auth.bearerTokens`), declared in the Agent Card's `securitySchemes`. Exposing on a non-loopback host
-    without tokens is refused; on loopback without tokens every request is accepted as `anonymous`. Missing or wrong token → 401
-    with `WWW-Authenticate: Bearer`. A named token may be limited to some exposed profiles (`profiles`); any other profile → 403
-    (gRPC `PERMISSION_DENIED`). mTLS is not supported.
+    without tokens is refused. Missing or wrong token → 401 with `WWW-Authenticate: Bearer`. A named token may be limited to some
+    exposed profiles (`profiles`); any other profile → 403 (gRPC `PERMISSION_DENIED`). Token names are the caller identity: they
+    must be unique and must not look like the generated `token#<n>`. mTLS is not supported.
+  - **Anonymous mode** (loopback, no tokens): every local process — any user's — can call the exposed profiles, and all of them
+    are the same caller `anonymous`, so they share sessions (per `contextId`) and can read each other's tasks. The daemon logs a
+    warning at startup. Configure tokens if more than one client may connect.
   - External agents can only reach profiles listed in `expose`.
   - Inbound `a2a:` sessions are deny-by-default (`packages/core/src/a2a-policy.ts`): the profile's permissions are capped at
-    `strict` (`locked` stays `locked`; `auto-allow` approval becomes `ask-operator`), Claude Code's shell, file-write, scheduling,
-    cross-session and notification tools plus reads of `.uniqlaw/` are denied, and the MCP gateway does not offer them `notify`,
-    `send_file`, `agents_list`, `agent_ask`, `agent_trigger`, `task_status`, `worker_*`, `cron_*` or `memory_*` (so MEMORY.md is not
-    injected either). Native tool denials are Claude Code names; other providers enforce what their adapters map from `denyTools`
-    and the level.
+    `strict` (`locked` stays `locked`; `auto-allow` approval becomes `ask-operator`); the groups `bash`, `files.read`,
+    `files.write`, `agents` (Task/Agent/Workflow/Skill), `cron`, `worker`, `xsession`, `notify` and `memory` are denied; the MCP
+    gateway does not offer them `notify`, `send_file`, `agents_list`, `agent_ask`, `agent_trigger`, `task_status`, `worker_*`,
+    `cron_*` or `memory_*` (so MEMORY.md is not injected either).
+  - They are **isolated** (`SessionSpec.isolated`): the working directory is an empty directory of their own outside the project
+    and outside any git repository (`$TMPDIR/uniqlaw-a2a-<instance>/<hash of the session key>`, mode 0700, refused if someone
+    else owns it or can write to it), so no project files, CLAUDE.md, git status or git user reach the context. Claude providers
+    launch them with `--tools ""` (no built-in tools), `--setting-sources ""` (no user/project/local settings, CLAUDE.md, hooks,
+    skills or plugins), `--strict-mcp-config` (UniQlaw's MCP server only), native memory off and without `extraArgs` — verified
+    with claude 2.1.322 (`packages/claude-common/test/a2a-isolation.e2e.test.ts`).
+  - Their system prompt is the exposed profile's own `expose.<profile>.prompt` / `promptFiles` plus a path-free scope instruction;
+    the brand prompt, `settings.prompts.files` (IDENTITY/USER/SOUL), memory and absolute paths are never included.
+  - **Fail closed**: only providers with the `isolation` capability (claude-tmux, claude-sdk) can serve remote callers. Exposing a
+    profile on any other provider (codex, opencode, acp, agy, pi) is a startup error, and the core refuses to open such a session,
+    unless the operator sets `expose.<profile>.unsafeProvider: true` (logged as UNSAFE at startup): those providers would run the
+    remote request with the operator's settings, MCP servers and file access.
 
 ---
 
