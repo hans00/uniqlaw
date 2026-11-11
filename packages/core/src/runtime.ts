@@ -144,7 +144,7 @@ export class ChannelRuntime {
   /** finishTurn calls still running (they post to platforms after the state went back to idle). */
   private finishing = 0;
   /** A rate-limited turn waiting for its retry (state stays "running", turn is undefined meanwhile). */
-  private retrying?: { origins: Origin[] };
+  private retrying?: { origins: Origin[]; input?: TurnInput };
   /** After reopening on a turn that was in flight at detach: give the reattached turn a moment to claim its
    *  origins before a queued input could start a turn of its own and take them. */
   private resumeGraceUntil = 0;
@@ -172,6 +172,8 @@ export class ChannelRuntime {
   get busy(): boolean { return this.state === "running" || this.state === "interrupting" || this.finishing > 0; }
   /** Who the in-flight turn answers (also during a rate-limit backoff, when there is no turn object). */
   inflightOrigins(): Origin[] { return this.turn?.origins ?? this.retrying?.origins ?? []; }
+  /** What the in-flight turn was sent (undefined for turns the provider started on its own). */
+  inflightInput(): TurnInput | undefined { return this.turn?.input ?? this.retrying?.input; }
   /** The provider process survives a daemon stop (claude-tmux): an in-flight turn keeps running. */
   get canDetach(): boolean { return !!this.session?.detach; }
 
@@ -842,7 +844,7 @@ export class ChannelRuntime {
       this.log.warn("rate limited; retrying", { attempt: n, delayMs: delay });
       if (n === 1) await this.postTo(turn, `⏳ Rate limited by the model provider — retrying automatically (up to ${MAX_RATE_LIMIT_RETRIES}×).`);
       this.state = "running"; // hold the queue until the retry has been sent
-      this.retrying = { origins: turn.origins };
+      this.retrying = { origins: turn.origins, input: turn.input };
       clearTimeout(this.retryTimer);
       this.retryTimer = setTimeout(() => {
         this.retrying = undefined;

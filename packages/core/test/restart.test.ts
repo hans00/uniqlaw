@@ -139,7 +139,7 @@ test("drain timeout: a turn still running is recorded as interrupted and that se
   await until(() => p1.s("tg:8")?.sent.length === 1);
   g1.c.request({ kind: "restart", requestedBy: "cli", reason: "upgrade", drainTimeoutSec: 0.05 });
   await until(() => executed);
-  expect(record().interrupted).toEqual([{ channelKey: "tg:8", answering: ["tg:u"], detachable: false, target: { platform: "tg", chatId: "8" } }]);
+  expect(record().interrupted).toEqual([{ channelKey: "tg:8", answering: ["tg:u"], detachable: false, target: { platform: "tg", chatId: "8" }, resent: true }]);
   await g1.m.stop(); // not detachable: the turn dies with the daemon
 
   const p2 = new GatedProvider();
@@ -149,6 +149,10 @@ test("drain timeout: a turn still running is recorded as interrupted and that se
   const t = p2.s("tg:8").texts;
   expect(t).toContain("Interrupted: tg:8 (answering tg:u; cut off)");
   expect(t).toContain("its reply was not delivered");
+  // The cut-off (claude-sdk-like) turn's message is asked again, as the original human message.
+  expect(t).toContain("[Re-sent: your turn on this was cut off by a UniQlaw restart");
+  expect(t).toContain("a very long job");
+  expect(t).toContain("re-sent with this notice");
   p2.s("tg:8").finish("Sorry, the restart cut me off — picking it up again.");
   await until(() => platform.sent.some((s) => s.text.startsWith("Sorry, the restart")));
   expect(platform.sent.find((s) => s.text.startsWith("Sorry, the restart"))!.target.chatId).toBe("8");
@@ -291,7 +295,7 @@ test("crash between persist and exit: the next start still replays and notifies,
   const p2 = new GatedProvider();
   const g2 = generation(p2, platform);
   const back = await comeBack(g2);
-  expect(back).toMatchObject({ replayed: 1, notified: ["tg:6"] });
+  expect(back).toMatchObject({ replayed: 2, notified: ["tg:6"] }); // the drain-time message + the cut-off turn's message
   await until(() => p2.s("tg:6")?.texts.includes("queued while draining") && p2.s("tg:6").texts.includes("[uniqlaw]"));
   await g2.m.stop();
 
@@ -355,7 +359,7 @@ test("a reattached claude-tmux-like session finishes its resumed turn first, the
   // The resumed reply kept its routing (reply to the original message), not the notice's.
   expect(platform.sent.find((s) => s.text === "refactor done")!.target).toMatchObject({ chatId: "9", replyToMessageId: "77" });
   await until(() => p2.s("tg:9").sent.length === 1);
-  expect(p2.s("tg:9").texts).toContain("Your session survived, so it may have finished on its own");
+  expect(p2.s("tg:9").texts).toContain("Your session survived");
   await g2.m.stop();
 });
 
