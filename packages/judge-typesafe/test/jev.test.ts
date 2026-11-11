@@ -110,8 +110,8 @@ test("the question states each field's trust level and a generic effect x proven
     const q = calls[0]!.body.questions.safety.instructions;
     const all = [q.data, ...q.consider].join(" ");
     for (const field of ["humanRequest", "actionTrace", "targets", "observedOutput", "agentRationale", "createdThisSession", "unrecognized"]) expect(all, field).toContain(field);
-    expect(q.data).toMatch(/`humanRequest`.*`actionTrace`.*trusted/);
-    expect(q.data).toMatch(/`input` and `agentRationale` were written by the AI agent/);
+    expect(q.data).toMatch(/Trusted facts: `humanRequest`.*`actionTrace`/);
+    expect(q.data).toMatch(/Untrusted content.*\{untrusted: …\}.*`observedOutput`.*`input` and `agentRationale` \(written by the AI agent/);
     expect(all).not.toMatch(/\brm\b/);
   });
 });
