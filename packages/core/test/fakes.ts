@@ -76,7 +76,14 @@ export class FakePlatform implements PlatformAdapter {
   setPairedUsers(ids: string[]) { this.paired = ids; }
   files: { target: Target; file: OutboundFile }[] = [];
   async sendFile(target: Target, file: OutboundFile) { this.files.push({ target, file }); return { platform: "tg", chatId: target.chatId, messageId: `f${this.files.length}` }; }
-  async askChoice(_t: Target, req: ChoiceRequest) { this.choices.push(req); return this.choiceAnswer; }
+  /** true: askChoice waits until answered via `held` or aborted through req.signal (resolves null). */
+  holdChoices = false;
+  held: ((i: number | null) => void)[] = [];
+  async askChoice(_t: Target, req: ChoiceRequest) {
+    this.choices.push(req);
+    if (!this.holdChoices) return this.choiceAnswer;
+    return new Promise<number | null>((res) => { this.held.push(res); req.signal?.addEventListener("abort", () => res(null), { once: true }); });
+  }
   operatorTargets() { return [{ platform: "tg", chatId: "1" }]; }
   parseTarget(s: string) { const [p, id] = s.split(":"); return p === "tg" && id ? { platform: "tg", chatId: id } : undefined; }
   channelKeyForTarget(t: Target) { return `tg:${t.chatId}`; }

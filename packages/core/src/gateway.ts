@@ -14,6 +14,10 @@ export class McpGateway {
   private extra: GatewayTool[] = [];
   private tokens = new Map<string, string>(); // token → channelKey
   private byKey = new Map<string, string>();  // channelKey → token
+  /** Separate per-session tokens for the permission hook URL only (it sits in a provider's settings file): they
+   *  open /hook/<t>/permission for that session and nothing else, never the MCP endpoint. */
+  private hookTokens = new Map<string, string>(); // hook token → channelKey
+  private hookByKey = new Map<string, string>();  // channelKey → hook token
   private server?: ReturnType<typeof Bun.serve>;
 
   private lastPort?: number;
@@ -23,18 +27,22 @@ export class McpGateway {
   constructor(private manager: () => ChannelManager, private log: Logger, private stateFile?: string) {
     if (stateFile && existsSync(stateFile)) {
       try {
-        const s = JSON.parse(readFileSync(stateFile, "utf8")) as { port?: number; tokens?: Record<string, string> };
+        const s = JSON.parse(readFileSync(stateFile, "utf8")) as { port?: number; tokens?: Record<string, string>; hookTokens?: Record<string, string> };
         this.lastPort = s.port;
         for (const [key, token] of Object.entries(s.tokens ?? {})) {
           this.byKey.set(key, token);
           this.tokens.set(token, key);
+        }
+        for (const [key, token] of Object.entries(s.hookTokens ?? {})) {
+          this.hookByKey.set(key, token);
+          this.hookTokens.set(token, key);
         }
       } catch (e) { log.warn("ignoring unreadable gateway state file", { file: stateFile, error: String(e) }); }
     }
   }
 
   private save() {
-    if (this.stateFile) writeFileSync(this.stateFile, JSON.stringify({ port: this.server?.port, tokens: Object.fromEntries(this.byKey) }, null, 2), { mode: 0o600 });
+    if (this.stateFile) writeFileSync(this.stateFile, JSON.stringify({ port: this.server?.port, tokens: Object.fromEntries(this.byKey), hookTokens: Object.fromEntries(this.hookByKey) }, null, 2), { mode: 0o600 });
   }
 
   /** With `port` 0, the previous run's port is tried first (see constructor). */
@@ -72,14 +80,14 @@ export class McpGateway {
   endpointFor(channelKey: string) {
     if (!this.server) return undefined;
     let token = this.byKey.get(channelKey);
-    if (!token) {
-      token = crypto.randomUUID().replace(/-/g, "");
-      this.byKey.set(channelKey, token);
-      this.tokens.set(token, channelKey);
+    let hookToken = this.hookByKey.get(channelKey);
+    if (!token || !hookToken) {
+      if (!token) { token = crypto.randomUUID().replace(/-/g, ""); this.byKey.set(channelKey, token); this.tokens.set(token, channelKey); }
+      if (!hookToken) { hookToken = crypto.randomUUID().replace(/-/g, ""); this.hookByKey.set(channelKey, hookToken); this.hookTokens.set(hookToken, channelKey); }
       this.save();
     }
     const base = `http://${this.server.hostname}:${this.server.port}`;
-    return { url: `${base}/mcp/${token}`, token, toolNames: this.toolNames(channelKey), permissionHookUrl: `${base}/hook/${token}/permission` };
+    return { url: `${base}/mcp/${token}`, token, toolNames: this.toolNames(channelKey), permissionHookUrl: `${base}/hook/${hookToken}/permission` };
   }
 
   private async handle(req: Request): Promise<Response> {
@@ -97,7 +105,7 @@ export class McpGateway {
   /** Claude Code `PermissionRequest` HTTP hook (docs §10.4): the approval judge decides on the structured request.
    *  `{}` defers to the normal dialog (judge off or escalated, or any error); the session is the token's. */
   private async permissionHook(req: Request, token: string): Promise<Response> {
-    const caller = this.tokens.get(token);
+    const caller = this.hookTokens.get(token); // hook tokens only: an MCP token doesn't open this, nor the reverse
     if (!caller) return new Response("unknown token", { status: 401 });
     if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
     try {

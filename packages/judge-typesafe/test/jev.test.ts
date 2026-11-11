@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import type { JudgeInput } from "@uniqlaw/core";
 import { JevJudge, parseJevResponse } from "../src/index.ts";
 
-const INPUT: JudgeInput = { tool: "Bash", input: { command: "ls" }, structured: true, cwd: "/w", scope: ["/w"], level: "moderate", sessionKind: "chat", channelPolicy: "unrestricted", humanRequest: "list files" };
+const INPUT: JudgeInput = { tool: "Bash", input: { command: "ls" }, inputTrust: "untrusted", structured: true, cwd: "/w", scope: ["/w"], level: "moderate", sessionKind: "chat", channelPolicy: "unrestricted", humanRequest: "list files" };
 const KEY = "test-key-not-a-secret";
 
 function fakeFetch(respond: (url: string, init: RequestInit) => Response) {

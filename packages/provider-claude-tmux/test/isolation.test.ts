@@ -1,7 +1,7 @@
 // SessionSpec.isolated (inbound A2A) → the claude launch command: no built-in tools, no settings files, only
 // UniQlaw's MCP server, native memory off, no operator extraArgs, path-free prompt. Uses a fake tmux.
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_PERMISSIONS, silentLogger, type SessionSpec } from "@uniqlaw/core";
@@ -66,13 +66,17 @@ test("not isolated: chats keep the operator's settings sources, extraArgs and na
   expect(prompt).toContain("/home/op/project");
 });
 
-test("approval judge on: one --settings with the PermissionRequest HTTP hook (also isolated); off: no hook", async () => {
+test("approval judge on: one --settings naming a 0600 file with the PermissionRequest HTTP hook (also isolated); off: no hook", async () => {
   const hook = { PermissionRequest: [{ matcher: "*", hooks: [{ type: "http", url: "http://127.0.0.1:1/hook/x/permission", timeout: 10 }] }] };
   const chat = await launch(false, "shadow");
   expect(chat.argv.filter((a) => a === "--settings")).toHaveLength(1);
-  expect(JSON.parse(chat.flag("--settings")!)).toEqual({ hooks: hook });
+  const file = chat.flag("--settings")!;
+  expect(file).toEndWith("settings.json");
+  expect(chat.argv.join(" ")).not.toContain("/hook/"); // the hook token never sits in argv
+  expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ hooks: hook });
+  expect(statSync(file).mode & 0o777).toBe(0o600);
   const iso = await launch(true, "shadow");
-  expect(JSON.parse(iso.flag("--settings")!)).toEqual({ autoMemoryEnabled: false, autoDreamEnabled: false, hooks: hook });
+  expect(JSON.parse(readFileSync(iso.flag("--settings")!, "utf8"))).toEqual({ autoMemoryEnabled: false, autoDreamEnabled: false, hooks: hook });
   expect((await launch(false, "off")).argv).not.toContain("--settings");
   expect((await launch(true, "off")).flag("--settings")).toBe('{"autoMemoryEnabled":false,"autoDreamEnabled":false}');
 });

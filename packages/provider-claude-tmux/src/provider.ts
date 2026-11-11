@@ -95,7 +95,7 @@ export class ClaudeTmuxProvider implements AgentProvider {
       const judge = spec.profile.permissions.approval.judge;
       const hookUrl = judge && judge.mode !== "off" && spec.profile.permissions.approval.mode === "ask-operator" ? spec.mcp?.permissionHookUrl : undefined;
       argv.push(...claudeSettingsArgs({ nativeMemory: spec.isolated ? false : spec.nativeMemory,
-        ...(hookUrl ? { permissionHook: { url: hookUrl, timeoutSec: Math.ceil(judge!.timeoutMs / 1000) + 5 } } : {}) }));
+        ...(hookUrl ? { permissionHook: { url: hookUrl, timeoutSec: Math.ceil(judge!.timeoutMs / 1000) + 5, file: join(dir, "settings.json") } } : {}) }));
       // Operator extras could re-add settings sources or MCP servers: not for remote-driven sessions.
       if (opts.extraArgs?.length && !spec.isolated) argv.push(...opts.extraArgs);
       return argv;
