@@ -6,7 +6,7 @@
 // `{type: "choice", choice, probabilities: [{value, probability}], confidence}` or `{type: "refusal", name}`.
 // P(safe) is the probability of the "safe" option. The docs give probabilities but make no calibration claim:
 // they say to set thresholds from labelled examples, which is what shadow mode's audit pairs are for.
-import { JUDGE_QUESTION, secretRefSchema, type ApprovalJudge, type JudgeInput, type JudgeVerdict } from "@uniqlaw/core";
+import { JUDGE_INDUCED_QUESTION, JUDGE_QUESTION, secretRefSchema, type ApprovalJudge, type JudgeInput, type JudgeVerdict } from "@uniqlaw/core";
 import { z } from "zod";
 
 export const OPENAI_API = "https://api.openai.com/v1";
@@ -56,6 +56,12 @@ export function decisionRequestBody(req: JudgeInput, model = DEFAULT_DECISIONS_M
         // The Decisions docs recommend a fallback option; its probability mass is not P(safe), so it escalates.
         { value: "uncertain", description: "The request cannot be judged from what is given. A human should decide." },
       ],
+    }, {
+      // The second question in the same request (Decisions answers up to 400 per call).
+      type: "choice",
+      name: "induced",
+      instructions: JUDGE_INDUCED_QUESTION.task,
+      choices: (["task", "induced", "unclear"] as const).map((value) => ({ value, description: JUDGE_INDUCED_QUESTION.criteria[value] })),
     }],
   };
 }
@@ -67,7 +73,11 @@ export function parseDecisionResponse(j: unknown): JudgeVerdict {
   if (a?.type === "refusal") throw new Error("OpenAI Decisions refused to answer");
   const p = a?.type === "choice" ? a.probabilities?.find((x) => x?.value === "safe")?.probability : undefined;
   if (typeof p !== "number" || !Number.isFinite(p)) throw new Error("unexpected OpenAI Decisions response: no choice probability for \"safe\"");
-  return { pSafe: p, ...(typeof a!.choice === "string" ? { label: a!.choice } : {}), ...(typeof r.model === "string" ? { model: r.model } : {}) };
+  const ind = (r?.answers ?? []).find((x) => x?.name === "induced");
+  const pi = ind?.type === "choice" ? ind.probabilities?.find((x) => x?.value === "induced")?.probability : undefined;
+  return { pSafe: p, ...(typeof a!.choice === "string" ? { label: a!.choice } : {}), ...(typeof r.model === "string" ? { model: r.model } : {}),
+    ...(typeof pi === "number" && Number.isFinite(pi) ? { pInduced: pi } : {}),
+    ...(ind?.choice === "task" || ind?.choice === "induced" || ind?.choice === "unclear" ? { inducedLabel: ind.choice as "task" | "induced" | "unclear" } : {}) };
 }
 
 export class OpenAIDecisionJudge implements ApprovalJudge {

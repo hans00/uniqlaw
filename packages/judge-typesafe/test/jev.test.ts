@@ -115,3 +115,21 @@ test("the question states each field's trust level and a generic effect x proven
     expect(all).not.toMatch(/\brm\b/);
   });
 });
+
+test("one request carries both questions (safety + induced), for typesafe-jev and typesafe-compatible; pInduced is parsed", async () => {
+  const both = () => Response.json({ model: "jev-1", answers: {
+    safety: { type: "choice", choice: "safe", confidence: 0.9, probabilities: { safe: 0.93, unsafe: 0.07 } },
+    induced: { type: "choice", choice: "induced", confidence: 0.3, probabilities: { task: 0.29, induced: 0.61, unclear: 0.1 } } }, usage: { input_tokens: 1, output_tokens: 1 } });
+  for (const make of [(f: typeof fetch) => new JevJudge({ key: async () => KEY, fetch: f }),
+    (f: typeof fetch) => { const j = createTypeSafeJudge("typesafe-compatible", { baseUrl: "http://ts.local" }, async () => KEY); (j as unknown as { o: { fetch: typeof fetch } }).o.fetch = f; return j; }]) {
+    const { f, calls } = fakeFetch(both);
+    expect(await make(f).judge(INPUT, new AbortController().signal)).toEqual({ pSafe: 0.93, label: "safe", model: "jev-1", pInduced: 0.61, inducedLabel: "induced" });
+    expect(calls).toHaveLength(1);
+    const q = calls[0]!.body.questions;
+    expect(Object.keys(q)).toEqual(["safety", "induced"]);
+    expect(q.induced).toMatchObject({ type: "choice" });
+    expect(Object.keys(q.induced.criteria)).toEqual(["task", "induced", "unclear"]);
+  }
+  // A server that answers only the first question still works (no induced check then).
+  expect(parseJevResponse({ answers: { safety: { type: "choice", choice: "safe", probabilities: { safe: 0.9 } } } })).toEqual({ pSafe: 0.9, label: "safe" });
+});
