@@ -110,8 +110,13 @@ export class RestartCoordinator {
   /** Collected by prepare() (before sessions reopen), used by resume(). */
   private carried?: { record?: RestartRecord; failedTasks: FailedTask[] };
   private stopped = false;
+  /** The previous process's record, as read by prepare() (kept after resume() deletes it). */
+  private previous?: { kind: RestartRecord["kind"]; stoppedAt: number };
 
   constructor(private readonly d: RestartDeps) {}
+
+  /** What the previous process recorded when it stopped (undefined: no record, e.g. a crash or a first start). */
+  lastRestart() { return this.previous; }
 
   // ── request ──────────────────────────────────────────────────────────────
 
@@ -322,6 +327,7 @@ export class RestartCoordinator {
     const raw = this.d.store.get(RECORD_KEY);
     let record: RestartRecord | undefined;
     if (raw) { try { record = JSON.parse(raw) as RestartRecord; } catch { this.d.log.warn("unreadable restart record; ignored"); } }
+    if (record) this.previous = { kind: record.kind, stoppedAt: record.stoppedAt };
     const failedTasks = this.d.manager.resumeTasks(record ? new Set(record.openTasks.map((t) => t.taskId)) : undefined);
     this.carried = { ...(record ? { record } : {}), failedTasks };
   }

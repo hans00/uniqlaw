@@ -208,6 +208,7 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
         complete: (o) => manager.complete(o),
         ...(memory ? { memory } : {}),
         noteToOpenChats: (label, text) => manager.noteToOpenChats(label, text),
+        ...(restart.lastRestart() ? { lastRestart: restart.lastRestart()! } : {}),
       });
       cleanups.push(() => sch.stop());
     }

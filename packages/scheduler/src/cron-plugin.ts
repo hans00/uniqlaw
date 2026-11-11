@@ -15,8 +15,9 @@ export const cronConfigSchema = z.object({
   catchUpHours: z.number().nonnegative().default(0),
 });
 
-/** A gap this short since the previous process's last tick is a restart/reload: its missed occurrences fire once
- *  even with catchUpHours 0 (a job due while the daemon restarted must not be dropped). */
+/** After a recorded restart / reload (not a plain stop, not a crash), occurrences missed in a gap this short since
+ *  the previous process's last tick fire once even with catchUpHours 0: a job due while the daemon restarted must
+ *  not be dropped. Any other downtime (deliberate stop, crash) is what catchUpHours is for. */
 export const RESTART_GAP_MS = 15 * 60_000;
 const LAST_TICK_KEY = "cron:__lastTick";
 
@@ -30,7 +31,9 @@ export class CronScheduler implements Scheduler {
     this.api = api;
     const lastTick = Number(api.kvGet(LAST_TICK_KEY) ?? 0) * 60_000;
     if (this.cfg.catchUpHours > 0) void this.catchUp();
-    else if (lastTick && this.now().getTime() - lastTick <= RESTART_GAP_MS) void this.catchUpGap(new Date(lastTick));
+    else if (lastTick && (api.lastRestart?.kind === "restart" || api.lastRestart?.kind === "reload") && this.now().getTime() - lastTick <= RESTART_GAP_MS) {
+      void this.catchUpGap(new Date(lastTick));
+    }
     const n = this.now();
     const ms = (60 - n.getSeconds()) * 1000 - n.getMilliseconds();
     this.timer = setTimeout(() => this.loop(), ms);

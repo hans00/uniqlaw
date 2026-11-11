@@ -102,7 +102,7 @@ describe("CronScheduler", () => {
     expect(fired[0]!.sourceLine).toContain("missed 3×");
     expect(await s.catchUp(new Date("2026-11-02T10:25:00Z"))).toEqual([]);
   });
-  test("a job due while the daemon restarted fires once on start, even with catchUpHours 0", async () => {
+  test("a job due while the daemon restarted fires once on start, even with catchUpHours 0 — only after a restart/reload record", async () => {
     const d = tmp();
     saveJob(d, "ten", { schedule: "0 10 * * *", recurring: true, target: "global", body: "t" });
     saveJob(d, "done", { schedule: "59 9 * * *", recurring: true, target: "global", body: "d" });
@@ -111,9 +111,17 @@ describe("CronScheduler", () => {
     const old = new CronScheduler(d, { dir: d, catchUpHours: 0 }, "UTC", silentLogger, () => new Date("2026-11-02T09:59:00Z"));
     (old as unknown as { api: SchedulerApi }).api = api;
     expect(await old.tick()).toEqual(["done"]);
-    // New process comes up at 10:00:40: the 10:00 run is caught up (the first tick would only be at 10:01).
+    // Same gap after a plain stop/start or a crash (no restart record): not caught up.
+    for (const lastRestart of [undefined, { kind: "stop" as const, stoppedAt: 0 }]) {
+      const plain = new CronScheduler(d, { dir: d, catchUpHours: 0 }, "UTC", silentLogger, () => new Date("2026-11-02T10:00:40Z"));
+      plain.start({ ...api, ...(lastRestart ? { lastRestart } : {}) });
+      plain.stop();
+    }
+    await Bun.sleep(10);
+    expect(fired.map((f) => f.job)).toEqual(["done"]);
+    // After a restart: the 10:00 run is caught up (the first tick would only be at 10:01).
     const s = new CronScheduler(d, { dir: d, catchUpHours: 0 }, "UTC", silentLogger, () => new Date("2026-11-02T10:00:40Z"));
-    s.start(api);
+    s.start({ ...api, lastRestart: { kind: "restart", stoppedAt: 0 } });
     s.stop();
     await Bun.sleep(10);
     expect(fired.map((f) => f.job)).toEqual(["done", "ten"]);
@@ -122,7 +130,7 @@ describe("CronScheduler", () => {
     kv.set("cron:__lastTick", String(Math.floor(new Date("2026-11-01T10:00:00Z").getTime() / 60_000)));
     kv.delete("cron:ten:minute");
     const late = new CronScheduler(d, { dir: d, catchUpHours: 0 }, "UTC", silentLogger, () => new Date("2026-11-02T10:00:40Z"));
-    late.start(api);
+    late.start({ ...api, lastRestart: { kind: "reload", stoppedAt: 0 } });
     late.stop();
     await Bun.sleep(10);
     expect(fired).toHaveLength(2);
