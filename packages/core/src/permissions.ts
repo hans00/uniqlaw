@@ -10,8 +10,11 @@ export interface ApprovalJudgeConfig {
   /** off: no judge (behaviour as without this block). shadow: score and log, always ask the operator. enforce:
    *  auto-allow (once) at or above the threshold. */
   mode: "off" | "shadow" | "enforce";
+  /** Backend settings (baseUrl, model, credential, authHeader, headers, …), validated by the backend. */
+  options?: Record<string, unknown>;
+  /** Shorthand for options.credential. */
   credential?: SecretRef;
-  /** Provider model name (typesafe-jev: default "jev-latest"). */
+  /** Shorthand for options.model. */
   model?: string;
   /** Floor for every session kind's threshold. */
   allowAbove: number;
