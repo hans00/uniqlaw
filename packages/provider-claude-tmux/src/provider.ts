@@ -68,6 +68,7 @@ export class ClaudeTmuxProvider implements AgentProvider {
     const existing = spec.providerSessionId ? locateJsonl(providerSessionId, env) : undefined;
     const dir = join(this.deps.stateDir, "claude-tmux", slug(spec.sessionId));
     mkdirSync(dir, { recursive: true });
+    const settingsFile = join(dir, "settings.json");
     const launchArgs = (resume: boolean) => {
       const argv = [this.cfg.claudePath, resume ? "--resume" : "--session-id", providerSessionId];
       if (spec.profile.model) argv.push("--model", spec.profile.model);
@@ -95,7 +96,9 @@ export class ClaudeTmuxProvider implements AgentProvider {
       const judge = spec.profile.permissions.approval.judge;
       const hookUrl = judge && judge.mode !== "off" && spec.profile.permissions.approval.mode === "ask-operator" ? spec.mcp?.permissionHookUrl : undefined;
       argv.push(...claudeSettingsArgs({ nativeMemory: spec.isolated ? false : spec.nativeMemory,
-        ...(hookUrl ? { permissionHook: { url: hookUrl, timeoutSec: Math.ceil(judge!.timeoutMs / 1000) + 5, file: join(dir, "settings.json") } } : {}) }));
+        ...(hookUrl ? { permissionHook: { url: hookUrl, timeoutSec: Math.ceil(judge!.timeoutMs / 1000) + 5, file: settingsFile } } : {}) }));
+      // Judge off now: a settings file left from a judge-on launch (it holds the hook token) goes.
+      if (!hookUrl) rmSync(settingsFile, { force: true });
       // Operator extras could re-add settings sources or MCP servers: not for remote-driven sessions.
       if (opts.extraArgs?.length && !spec.isolated) argv.push(...opts.extraArgs);
       return argv;
@@ -122,7 +125,7 @@ export class ClaudeTmuxProvider implements AgentProvider {
         await spawn(!!locateJsonl(providerSessionId, env));
       };
       const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings,
-        respawn, readyTimeoutMs: this.cfg.readyTimeoutMs, tailStateFile }, "end");
+        respawn, readyTimeoutMs: this.cfg.readyTimeoutMs, tailStateFile, settingsFile }, "end");
       await s.start({ reattach: true, staleLaunch: stale });
       this.sessions.set(spec.sessionId, s);
       return s;
@@ -139,7 +142,7 @@ export class ClaudeTmuxProvider implements AgentProvider {
     // A fresh session id: an old position means nothing. --resume (claude exited while the daemon was down) keeps
     // appending to the same jsonl, so the saved position still applies.
     if (!existing) rmSync(tailStateFile, { force: true });
-    const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings, tailStateFile },
+    const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings, tailStateFile, settingsFile },
       existing ? "end" : "start");
     await s.start({ reattach: false, readyTimeoutMs: this.cfg.readyTimeoutMs });
     this.sessions.set(spec.sessionId, s);

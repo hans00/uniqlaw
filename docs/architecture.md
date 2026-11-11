@@ -588,7 +588,10 @@ Outcomes, in order:
    - `interactive-tool`: `AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode` (allowing answers for the human) and codex
      `SandboxPermissions` (granted for the turn);
    - `complex-command`: when any `Bash(…)` deny rule exists, a command with `;` `&&` `||` `|` `` ` `` `$(` `<(`, a
-     newline, a leading env assignment, a binary called by path, or a wrapper (`sh -c`, `env`, `xargs`, `sudo`, …);
+     newline, a leading env assignment, a first word that isn't a plain name (`r''m`, `"rm"`, `\rm`, `(rm …)`,
+     `{ rm …; }`, `! rm`, `$RM`), a binary called by path, or a wrapper that runs its arguments (`sh`, `eval`, `exec`,
+     `command`, `env`, `xargs`, `sudo`, `timeout`, `ionice`, `stdbuf`, `setsid`, `chroot`, `flock`, `parallel`,
+     `busybox`, interpreters, `find`, `git`, `make`, …);
    - `suspicious-comment`: a shell `#` comment that talks to the reviewer (approved, authorized, safe, Hans, operator, …).
 
 `off` changes nothing in what is asked (no judge call, no audit, identical prompts and launch flags). `shadow` scores
@@ -620,14 +623,17 @@ wouldOutcome, wouldReason, blockers, latencyMs, error`), then `{id, humanDecisio
 
 **Prompts never block the session.** A permission request is handled off the event loop (prompts still one at a
 time, in order). `askChoice` takes an `AbortSignal`: when the provider withdraws the request
-(`permission_withdrawn`: claude-tmux's dialog was answered in the terminal or replaced; the Agent SDK aborted
-`canUseTool`), when the turn ends, or when the session closes, detaches or is reset, the chat prompt is cancelled
+(`permission_withdrawn`: claude-tmux's dialog stayed gone for 3 s (`timings.dialogWithdrawnMs`; a redraw or resize
+that hides it briefly, or redraws the same tool and request with other option text, keeps the same request) or was
+replaced by a different one; the Agent SDK aborted `canUseTool`), when the turn ends, or when the session closes, detaches or is reset, the chat prompt is cancelled
 ("↩️ Cancelled — resolved elsewhere", buttons removed, the adapter's pending entry dropped) and nothing is answered.
 So `timeoutSec: 0` can't freeze a turn or a graceful restart's drain. This applies with the judge off too.
 
 **claude-tmux: the `PermissionRequest` hook.** With a judge on (and `ask-operator`), claude-tmux writes its settings
 (native memory and an HTTP hook) to `<stateDir>/claude-tmux/<session>/settings.json` (mode 0600) and passes
-`--settings <that file>`: the hook URL carries a token and must not sit in argv. The URL uses a **hook-only token**
+`--settings <that file>`: the hook URL carries a token and must not sit in argv. The file is deleted when the session
+closes for good and when it is relaunched with the judge off (a daemon restart's detach keeps it: the live claude
+still uses it). The URL uses a **hook-only token**
 (`/hook/<token>/permission`; it cannot open `/mcp/…`, and the MCP token cannot open the hook). The runtime judges
 the **structured** `tool_name`/`tool_input`: allow or hard-policy deny answer the hook; escalate returns `{}` and
 Claude shows its dialog. The scraped `permission_request` reuses that verdict only when it shows the same request
