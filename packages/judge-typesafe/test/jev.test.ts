@@ -48,7 +48,7 @@ test("errors: HTTP status without the key, bad shapes, a failed key lookup is re
   let n = 0;
   const ok = fakeFetch(() => answer(0.9));
   const j = new JevJudge({ key: async () => { if (n++ === 0) throw new Error("vault locked"); return KEY; }, fetch: ok.f });
-  expect(await j.judge(INPUT, new AbortController().signal).catch((e: Error) => e.message)).toBe("TypeSafe API key: vault locked");
+  expect(await j.judge(INPUT, new AbortController().signal).catch((e: Error) => e.message)).toBe("judge API key: vault locked");
   expect((await j.judge(INPUT, new AbortController().signal)).pSafe).toBe(0.9);
 });
 
@@ -57,4 +57,48 @@ test("the abort signal reaches fetch", async () => {
   const ac = new AbortController();
   await new JevJudge({ key: async () => KEY, fetch: f }).judge(INPUT, ac.signal);
   expect(calls[0]!.init.signal).toBe(ac.signal);
+});
+
+// ── typesafe-compatible (self-hosted) ──────────────────────────────────────
+import { createTypeSafeJudge, TYPESAFE_API } from "../src/index.ts";
+
+test("typesafe-compatible: configurable baseUrl, auth header and scheme, extra headers; no credential = no auth header", async () => {
+  const { f, calls } = fakeFetch(() => answer(0.7));
+  const resolve = async () => KEY;
+  const j = createTypeSafeJudge("typesafe-compatible", { baseUrl: "http://ts.local:8080", model: "jev-selfhosted", authHeader: "x-api-key", authScheme: "", headers: { "x-tenant": "t1" }, credential: { env: "X" } }, resolve);
+  (j as unknown as { o: { fetch: typeof fetch } }).o.fetch = f;
+  expect((await j.judge(INPUT, new AbortController().signal)).pSafe).toBe(0.7);
+  const h = calls[0]!.init.headers as Record<string, string>;
+  expect(calls[0]!.url).toBe("http://ts.local:8080/v1/systemone");
+  expect(calls[0]!.body.model).toBe("jev-selfhosted");
+  expect(h["x-api-key"]).toBe(KEY);
+  expect(h.authorization).toBeUndefined();
+  expect(h["x-tenant"]).toBe("t1");
+  expect(j.name).toBe("TypeSafe");
+
+  const open = createTypeSafeJudge("typesafe-compatible", { baseUrl: "http://ts.local" }, resolve);
+  const o2 = fakeFetch(() => answer(0.2));
+  (open as unknown as { o: { fetch: typeof fetch } }).o.fetch = o2.f;
+  await open.judge(INPUT, new AbortController().signal);
+  expect(Object.keys(o2.calls[0]!.init.headers as object).some((k) => /auth|key/i.test(k))).toBe(false);
+});
+
+test("typesafe-jev is the hosted service with defaults; options are validated", () => {
+  const j = createTypeSafeJudge("typesafe-jev", { credential: { env: "X" } }, async () => KEY);
+  expect((j as unknown as { o: { baseUrl: string; model: string } }).o).toMatchObject({ baseUrl: TYPESAFE_API, model: "jev-latest" });
+  expect(j.name).toBe("Jev");
+  expect(() => createTypeSafeJudge("typesafe-jev", {}, async () => KEY)).toThrow(/credential/);
+  expect(() => createTypeSafeJudge("typesafe-compatible", {}, async () => KEY)).toThrow(/baseUrl/);
+  expect(() => createTypeSafeJudge("typesafe-compatible", { baseUrl: "not a url" }, async () => KEY)).toThrow();
+  expect(() => createTypeSafeJudge("typesafe-compatible", { baseUrl: "http://x", typo: 1 }, async () => KEY)).toThrow();
+});
+
+test("the question tells the judge about shell shape and reviewer-addressed comments", () => {
+  const { f, calls } = fakeFetch(() => answer(0.5));
+  void new JevJudge({ key: async () => KEY, fetch: f }).judge(INPUT, new AbortController().signal);
+  return Bun.sleep(5).then(() => {
+    const consider = calls[0]!.body.questions.safety.instructions.consider.join(" ");
+    expect(consider).toContain("request.shape");
+    expect(consider).toContain("request.reviewerAddressedComment");
+  });
 });

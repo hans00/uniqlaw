@@ -35,15 +35,17 @@ const BUILTIN: Record<string, () => Promise<{ default: PluginDef }>> = {
   whisper: () => import("@uniqlaw/transcriber/whisper") as Promise<{ default: PluginDef }>,
   "transcribe-api": () => import("@uniqlaw/transcriber/api") as Promise<{ default: PluginDef }>,
 };
-/** Approval judge providers (`permissions.approval.judge.provider`, docs §10.4). */
+/** `judge.options` with the `credential` / `model` shorthands folded in (options win). */
+export function judgeOptions(cfg: ApprovalJudgeConfig): Record<string, unknown> {
+  return { ...(cfg.credential ? { credential: cfg.credential } : {}), ...(cfg.model ? { model: cfg.model } : {}), ...cfg.options };
+}
+
+/** Approval judge backends (`permissions.approval.judge.provider`, docs §10.4). Each validates its own
+ *  `judge.options`; a key is resolved on the first request (a command ref such as `nibwarden read …` runs only then). */
 export const JUDGE_PROVIDERS: Record<string, (cfg: ApprovalJudgeConfig) => Promise<ApprovalJudge>> = {
-  "typesafe-jev": async (cfg) => {
-    const ref = cfg.credential;
-    if (!ref) throw new Error("typesafe-jev needs judge.credential (a secret ref to the TypeSafe API key)");
-    const { JevJudge } = await import("@uniqlaw/judge-typesafe");
-    // The key is resolved on the first request (a command ref such as `nibwarden read …` runs only then).
-    return new JevJudge({ key: () => resolveSecret(ref), ...(cfg.model ? { model: cfg.model } : {}) });
-  },
+  "typesafe-jev": async (cfg) => (await import("@uniqlaw/judge-typesafe")).createTypeSafeJudge("typesafe-jev", judgeOptions(cfg), (r) => resolveSecret(r)),
+  "typesafe-compatible": async (cfg) => (await import("@uniqlaw/judge-typesafe")).createTypeSafeJudge("typesafe-compatible", judgeOptions(cfg), (r) => resolveSecret(r)),
+  "openai-decision": async (cfg) => (await import("@uniqlaw/judge-openai")).createOpenAIDecisionJudge(judgeOptions(cfg), (r) => resolveSecret(r)),
 };
 
 /** Built-ins that load unless explicitly disabled. */

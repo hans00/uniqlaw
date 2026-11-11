@@ -23,7 +23,8 @@
     "@uniqlaw/provider-agy": "workspace:*",
     "@uniqlaw/provider-opencode": "workspace:*",
     "@uniqlaw/provider-acp": "workspace:*",
-    "@uniqlaw/judge-typesafe": "workspace:*"
+    "@uniqlaw/judge-typesafe": "workspace:*",
+    "@uniqlaw/judge-openai": "workspace:*"
   },
   "devDependencies": {
     "zod": "^4.6.6",
