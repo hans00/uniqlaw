@@ -13,23 +13,42 @@ export interface ToolGroupDef {
   claude: string[];
 }
 
+// Claude Code names checked against claude 2.1.322 (stream-json init event, `--tools` probe). `--tools` ignores
+// unknown names, so names from other versions/platforms (PowerShell, BashOutput, …) are listed too: in deny mode
+// they must be caught whatever the installed version calls them.
 export const TOOL_GROUPS: Record<ToolGroup, ToolGroupDef> = {
-  chat: { mcp: ["send_file"], claude: ["TodoWrite"] },
+  chat: { mcp: ["send_file"], claude: ["TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TodoWrite", "ToolSearch",
+    "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "ReportFindings"] },
   memory: { mcp: ["memory_write", "memory_search", "memory_get"], claude: [] },
   web: { mcp: [], claude: ["WebSearch", "WebFetch"] },
-  "files.read": { mcp: [], claude: ["Read", "Grep", "Glob"] },
-  "files.write": { mcp: [], claude: ["Write", "Edit", "NotebookEdit"] },
-  bash: { mcp: [], claude: ["Bash"] },
-  cron: { mcp: ["cron_list", "cron_save", "cron_delete"], claude: [] },
+  "files.read": { mcp: [], claude: ["Read", "Grep", "Glob", "LSP", "NotebookRead"] },
+  "files.write": { mcp: [], claude: ["Write", "Edit", "MultiEdit", "NotebookEdit", "EnterWorktree", "ExitWorktree"] },
+  // Anything that runs code or shell commands.
+  bash: { mcp: [], claude: ["Bash", "Monitor", "PowerShell", "TaskStop", "TaskOutput", "BashOutput", "KillShell", "KillBash"] },
+  // Sub-agents and skills (they run with the same tool set as the session).
+  agents: { mcp: [], claude: ["Task", "Agent", "Workflow", "Skill"] },
+  // Scheduling: UniQlaw cron plus Claude Code's own schedulers / remote agents.
+  cron: { mcp: ["cron_list", "cron_save", "cron_delete"], claude: ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger"] },
   worker: { mcp: ["worker_start", "worker_stop"], claude: [] },
-  xsession: { mcp: ["agents_list", "agent_ask", "agent_trigger", "task_status"], claude: [] },
-  notify: { mcp: ["notify"], claude: [] },
+  // Talking to other sessions (ListAgents / SendMessage are always disallowed by claude-common).
+  xsession: { mcp: ["agents_list", "agent_ask", "agent_trigger", "task_status"], claude: ["SendToProject", "SendToProjectContext", "ListAgents", "SendMessage"] },
+  // Reaching people outside this chat: other chats, push notifications, published pages.
+  notify: { mcp: ["notify"], claude: ["PushNotification", "Artifact", "ArtifactData", "ArtifactComments", "DesignSync", "SendFeedback"] },
   // Reserved for tools that change UniQlaw's own settings; none exist yet.
   config: { mcp: [], claude: [] },
 };
 
+/** Groups that let a restricted chat reach an unrestricted session or UniQlaw's own config (a cron job in its own
+ *  session, a worker, another chat's session, or files such as .uniqlaw/jobs, .uniqlaw/settings.json and
+ *  .claude/settings.json hooks): granting one is effectively granting full access. */
+export const ADMIN_TOOL_GROUPS: readonly ToolGroup[] = ["bash", "files.write", "cron", "worker", "xsession"];
+
+/** Files a restricted chat may not read even with files.read (UniQlaw state: transcripts, state.db, gateway
+ *  tokens in claude-tmux mcp.json files, settings). Paths are relative to the session's cwd (the project dir). */
+export const PROTECTED_READ_RULES = ["Read(./.uniqlaw/**)", "Grep(./.uniqlaw/**)", "Glob(./.uniqlaw/**)"];
+
 /** Groups whose tools are the provider's own (enforced by the provider, not the gateway). */
-const NATIVE_GROUPS = (Object.keys(TOOL_GROUPS) as ToolGroup[]).filter((g) => TOOL_GROUPS[g].claude.length > 0 && g !== "chat");
+const NATIVE_GROUPS = (Object.keys(TOOL_GROUPS) as ToolGroup[]).filter((g) => TOOL_GROUPS[g].claude.length > 0 && g !== "chat" && g !== "xsession");
 
 /**
  * A session's tool policy, handed to the provider in SessionSpec.toolPolicy.
@@ -53,8 +72,10 @@ function entryFor(channels: Settings["channels"], channelKey: string): ChannelPo
  * settings.channels keep every tool). Missing fields of an entry fall back to "defaults", then to "*".
  */
 export function resolveToolPolicy(channels: Settings["channels"], channelKey: string): ToolPolicy | undefined {
-  const entry = entryFor(channels, channelKey);
-  const defaults = channels.defaults;
+  return policyOf(entryFor(channels, channelKey), channels.defaults);
+}
+
+function policyOf(entry: ChannelPolicyConfig | undefined, defaults: ChannelPolicyConfig | undefined): ToolPolicy | undefined {
   if (!entry && !defaults) return undefined;
   const tools = entry?.tools ?? defaults?.tools ?? "*";
   const deny = new Set(entry?.deny ?? defaults?.deny ?? []);
@@ -81,8 +102,26 @@ export function restrictsNativeTools(policy: ToolPolicy | undefined): boolean {
   return policy.mode === "allow" || policy.groups.some((g) => NATIVE_GROUPS.includes(g));
 }
 
-/** Claude Code flags for a policy: the built-in tools to keep (allow mode → `--tools`) and to disallow. */
+/** Claude Code flags for a policy: the built-in tools to keep (allow mode → `--tools`) and to disallow. Any
+ *  restricted chat also loses read access to UniQlaw's state directory. */
 export function claudeToolLists(policy: ToolPolicy): { tools?: string[]; disallowed: string[] } {
-  const names = policy.groups.flatMap((g) => TOOL_GROUPS[g].claude);
-  return policy.mode === "allow" ? { tools: [...new Set(names)], disallowed: [] } : { disallowed: [...new Set(names)] };
+  const names = [...new Set(policy.groups.flatMap((g) => TOOL_GROUPS[g].claude))];
+  return policy.mode === "allow" ? { tools: names, disallowed: [...PROTECTED_READ_RULES] } : { disallowed: [...names, ...PROTECTED_READ_RULES] };
+}
+
+/** Config-load warnings: restricted chats that are granted admin-level groups, and bare ids in the global
+ *  groups.allowFrom (they match no one there: an id means different people on different platforms). */
+export function channelPolicyWarnings(settings: Pick<Settings, "channels" | "groups">): string[] {
+  const out: string[] = [];
+  for (const [key, entry] of Object.entries(settings.channels)) {
+    const policy = key === "defaults" ? policyOf(undefined, entry) : policyOf(entry, settings.channels.defaults);
+    if (!policy) continue;
+    const admin = ADMIN_TOOL_GROUPS.filter((g) => groupAllowed(policy, g));
+    if (admin.length) {
+      out.push(`channels.${key} restricts tools but grants ${admin.join(", ")}: these reach unrestricted sessions or UniQlaw's config, so this chat effectively has full access`);
+    }
+  }
+  const bare = settings.groups.allowFrom.filter((a) => !a.includes(":"));
+  if (bare.length) out.push(`groups.allowFrom: bare ids (${bare.join(", ")}) match no one in the global list; write them as "<platform>:<id>"`);
+  return out;
 }

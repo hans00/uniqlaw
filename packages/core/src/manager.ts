@@ -394,14 +394,18 @@ export class ChannelManager {
     let entry: Partial<typeof defaults> | undefined;
     for (let n = parts.length; n >= 2 && !entry; n--) entry = channels[parts.slice(0, n).join(":")];
     const override = this.deps.store.get(`group-mode:${channelKey}`) as GroupMode | undefined;
-    return { ...defaults, ...platformPolicy, ...entry, ...(override ? { mode: override } : {}) };
+    // allowFrom entries are "<platform>:<id>". In a per-channel entry a bare id means that channel's platform; in the
+    // global list a bare id matches no one (it would mean different people on different platforms), so a list of
+    // only bare ids fails closed. channelPolicyWarnings reports them at startup.
+    const allowFrom = entry?.allowFrom ? entry.allowFrom.map((a) => (a.includes(":") ? a : `${parts[0]}:${a}`)) : defaults.allowFrom;
+    return { ...defaults, ...platformPolicy, ...entry, allowFrom, ...(override ? { mode: override } : {}) };
   }
 
   /** Multiparty gate: does this message start a turn, or only become context? The sender check uses the
    *  platform's user id from the payload (never a name, never the message text). */
   private wakeCheck(msg: InboundMessage): "wake" | "not-addressed" | "not-allowed" {
     const g = this.groupSettings(msg.channelKey, msg.groupPolicy);
-    if (g.allowFrom.length && !g.allowFrom.some((a) => a === `${msg.platform}:${msg.sender.id}` || a === msg.sender.id)) return "not-allowed";
+    if (g.allowFrom.length && !g.allowFrom.includes(`${msg.platform}:${msg.sender.id}`)) return "not-allowed";
     const addressed = msg.addressed ?? true; // an adapter that can't tell must not produce a bot that never answers
     if (addressed) return "wake";
     if (g.mode === "mention") return "not-addressed";

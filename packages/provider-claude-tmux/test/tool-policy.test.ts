@@ -58,7 +58,8 @@ test("a channel without cron launches claude without cron_*; adding cron + reloa
   sessions.push(s1);
   const first = tmux.spawned[0]!;
   expect(flag(first, "--allowedTools")).not.toContain("cron_");
-  expect(flag(first, "--tools")).toBe("TodoWrite");
+  expect(flag(first, "--tools")!.split(",")).toContain("TaskCreate");
+  expect(flag(first, "--tools")).not.toContain("Bash");
   expect(first).toContain("--strict-mcp-config");
   s1.detach!(); // daemon reload: tmux keeps running
 

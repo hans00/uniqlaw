@@ -30,7 +30,10 @@ describe("permissions", () => {
     expect(none).not.toContain("--tools");
     expect(none).not.toContain("--strict-mcp-config");
     const a = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "allow", groups: ["chat", "memory", "web", "files.read"] } });
-    expect(a[a.indexOf("--tools") + 1]).toBe("TodoWrite,WebSearch,WebFetch,Read,Grep,Glob");
+    const kept = a[a.indexOf("--tools") + 1].split(",");
+    expect(kept).toEqual(expect.arrayContaining(["TaskCreate", "WebSearch", "WebFetch", "Read", "Grep", "Glob"]));
+    expect(kept).not.toContain("Bash");
+    expect(a[a.indexOf("--disallowedTools") + 1]).toContain("Read(./.uniqlaw/**)");
     expect(a).toContain("--strict-mcp-config");
     const empty = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "allow", groups: ["memory"] } });
     expect(empty[empty.indexOf("--tools") + 1]).toBe(""); // no built-in tools at all
@@ -39,7 +42,7 @@ describe("permissions", () => {
     const d = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "deny", groups: ["bash", "web", "cron"] } });
     expect(d).not.toContain("--tools");
     expect(d).not.toContain("--strict-mcp-config");
-    expect(d[d.indexOf("--disallowedTools") + 1].split(" ")).toEqual(expect.arrayContaining(["Bash", "WebSearch", "WebFetch", "SendMessage"]));
+    expect(d[d.indexOf("--disallowedTools") + 1].split(" ")).toEqual(expect.arrayContaining(["Bash", "Monitor", "WebSearch", "WebFetch", "SendMessage", "Read(./.uniqlaw/**)"]));
   });
 });
 
