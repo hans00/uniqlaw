@@ -7,7 +7,7 @@
 //    Under a supervisor (systemd service, or UNIQLAW_RESTART_MODE=exit) it exits 75 instead and lets the
 //    supervisor start the new process: systemd's KillMode=control-group would kill a detached child.
 // stop() detaches provider sessions (claude-tmux keeps tmux alive), so conversations survive both.
-import { mkdirSync, openSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RESTART_FALLBACK_KEY, StateStore, type RestartKind } from "@uniqlaw/core";
 import { startDaemon, loadSettings, type Daemon } from "./index.ts";
@@ -35,13 +35,33 @@ function readOwnCgroup(): string {
 }
 
 export async function runForever(projectDir: string, opts: { logToStderr?: boolean } = {}): Promise<void> {
-  let daemon!: Daemon;
+  let daemon: Daemon | undefined;
   let reloading: Promise<boolean> | undefined;
   /** Single-flight stop of the current daemon (a SIGTERM during a restart must not stop it twice). */
   let stopping: Promise<void> | undefined;
-  const stopOnce = () => (stopping ??= daemon.stop());
+  /** A SIGTERM/SIGINT that came while a start was still in progress: honoured once it finishes. */
+  let terminating: string | undefined;
+  const stopOnce = () => (stopping ??= daemon!.stop());
+
+  // Started by a restart: take nothing over from the previous process until the parent has seen us up and acked
+  // (it may still give up on us and start the old code again), or is gone.
+  const parentPid = Number(process.env.UNIQLAW_RESTART_PARENT) || 0;
+  delete process.env.UNIQLAW_RESTART_PARENT;
+  let waitForAck = parentPid > 0;
+  const beforeResume = async () => {
+    if (waitForAck) {
+      waitForAck = false;
+      const ack = ackFile(projectDir, process.pid);
+      while (!terminating) {
+        if (existsSync(ack)) { rmSync(ack, { force: true }); break; }
+        if (!isAlive(parentPid)) break; // it went away without acking: we are the daemon now
+        await Bun.sleep(100);
+      }
+    }
+    return !terminating;
+  };
   const onRestart = (kind: RestartKind) => (kind === "reload" ? reload() : restart());
-  const start = async () => { const d = await startDaemon(projectDir, { ...opts, onRestart }); daemon = d; stopping = undefined; return d; };
+  const start = async () => { daemon = await startDaemon(projectDir, { ...opts, onRestart, beforeResume }); stopping = undefined; return daemon; };
 
   /** false = rejected, nothing was stopped (the coordinator ends the drain). */
   const reload = () => {
@@ -74,20 +94,28 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
     let why: string;
     try {
       const out = openSync(join(logDir, "stdout.log"), "a");
-      const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], { stdio: ["ignore", out, out], env: process.env, detached: true });
-      child.unref();
+      const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], {
+        stdio: ["ignore", out, out], env: { ...process.env, UNIQLAW_RESTART_PARENT: String(process.pid) }, detached: true,
+      });
       const readyMs = Number(process.env.UNIQLAW_RESTART_READY_MS ?? 60_000);
       const until = Date.now() + readyMs;
       while (Date.now() < until && child.exitCode === null && readRuntime(projectDir)?.pid !== child.pid) await Bun.sleep(200);
-      if (readRuntime(projectDir)?.pid === child.pid && isAlive(child.pid)) {
+      if (child.exitCode === null && readRuntime(projectDir)?.pid === child.pid) {
+        // Up: let it take over (it waits for this before touching the restart record, deferred input, tasks).
+        writeFileSync(ackFile(projectDir, child.pid), "");
+        child.unref();
         console.error(`[uniqlaw] restarted as pid ${child.pid}`);
         process.exit(0);
       }
       why = child.exitCode !== null ? `the new process exited with code ${child.exitCode}` : `the new process was not up after ${readyMs / 1000}s`;
       if (child.exitCode === null) {
+        // Not acked, so it has taken nothing over. Stop it, and make sure it is gone (and reaped: a zombie still
+        // holds the lock as far as acquireLock can tell) before starting the daemon here again.
         child.kill("SIGTERM");
-        for (let i = 0; i < 30 && isAlive(child.pid); i++) await Bun.sleep(100);
-        if (isAlive(child.pid)) child.kill("SIGKILL");
+        const graceMs = Number(process.env.UNIQLAW_RESTART_KILL_GRACE_MS ?? 15_000);
+        await Promise.race([child.exited, Bun.sleep(graceMs)]);
+        if (child.exitCode === null) child.kill("SIGKILL");
+        await child.exited;
       }
     } catch (e) {
       why = `could not start the new process: ${e instanceof Error ? e.message : e}`;
@@ -105,13 +133,15 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
     }
   };
 
-  await start();
-
+  // Handlers first: a signal during start() must not kill the process half-way (sessions not detached, the
+  // previous process's state half taken over).
   process.on("SIGHUP", () => {
+    if (!daemon) return;
     try { daemon.restart.request({ kind: "reload", requestedBy: "SIGHUP" }); }
     catch (e) { console.error(`[uniqlaw] reload rejected, keeping the running config: ${e instanceof Error ? e.message : e}`); }
   });
   const shutdown = async (signal: string) => {
+    if (!daemon) { terminating ??= signal; console.error(`[uniqlaw] ${signal} during start: stopping once the start has finished`); return; }
     await reloading;
     if (!stopping) daemon.restart.recordStop(signal); // the next start tells sessions whose turn this cut off
     await stopOnce();
@@ -119,4 +149,9 @@ export async function runForever(projectDir: string, opts: { logToStderr?: boole
   };
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
+
+  await start();
+  if (terminating) await shutdown(terminating);
 }
+
+function ackFile(projectDir: string, pid: number) { return join(stateDirOf(projectDir), `restart-ack.${pid}`); }

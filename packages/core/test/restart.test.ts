@@ -420,10 +420,10 @@ test("open tasks: listed in the record → the asker is told even if old; no rec
     store.createTask({ taskId: id, fromSession: "tg:1", toSession: "worker:x", mode: "ask", request: "q" });
     store.db.run("UPDATE tasks SET updated_at = ? WHERE task_id = ?", [Date.now() - 2 * 3600_000, id]);
   }
-  expect(g.m.resumeTasks(new Set(["old"])).map((t) => t.taskId)).toEqual(["old"]);
+  expect(g.m.failUnarmedTasks(new Set(["old"])).map((t) => t.taskId)).toEqual(["old"]);
   expect(store.getTask("older")!.state).toBe("failed");
   store.createTask({ taskId: "new", fromSession: "tg:1", toSession: "worker:x", mode: "ask", request: "q" });
-  expect(g.m.resumeTasks().map((t) => t.taskId)).toEqual(["new"]);
+  expect(g.m.failUnarmedTasks().map((t) => t.taskId)).toEqual(["new"]);
   await g.m.stop();
 });
 
@@ -494,4 +494,14 @@ test("a cut-off turn re-sends each human message with its own text (steered ones
   expect(rows.map((r) => [r.origin.kind, r.origin.ref?.messageId, r.item.text])).toEqual([["human", "81", "first thing"], ["human", "82", "second thing"]]);
   expect(rows[1]!.item.sourceLine).toContain("[Re-sent");
   await g1.m.stop();
+});
+
+test("a failed restart is reported to the operators even when no restart record is left", async () => {
+  const platform = new FakePlatform(); // operator target: tg:1
+  const g = generation(new GatedProvider(), platform);
+  store.set("restart-fallback", "the new process was not up after 60s");
+  await comeBack(g);
+  expect(platform.sent.find((x) => x.target.chatId === "1")?.text).toContain("restart FAILED (the new process was not up after 60s)");
+  expect(store.get("restart-fallback")).toBeUndefined();
+  await g.m.stop();
 });

@@ -155,3 +155,26 @@ test("restart API: a session is only trusted as the requester with proof (its ga
   expect(await ask({ from: "tg:100", fromToken: tok })).toEqual(["tg:100"]);       // proven
   expect(await ask({ from: "cli" })).toEqual(["cli"]);                             // not a session: a plain label
 });
+
+test("a start takes nothing over from the previous process before runtime.json is written and beforeResume agrees", async () => {
+  const dir = project();
+  const { StateStore, RECORD_KEY } = await import("@uniqlaw/core");
+  const { existsSync, readFileSync } = await import("node:fs");
+  const seed = new StateStore(join(dir, ".uniqlaw", "state.db"));
+  seed.set(RECORD_KEY, JSON.stringify({ id: "r", kind: "restart", requestedBy: ["cli"], reasons: [], requestedAt: 0, stoppedAt: 0, targets: {},
+    interrupted: [], deferred: 1, openTasks: [] }));
+  seed.pushDeferred("tg:100", { origin: { kind: "human", platform: "tg", channelKey: "tg:100", sender: { id: "7", name: "Hans" }, replyTarget: { platform: "tg", chatId: "100" },
+    ref: { platform: "tg", chatId: "100", messageId: "1" }, trusted: true }, item: { text: "held", receivedAt: 0, sourceLine: "[x]" }, attachments: [] });
+  seed.close();
+  let release!: (go: boolean) => void;
+  const gate = new Promise<boolean>((r) => { release = r; });
+  const starting = startDaemon(dir, { onRestart: () => false, beforeResume: () => gate });
+  await until(() => existsSync(join(dir, ".uniqlaw", "runtime.json")), 5000);
+  const peek = () => { const st = new StateStore(join(dir, ".uniqlaw", "state.db")); try { return { record: !!st.get(RECORD_KEY), deferred: st.listDeferred().length }; } finally { st.close(); } };
+  expect(peek()).toEqual({ record: true, deferred: 1 });   // up, but nothing consumed yet
+  release(false);                                            // abandoned (the parent gave up on us)
+  const d = await starting;
+  cleanups.push(() => d.stop());
+  expect(peek()).toEqual({ record: true, deferred: 1 });   // still there for the process that takes over
+  expect(JSON.parse(readFileSync(join(dir, ".uniqlaw", "runtime.json"), "utf8")).pid).toBe(process.pid);
+});

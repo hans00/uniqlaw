@@ -66,6 +66,10 @@ export interface DaemonOptions {
    *  next one (runForever: reload = in-process, restart = new process). Resolve false if nothing was stopped.
    *  Without it restart requests are refused. */
   onRestart?: (kind: RestartKind) => void | boolean | Promise<void | boolean>;
+  /** Called once the daemon is up and runtime.json is written, before it takes anything over from the previous
+   *  process (reattaching sessions, the restart record, deferred input, open tasks). false = don't: this start is
+   *  being abandoned (runForever: the restarting parent gave up on us) and is about to be stopped. */
+  beforeResume?: () => Promise<boolean>;
 }
 
 export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}): Promise<Daemon> {
@@ -174,7 +178,6 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
     gateway.addTools(restart.tools());
     // Before restore(): reopening a session consumes its inflight-turn key, which re-arms the tasks it answers.
     restart.prepare();
-    await manager.restore();
     manager.start();
     cleanups.push(() => manager.stop());
 
@@ -244,16 +247,22 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
       cleanups.push(() => api.stop());
     }
 
-    // Back from a restart: replay deferred input, notify the requester and interrupted sessions (platforms are up).
-    await restart.resume().catch((e) => log.error("restart resume failed", { e: String(e) }));
-    restart.start();
     cleanups.push(() => restart.stop());
-
     const transportPorts: Record<string, number> = {};
     for (const t of transports.values()) Object.assign(transportPorts, t.ports?.() ?? {});
     writeRuntime(projectDir, { pid: process.pid, instanceId, projectDir, startedAt: Date.now(), webPort, gatewayPort,
       ...(Object.keys(transportPorts).length ? { transportPorts } : {}), version: VERSION });
     log.info("ready", { webPort, gatewayPort, platforms: [...platforms.keys()], providers: [...providers.keys()], schedulers: [...schedulers.keys()] });
+
+    // Take over from the previous process only now (runtime.json is written, the restarting parent has acked):
+    // reattach sessions, replay deferred input, fail/re-arm open tasks, send the restart notices.
+    if (await (opts.beforeResume?.() ?? Promise.resolve(true))) {
+      await manager.restore();
+      await restart.resume().catch((e) => log.error("restart resume failed", { e: String(e) }));
+      restart.start();
+    } else {
+      log.warn("not taking over from the previous process: this start is being abandoned");
+    }
 
     let stopped: Promise<void> | undefined;
     return {

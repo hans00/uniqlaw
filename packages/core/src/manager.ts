@@ -955,16 +955,21 @@ export class ChannelManager {
    *  - re-armed: its request is about to be replayed, or the turn answering it kept running in a reattached session
    *    (inflight-turn) → the answer goes to the asker as usual;
    *  - failed: the turn answering it died with the daemon → the asking session is told (if the task is recent).
-   * Nothing is sent here (platforms may not be up yet): the failures to report are returned for reportFailedTasks.
-   * `known`: the tasks the restart record listed as open (all of them are reported); without a record only
-   * recently active ones are.
+   * Two steps: armResumedTasks (in memory only, before restore()) and failUnarmedTasks (writes state.db; only once
+   * this start is committed to, see RestartCoordinator.resume).
    */
-  resumeTasks(known?: Set<string>): FailedTask[] {
+  armResumedTasks() {
     // Call before restore(): reopening a session consumes its inflight-turn key.
     const origins: Origin[] = [];
     for (const [, v] of this.deps.store.entries("inflight-turn:")) { try { origins.push(...(JSON.parse(v) as Origin[])); } catch {} }
     for (const r of this.deps.store.listDeferred()) { try { origins.push((JSON.parse(r.payload) as QueuedInput).origin); } catch {} }
     for (const o of origins) this.rearmTask(o);
+  }
+
+  /** Fail every open task nobody waits for. Nothing is sent here: the failures to report are returned for
+   *  reportFailedTasks. `known`: the tasks the restart record listed as open (all are reported); without a
+   *  record only recently active ones are. */
+  failUnarmedTasks(known?: Set<string>): FailedTask[] {
     const armed = new Set(this.waiters.keys());
     const failed: FailedTask[] = [];
     const now = Date.now();
@@ -977,7 +982,12 @@ export class ChannelManager {
     return failed;
   }
 
-  /** Tell the askers of tasks the restart killed (resumeTasks), once platforms are up. */
+  /** Tell the operators something directly (their own chats), e.g. a restart that failed with no record to report on. */
+  async notifyOperators(text: string) {
+    for (const p of this.deps.platforms.values()) for (const t of p.operatorTargets()) await p.send(t, text).catch(() => {});
+  }
+
+  /** Tell the askers of tasks the restart killed (failUnarmedTasks), once platforms are up. */
   reportFailedTasks(list: FailedTask[]) {
     for (const t of list) {
       if (t.mode === "ask") this.deliverAsyncResult(t.from, t.to, t.taskId, 0, { ok: false, text: `${RESTART_TASK_FAILURE}. Ask again if you still need it.` });

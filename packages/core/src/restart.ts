@@ -5,7 +5,7 @@
 //  4. come back: open tasks re-armed or failed, deferred input replayed, notices to the requester and to every
 //     session whose turn was cut off — delivered as a new turn (a reattached claude-tmux session gets it too).
 import { z } from "zod";
-import type { ChannelManager, FailedTask, InflightTurn } from "./manager.ts";
+import type { ChannelManager, InflightTurn } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
 import type { Target } from "./platform.ts";
 import type { StateStore } from "./state.ts";
@@ -110,7 +110,7 @@ export class RestartCoordinator {
   /** The restart being carried out now (draining). */
   private active?: Pending;
   /** Collected by prepare() (before sessions reopen), used by resume(). */
-  private carried?: { record?: RestartRecord; failedTasks: FailedTask[] };
+  private carried?: { record?: RestartRecord };
   private stopped = false;
   /** The previous process's record, as read by prepare() (kept after resume() deletes it). */
   private previous?: { kind: RestartRecord["kind"]; stoppedAt: number };
@@ -322,16 +322,16 @@ export class RestartCoordinator {
 
   // ── come back ────────────────────────────────────────────────────────────
 
-  /** First half of the comeback, before sessions are restored (reopening one consumes its inflight-turn key):
-   *  re-arm or fail the previous process's open tasks. Nothing is sent yet. */
+  /** First half of the comeback, before sessions are restored (reopening one consumes its inflight-turn key).
+   *  Writes nothing: a start that is abandoned before resume() (a restart whose new process didn't come up in
+   *  time) leaves the record, the deferred input and the open tasks for the process that does take over. */
   prepare() {
-    this.d.store.unclaimDeferred(); // claims of a previous process: its queues are gone, replay those rows again
     const raw = this.d.store.get(RECORD_KEY);
     let record: RestartRecord | undefined;
     if (raw) { try { record = JSON.parse(raw) as RestartRecord; } catch { this.d.log.warn("unreadable restart record; ignored"); } }
     if (record) this.previous = { kind: record.kind, stoppedAt: record.stoppedAt };
-    const failedTasks = this.d.manager.resumeTasks(record ? new Set(record.openTasks.map((t) => t.taskId)) : undefined);
-    this.carried = { ...(record ? { record } : {}), failedTasks };
+    this.d.manager.armResumedTasks();
+    this.carried = { ...(record ? { record } : {}) };
   }
 
   /** Second half, once platforms are up: replay deferred input, tell askers about failed tasks, send the notices.
@@ -339,15 +339,24 @@ export class RestartCoordinator {
    *  crash in here never notifies twice: notices are at-most-once. */
   async resume(): Promise<{ record?: RestartRecord; replayed: number; notified: string[] }> {
     if (!this.carried) this.prepare();
-    const { record, failedTasks } = this.carried!;
+    const { record } = this.carried!;
     this.carried = undefined;
+    const m = this.d.manager;
+    this.d.store.unclaimDeferred(); // claims of a previous process: its queues are gone, replay those rows again
+    const failedTasks = m.failUnarmedTasks(record ? new Set(record.openTasks.map((t) => t.taskId)) : undefined);
     this.d.store.del(RECORD_KEY);
     const fallback = this.d.store.get(RESTART_FALLBACK_KEY);
     this.d.store.del(RESTART_FALLBACK_KEY);
-    const m = this.d.manager;
     const replayed = await m.replayDeferred();
     m.reportFailedTasks(failedTasks);
-    if (!record) return { replayed, notified: [] };
+    if (!record) {
+      // A failed restart whose record is gone (consumed by the process that didn't make it): still say so.
+      if (fallback) {
+        this.d.log.error("restart failed; running the previous code again", { fallback });
+        await m.notifyOperators(`⚠️ [uniqlaw] restart FAILED (${fallback}); the previous code was started again at ${formatTimestamp(new Date(), this.d.settings.timezone)}.`);
+      }
+      return { replayed, notified: [] };
+    }
     const tz = this.d.settings.timezone;
     const verb = fallback ? `restart FAILED (${fallback}); the previous code was started again` : record.kind === "reload" ? "reloaded" : record.kind === "stop" ? "was stopped and started again" : "restarted";
     const why = record.reasons.length ? record.reasons.join("; ") : "none given";
@@ -384,7 +393,7 @@ export class RestartCoordinator {
         });
       } catch (e) { this.d.log.warn("restart notice failed", { key, e: String(e) }); }
     }
-    this.d.log.info("back from restart", { kind: record.kind, replayed, notified: [...notices.keys()] });
+    this.d.log.info("back from restart", { kind: record.kind, replayed, notified: [...notices.keys()], ...(fallback ? { fallback } : {}) });
     return { record, replayed, notified: [...notices.keys()] };
   }
 

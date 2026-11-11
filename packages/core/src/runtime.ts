@@ -293,7 +293,7 @@ export class ChannelRuntime {
       // A turn still running in the provider (e.g. claude-tmux keeps working through a reload): remember who it
       // answers, so the reattached session delivers the reply to them instead of treating it as background output.
       // Peer ask/trigger origins are kept too: the next daemon re-registers their tasks, so the answer still
-      // reaches the asking session (ChannelManager.resumeTasks).
+      // reaches the asking session (ChannelManager.armResumedTasks).
       const keep = this.inflightOrigins().filter((o) => o.kind === "human" || (o.kind === "scheduler" && !o.taskId)
         || (o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")));
       if (this.busy && keep.length) this.host.store.set(`inflight-turn:${this.channelKey}`, JSON.stringify(keep));

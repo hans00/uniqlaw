@@ -61,9 +61,9 @@ test("restart: drains, starts a new process on the same project, exits; --in sch
   await waitFor(() => !!runtime(dir) && runtime(dir)!.pid !== child.pid && isAlive(runtime(dir)!.pid), 15_000, "new process");
   const second = runtime(dir)!.pid;
   pids.add(second);
-  const log = readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8");
-  expect(log).toContain("restart record written");
-  expect(log).toContain("back from restart");
+  // The new process takes over only after the old one acked it as up.
+  await waitFor(() => readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8").includes("back from restart"), 10_000, "resume");
+  expect(readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8")).toContain("restart record written");
 
   // Scheduled: --in 2s shows up in status, then fires.
   const s = await cli(dir, "restart", "--in", "2s");
@@ -123,3 +123,37 @@ test("restart mode: only a service systemd started directly exits for its superv
   expect(restartMode({ INVOCATION_ID: "x", UNIQLAW_RESTART_MODE: "spawn" }, sys, 1)).toBe("spawn");
   expect(restartMode({ UNIQLAW_RESTART_MODE: "exit" }, term, 4242)).toBe("exit");
 });
+
+const stdoutLog = (dir: string) => { try { return readFileSync(join(dir, ".uniqlaw", "logs", "stdout.log"), "utf8"); } catch { return ""; } };
+const daemonLog = (dir: string) => readFileSync(join(dir, ".uniqlaw", "logs", "daemon.log"), "utf8");
+
+test("a new process that never comes up is killed and reaped before the old one starts again (not left with nothing)", async () => {
+  const dir = project("restart-tok-4");
+  const child = run(dir, { UNIQLAW_RESTART_READY_MS: "1500", UNIQLAW_RESTART_KILL_GRACE_MS: "1000" });
+  await waitFor(() => runtime(dir)?.pid === child.pid, 15_000, "start");
+  writeFileSync(join(dir, ".hang-next-start"), "");
+  await fetch(`http://127.0.0.1:${runtime(dir)!.webPort}/api/restart`, { method: "POST", body: JSON.stringify({ reason: "will hang" }) });
+  await waitFor(() => child.out.stderr.includes("running again on the previous code") || child.exitCode !== null, 30_000, "fallback");
+  expect(child.out.stderr).toContain("RESTART FAILED: the new process was not up after 1.5s");
+  expect(child.out.stderr).toContain("running again on the previous code");
+  expect(child.exitCode).toBeNull();
+  expect(runtime(dir)!.pid).toBe(child.pid);
+  expect(stdoutLog(dir)).toContain("SIGTERM during start"); // the hung child had its handler, then got SIGKILL
+  await waitFor(() => daemonLog(dir).includes("back from restart"), 5000, "resume");
+  expect(daemonLog(dir)).toMatch(/back from restart.*restart FAILED|back from restart.*fallback/);
+}, 60_000);
+
+test("a new process that comes up too late honours SIGTERM after its start and takes nothing over", async () => {
+  const dir = project("restart-tok-5");
+  const child = run(dir, { UNIQLAW_RESTART_READY_MS: "1000", UNIQLAW_RESTART_KILL_GRACE_MS: "10000" });
+  await waitFor(() => runtime(dir)?.pid === child.pid, 15_000, "start");
+  writeFileSync(join(dir, ".slow-next-start"), "2500");
+  await fetch(`http://127.0.0.1:${runtime(dir)!.webPort}/api/restart`, { method: "POST", body: JSON.stringify({ reason: "too slow" }) });
+  await waitFor(() => child.out.stderr.includes("running again on the previous code") || child.exitCode !== null, 30_000, "fallback");
+  expect(child.out.stderr).toContain("RESTART FAILED: the new process was not up after 1s");
+  expect(stdoutLog(dir)).toContain("SIGTERM during start: stopping once the start has finished");
+  expect(daemonLog(dir)).toContain("not taking over from the previous process");
+  // The record was left for the old process, which reports the failed restart.
+  await waitFor(() => /back from restart.*fallback/.test(daemonLog(dir)), 5000, "resume with the record");
+  expect(runtime(dir)!.pid).toBe(child.pid);
+}, 60_000);
