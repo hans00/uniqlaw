@@ -40,8 +40,18 @@ export const a2aConfigSchema = z.object({
   })).prefault({}),
   auth: z.object({
     /** Accepted bearer tokens; the caller is identified as `token#<index>` (or the entry's name). A named entry
-     *  may list the exposed profiles it can use (`profiles`, default all); any other profile answers 403. */
-    bearerTokens: z.array(z.union([secretRef, z.object({ name: z.string(), token: secretRef, profiles: z.array(z.string()).optional() })])).default([]),
+     *  may list the exposed profiles it can use (`profiles`, default all); any other profile answers 403. Names
+     *  are the caller's identity, so they must be unique and must not look like a generated `token#<n>`. */
+    bearerTokens: z.array(z.union([secretRef, z.object({ name: z.string().min(1), token: secretRef, profiles: z.array(z.string()).optional() })])).default([])
+      .superRefine((list, ctx) => {
+        const seen = new Set<string>();
+        list.forEach((t, i) => {
+          if (!("token" in t)) return;
+          if (/^token#\d+$/.test(t.name)) ctx.addIssue({ code: "custom", path: [i, "name"], message: `"${t.name}" is reserved for unnamed tokens` });
+          else if (seen.has(t.name)) ctx.addIssue({ code: "custom", path: [i, "name"], message: `duplicate token name "${t.name}"` });
+          seen.add(t.name);
+        });
+      }),
   }).prefault({}),
   remotes: z.record(z.string(), z.object({
     url: z.string().url(), bearer: secretRef.optional(), description: z.string().optional(),
@@ -246,6 +256,9 @@ export class A2ATransport implements Transport {
         if (!e.unsafeProvider) throw new Error(`a2a.expose.${name}: provider "${p.provider}" cannot isolate remote callers (no separate working directory, settings or MCP servers); use a claude-tmux / claude-sdk profile, or set "unsafeProvider": true to accept the risk`);
         this.log.warn("UNSAFE: exposing a profile whose provider cannot isolate remote callers — they run with the operator's settings, MCP servers and file access", { profile: name, provider: p.provider });
       }
+    }
+    if (!this.tokens.length && Object.keys(this.cfg.expose).length) {
+      this.log.warn("a2a: no auth.bearerTokens — every local process can call the exposed profiles, and all of them are the same caller (\"anonymous\": they share sessions and tasks)", { host: this.cfg.host });
     }
     for (const t of this.tokens) for (const p of t.profiles ?? []) {
       if (!this.cfg.expose[p]) throw new Error(`a2a.auth.bearerTokens "${t.name}": profile "${p}" is not exposed`);

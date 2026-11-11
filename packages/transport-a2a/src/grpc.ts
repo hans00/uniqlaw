@@ -30,6 +30,9 @@ function routingHandler(profiles: Handlers, auth: GrpcAuth, forbidden: () => Err
   const route = <K extends keyof A2ARequestHandler>(k: K) =>
     ((params: { tenant?: string }, ctx: CallContext) => (pick(params?.tenant, ctx)[k] as (...a: unknown[]) => unknown)(params, ctx)) as unknown as A2ARequestHandler[K];
   return {
+    // Takes no request (no tenant, no caller): the SDK calls it only to validate the A2A-Version header before
+    // routing, and every exposed card declares the same versions. No gRPC RPC returns this public card to a client;
+    // the per-profile card is served over HTTP, and GetExtendedAgentCard below is routed with the mayUse check.
     getAgentCard: () => first().handler.getAgentCard(),
     getAuthenticatedExtendedAgentCard: route("getAuthenticatedExtendedAgentCard"),
     sendMessage: route("sendMessage"),

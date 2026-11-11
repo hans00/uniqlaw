@@ -142,3 +142,23 @@ test("the exposed profile's own prompt (prompt + promptFiles) is what reaches ru
   expect(calls[1]!.prompt).toBeUndefined();
   expect(calls[0]!.unsafeProvider).toBeUndefined();
 });
+
+test("token names must be unique and must not look like a generated token#N", () => {
+  const issues = (bearerTokens: unknown[]) => (a2aConfigSchema.safeParse({ auth: { bearerTokens } }).error?.issues ?? []).map((i) => i.message);
+  expect(issues([{ name: "alice", token: { env: "A" } }, { name: "alice", token: { env: "B" } }])).toEqual(['duplicate token name "alice"']);
+  expect(issues([{ env: "A" }, { name: "token#0", token: { env: "B" } }])).toEqual(['"token#0" is reserved for unnamed tokens']);
+  expect(issues([{ env: "A" }, { env: "B" }, { name: "alice", token: { env: "C" } }])).toEqual([]);
+});
+
+test("anonymous mode (no tokens) logs a startup warning; with tokens it doesn't", async () => {
+  const anon = capturingLogger();
+  const t = new A2ATransport(a2aConfigSchema.parse({ expose: { main: {} } }), anon.log);
+  await t.start(api([{ name: "main", provider: "fake", isolation: true }]));
+  stops.push(() => t.stop());
+  expect(anon.warns.some((w) => w.includes("every local process") && w.includes("same caller"))).toBe(true);
+  const authed = capturingLogger();
+  const t2 = new A2ATransport(a2aConfigSchema.parse({ expose: { main: {} }, ...twoTokens() }), authed.log);
+  await t2.start(api([{ name: "main", provider: "fake", isolation: true }]));
+  stops.push(() => t2.stop());
+  expect(authed.warns).toEqual([]);
+});
