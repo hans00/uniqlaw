@@ -302,7 +302,7 @@ export class RestartCoordinator {
 
   private persist(p: Pick<Pending, "id" | "requestedBy" | "reasons" | "requestedAt" | "targets"> & { kind: RestartRecord["kind"] }) {
     const m = this.d.manager;
-    const interrupted = m.inflightTurns().map((t) => ({ ...this.interruptedOf(t), ...(m.requeueCutOff(t) ? { resent: true } : {}) }));
+    const interrupted = m.inflightTurns().map((t) => ({ ...this.interruptedOf(t), ...(m.requeueCutOff(t) > 0 ? { resent: true } : {}) }));
     const flushed = m.flushQueuesForRestart();
     const rec: RestartRecord = {
       id: p.id, kind: p.kind, requestedBy: p.requestedBy, reasons: p.reasons, requestedAt: p.requestedAt, stoppedAt: Date.now(), targets: p.targets,
@@ -372,7 +372,7 @@ export class RestartCoordinator {
       add(i.channelKey, i.detachable
         ? `Your turn (answering ${i.answering.join(", ") || "background work"}) was still running when the daemon stopped. Your session survived: if it finished meanwhile, its reply was delivered when the session was reattached, so nothing to do; otherwise resume it.`
         : i.resent
-          ? `Your turn (answering ${i.answering.join(", ") || "background work"}) was cut off when the daemon stopped and its reply was not delivered. The message it was answering is re-sent with this notice: answer it now (anything that turn already did, such as file edits, may be half done — check first).`
+          ? `Your turn (answering ${i.answering.join(", ") || "background work"}) was cut off when the daemon stopped and its reply was not delivered. The messages it was answering are re-sent with this notice: answer it now (anything that turn already did, such as file edits, may be half done — check first).`
           : `Your turn (answering ${i.answering.join(", ") || "background work"}) was cut off when the daemon stopped and its reply was not delivered. Resume it or tell them what happened.`, i.target);
     }
     for (const [key, n] of notices) {

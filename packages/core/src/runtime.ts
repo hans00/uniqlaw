@@ -75,6 +75,9 @@ interface TurnState {
   origins: Origin[];
   /** Input that started the turn (for rate-limit retries). */
   input?: TurnInput;
+  /** The queued inputs this turn carries, each with its own origin (batch + steered): re-sent one by one if a
+   *  restart kills the turn. */
+  inputs?: QueuedInput[];
   /** Content arrived through a channel outside UniQlaw (native peer socket): operators only. */
   external?: boolean;
   retries?: number;
@@ -144,7 +147,7 @@ export class ChannelRuntime {
   /** finishTurn calls still running (they post to platforms after the state went back to idle). */
   private finishing = 0;
   /** A rate-limited turn waiting for its retry (state stays "running", turn is undefined meanwhile). */
-  private retrying?: { origins: Origin[]; input?: TurnInput };
+  private retrying?: { origins: Origin[]; input?: TurnInput; inputs?: QueuedInput[] };
   /** After reopening on a turn that was in flight at detach: give the reattached turn a moment to claim its
    *  origins before a queued input could start a turn of its own and take them. */
   private resumeGraceUntil = 0;
@@ -172,8 +175,8 @@ export class ChannelRuntime {
   get busy(): boolean { return this.state === "running" || this.state === "interrupting" || this.finishing > 0; }
   /** Who the in-flight turn answers (also during a rate-limit backoff, when there is no turn object). */
   inflightOrigins(): Origin[] { return this.turn?.origins ?? this.retrying?.origins ?? []; }
-  /** What the in-flight turn was sent (undefined for turns the provider started on its own). */
-  inflightInput(): TurnInput | undefined { return this.turn?.input ?? this.retrying?.input; }
+  /** The inputs the in-flight turn carries, each with its origin (empty for turns the provider started itself). */
+  inflightInputs(): QueuedInput[] { return this.turn?.inputs ?? this.retrying?.inputs ?? []; }
   /** The provider process survives a daemon stop (claude-tmux): an in-flight turn keeps running. */
   get canDetach(): boolean { return !!this.session?.detach; }
 
@@ -232,6 +235,7 @@ export class ChannelRuntime {
     if (this.state === "running" && mode === "steer" && !slash && this.session?.steer && this.capabilities.steer) {
       const prompt = mergeQueued([input.item], this.host.settings.timezone);
       this.turn?.origins.push(input.origin);
+      this.turn?.inputs?.push(input);
       this.steerLog.push({ origin: input.origin, at: Date.now() });
       try {
         await this.session.steer({ text: prompt, attachments: input.attachments });
@@ -415,7 +419,7 @@ export class ChannelRuntime {
     if (isPassthroughSlashCommand(first.item.text) && first.origin.kind === "human") {
       this.queue.shift();
       this.release([first]);
-      return this.startTurn([first.origin], { text: first.item.text.trim(), attachments: [], slashCommand: true });
+      return this.startTurn([first.origin], { text: first.item.text.trim(), attachments: [], slashCommand: true }, 0, [first]);
     }
     const batch: QueuedInput[] = [];
     while (this.queue.length && !(isPassthroughSlashCommand(this.queue[0]!.item.text) && this.queue[0]!.origin.kind === "human")) batch.push(this.queue.shift()!);
@@ -428,7 +432,7 @@ export class ChannelRuntime {
     const body = mergeQueued(batch.map((b) => b.item), tz, this.dropped.splice(0));
     const text = [...handoff, formatPendingForPrompt(pending, tz), body].filter(Boolean).join("\n\n");
     this.release(batch);
-    await this.startTurn(batch.map((b) => b.origin), { text, attachments: batch.flatMap((b) => b.attachments) });
+    await this.startTurn(batch.map((b) => b.origin), { text, attachments: batch.flatMap((b) => b.attachments) }, 0, batch);
   }
 
   /** Scheduled turns may run on their own model (job/heartbeat `model`); the next turn without
@@ -493,12 +497,12 @@ export class ChannelRuntime {
     });
   }
 
-  private async startTurn(origins: Origin[], input: TurnInput, retries = 0): Promise<void> {
+  private async startTurn(origins: Origin[], input: TurnInput, retries = 0, inputs?: QueuedInput[]): Promise<void> {
     if (!this.session) return;
     this.expireResume(); // another turn comes first: the resumed one is not coming back
     this.steerLog = [];
     this.steerCarry = undefined;
-    this.turn = { origins, input, retries, startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: false };
+    this.turn = { origins, input, ...(inputs ? { inputs: [...inputs] } : {}), retries, startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: false };
     this.armStall();
     this.state = "running";
     this.record("prompt", input.text, { origins: origins.map((o) => o.kind), retry: retries || undefined });
@@ -845,12 +849,12 @@ export class ChannelRuntime {
       this.log.warn("rate limited; retrying", { attempt: n, delayMs: delay });
       if (n === 1) await this.postTo(turn, `⏳ Rate limited by the model provider — retrying automatically (up to ${MAX_RATE_LIMIT_RETRIES}×).`);
       this.state = "running"; // hold the queue until the retry has been sent
-      this.retrying = { origins: turn.origins, input: turn.input };
+      this.retrying = { origins: turn.origins, input: turn.input, ...(turn.inputs ? { inputs: turn.inputs } : {}) };
       clearTimeout(this.retryTimer);
       this.retryTimer = setTimeout(() => {
         this.retrying = undefined;
         this.state = this.session ? "idle" : "closed";
-        void this.startTurn(turn.origins, turn.input!, n);
+        void this.startTurn(turn.origins, turn.input!, n, turn.inputs);
       }, delay);
       return;
     }

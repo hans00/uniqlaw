@@ -151,7 +151,7 @@ test("drain timeout: a turn still running is recorded as interrupted and that se
   expect(t).toContain("Interrupted: tg:8 (answering tg:u; cut off)");
   expect(t).toContain("its reply was not delivered");
   // The cut-off (claude-sdk-like) turn's message is asked again, as the original human message.
-  expect(t).toContain("[Re-sent: your turn on this was cut off by a UniQlaw restart");
+  expect(t).toContain("[Re-sent: a UniQlaw restart cut off your turn on this");
   expect(t).toContain("a very long job");
   expect(t).toContain("re-sent with this notice");
   p2.s("tg:8").finish("Sorry, the restart cut me off — picking it up again.");
@@ -476,4 +476,22 @@ test("a replayed input steered into a running turn is released (not replayed aga
   expect(p.s("tg:3").steered).toHaveLength(1);
   expect(store.listDeferred()).toEqual([]);
   await g.m.stop();
+});
+
+test("a cut-off turn re-sends each human message with its own text (steered ones too), never a peer ask", async () => {
+  const platform = new FakePlatform();
+  const p1 = new GatedProvider();
+  let executed = false;
+  const g1 = generation(p1, platform, () => { executed = true; }, steerSettings);
+  await g1.m.handleInbound(msg("8", "first thing", "81"));
+  await until(() => p1.s("tg:8")?.sent.length === 1);
+  await g1.m.handleInbound(msg("8", "second thing", "82"));          // steered into the running turn
+  await g1.m.ask("tg:5", "tg:8", "peer question", false).catch(() => {}); // steered too (tg:5 is not a session; fine)
+  expect(p1.s("tg:8").steered.length).toBeGreaterThanOrEqual(2);
+  g1.c.request({ kind: "restart", requestedBy: "cli", drainTimeoutSec: 0.05 });
+  await until(() => executed);
+  const rows = store.listDeferred().map((r) => JSON.parse(r.payload) as { origin: { kind: string; ref?: { messageId: string } }; item: { text: string; sourceLine: string } });
+  expect(rows.map((r) => [r.origin.kind, r.origin.ref?.messageId, r.item.text])).toEqual([["human", "81", "first thing"], ["human", "82", "second thing"]]);
+  expect(rows[1]!.item.sourceLine).toContain("[Re-sent");
+  await g1.m.stop();
 });

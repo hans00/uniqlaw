@@ -7,7 +7,7 @@ import type { Origin } from "./origin.ts";
 import type { GroupMode } from "./config.ts";
 import { ChannelRuntime, type QueuedInput, type RuntimeHost } from "./runtime.ts";
 import { PairingService } from "./pairing.ts";
-import { formatTimestamp, renderSourceLine } from "./format.ts";
+import { formatTimestamp, isPassthroughSlashCommand, renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
 import { realpathSync, statSync } from "node:fs";
@@ -67,7 +67,7 @@ export interface TakeoverInfo { key: string; argv: string[]; cwd: string; live: 
 type TaskWaiter = { resolve: (r: { ok: boolean; text: string }) => void };
 
 /** A turn still in flight (graceful restart bookkeeping). */
-export interface InflightTurn { channelKey: string; origins: Origin[]; detachable: boolean; input?: TurnInput }
+export interface InflightTurn { channelKey: string; origins: Origin[]; detachable: boolean; inputs: QueuedInput[] }
 
 /** A task the previous daemon left open and that could not be resumed. */
 export interface FailedTask { taskId: string; from: string; to: string; mode: "ask" | "trigger" }
@@ -881,7 +881,7 @@ export class ChannelManager {
   /** Turns still in flight. */
   inflightTurns(): InflightTurn[] {
     return [...this.runtimes.values()].filter((r) => r.busy)
-      .map((r) => { const input = r.inflightInput(); return { channelKey: r.channelKey, origins: r.inflightOrigins(), detachable: r.canDetach, ...(input ? { input } : {}) }; });
+      .map((r) => ({ channelKey: r.channelKey, origins: r.inflightOrigins(), detachable: r.canDetach, inputs: r.inflightInputs() }));
   }
 
   /** Just before stopping: move every runtime's not-yet-sent queue into deferred_input. */
@@ -915,17 +915,20 @@ export class ChannelManager {
     this.deps.store.pushDeferred(channelKey, input);
   }
 
-  /** A turn the stop kills (provider not detachable): queue its human input again, so the message is answered after
-   *  the restart instead of silently dropped. Returns true if something was re-queued. */
-  requeueCutOff(t: InflightTurn): boolean {
-    const human = [...t.origins].reverse().find((o) => o.kind === "human");
-    if (t.detachable || !human || !t.input || t.input.slashCommand) return false;
-    this.deps.store.pushDeferred(t.channelKey, {
-      origin: human,
-      item: { text: t.input.text, receivedAt: Date.now(), sourceLine: "[Re-sent: your turn on this was cut off by a UniQlaw restart before it answered]", raw: true },
-      attachments: t.input.attachments,
-    } satisfies QueuedInput);
-    return true;
+  /** A turn the stop kills (provider not detachable): queue its human messages again — each with its own origin
+   *  and text, steered ones included — so they are answered after the restart instead of silently dropped. Peer,
+   *  cron and result inputs are not re-sent (their tasks fail / jobs are not repeated). Returns how many. */
+  requeueCutOff(t: InflightTurn): number {
+    if (t.detachable) return 0;
+    let n = 0;
+    for (const q of t.inputs) {
+      if (q.origin.kind !== "human" || isPassthroughSlashCommand(q.item.text)) continue;
+      const { deferredId: _d, ...rest } = q;
+      this.deps.store.pushDeferred(t.channelKey, { ...rest,
+        item: { ...q.item, sourceLine: `[Re-sent: a UniQlaw restart cut off your turn on this before it answered] ${q.item.sourceLine}` } } satisfies QueuedInput);
+      n++;
+    }
+    return n;
   }
 
   /** Replay input deferred during a drain (also after a crash mid-drain). At-least-once: a row is only claimed
