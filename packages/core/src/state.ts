@@ -69,7 +69,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS deferred_input (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_key TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `;
+
+/** Input held back while the daemon drains for a restart (replayed after it). */
+export interface DeferredInput { id: number; channelKey: string; payload: string; createdAt: number }
 
 export class StateStore {
   readonly db: Database;
@@ -136,11 +145,32 @@ export class StateStore {
   }
   getTask(taskId: string): TaskRow | undefined {
     const r = this.db.query("SELECT * FROM tasks WHERE task_id = ?").get(taskId) as Record<string, unknown> | null;
-    if (!r) return undefined;
-    return { taskId: r.task_id as string, fromSession: r.from_session as string, toSession: r.to_session as string,
-      mode: r.mode as TaskRow["mode"], state: r.state as TaskRow["state"], request: r.request as string,
-      result: (r.result as string | null) ?? null, createdAt: r.created_at as number, updatedAt: r.updated_at as number };
+    return r ? rowToTask(r) : undefined;
   }
+  /** Tasks nobody has answered yet (submitted / working). */
+  openTasks(): TaskRow[] {
+    return (this.db.query("SELECT * FROM tasks WHERE state IN ('submitted', 'working') ORDER BY created_at").all() as Record<string, unknown>[]).map(rowToTask);
+  }
+
+  // ── deferred input (graceful restart) ──
+  pushDeferred(channelKey: string, payload: unknown) {
+    this.db.query("INSERT INTO deferred_input (channel_key, payload, created_at) VALUES (?, ?, ?)").run(channelKey, JSON.stringify(payload), Date.now());
+  }
+  listDeferred(): DeferredInput[] {
+    return (this.db.query("SELECT * FROM deferred_input ORDER BY id").all() as Record<string, unknown>[])
+      .map((r) => ({ id: r.id as number, channelKey: r.channel_key as string, payload: r.payload as string, createdAt: r.created_at as number }));
+  }
+  countDeferred(): number { return (this.db.query("SELECT COUNT(*) AS n FROM deferred_input").get() as { n: number }).n; }
+  /** Read and delete every deferred input in one transaction (replay is at-most-once). */
+  takeDeferred(): DeferredInput[] {
+    return this.db.transaction(() => {
+      const rows = this.listDeferred();
+      this.db.query("DELETE FROM deferred_input").run();
+      return rows;
+    })();
+  }
+  /** Run fn in one SQLite transaction. */
+  tx<T>(fn: () => T): T { return this.db.transaction(fn)(); }
 
   // ── kv ──
   get(k: string): string | undefined { return (this.db.query("SELECT v FROM kv WHERE k = ?").get(k) as { v: string } | null)?.v; }
@@ -151,6 +181,12 @@ export class StateStore {
     return (this.db.query("SELECT k, v FROM kv WHERE substr(k, 1, ?) = ? ORDER BY k").all(prefix.length, prefix) as { k: string; v: string }[])
       .map((r) => [r.k, r.v]);
   }
+}
+
+function rowToTask(r: Record<string, unknown>): TaskRow {
+  return { taskId: r.task_id as string, fromSession: r.from_session as string, toSession: r.to_session as string,
+    mode: r.mode as TaskRow["mode"], state: r.state as TaskRow["state"], request: r.request as string,
+    result: (r.result as string | null) ?? null, createdAt: r.created_at as number, updatedAt: r.updated_at as number };
 }
 
 function rowToSession(r: Record<string, unknown>): SessionRow {

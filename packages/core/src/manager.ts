@@ -5,7 +5,7 @@ import type { RemoteAgent, ScheduledFire, Transcriber } from "./plugin.ts";
 import type { InboundMessage, OutboundFile, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
 import type { GroupMode } from "./config.ts";
-import { ChannelRuntime, type RuntimeHost } from "./runtime.ts";
+import { ChannelRuntime, type QueuedInput, type RuntimeHost } from "./runtime.ts";
 import { PairingService } from "./pairing.ts";
 import { formatTimestamp, renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
@@ -15,7 +15,7 @@ import { expandHome } from "./credentials.ts";
 import { basename, extname, isAbsolute, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
-export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "onUsageLimit" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget"> {
+export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "onUsageLimit" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget" | "deferInput"> {
   providers: Map<string, AgentProvider>;
   platforms: Map<string, PlatformAdapter>;
   profiles: Map<string, Profile>;
@@ -66,6 +66,12 @@ export interface TakeoverInfo { key: string; argv: string[]; cwd: string; live: 
 
 type TaskWaiter = { resolve: (r: { ok: boolean; text: string }) => void };
 
+/** A turn still in flight (graceful restart bookkeeping). */
+export interface InflightTurn { channelKey: string; origins: Origin[]; detachable: boolean }
+
+/** Open tasks older than this are failed quietly after a restart (no notice to the asker): they predate it. */
+const STALE_TASK_MS = 3600_000;
+
 export class ChannelManager {
   readonly runtimes = new Map<string, ChannelRuntime>();
   /** Live runtime events ("event" → RuntimeEvent) for dashboards. */
@@ -80,6 +86,8 @@ export class ChannelManager {
   private readonly host: RuntimeHost;
   /** DM pairing (strangers get a code; operators approve). */
   readonly pairing: PairingService;
+  /** Set while the daemon drains for a restart: new input is persisted (deferred_input) instead of starting turns. */
+  private draining?: { since: number; acked: Set<string> };
 
   constructor(private readonly deps: ManagerDeps) {
     this.host = {
@@ -92,6 +100,7 @@ export class ChannelManager {
       isInternal: (k) => this.kindOf(k) === "internal",
       cwdFor: (k) => deps.store.get(`session-cwd:${k}`),
       workerOf: (k) => { const m = this.workerMeta(k); return m ? { owner: m.owner } : undefined; },
+      deferInput: (k, input) => this.deferInput(k, input),
       backgroundTarget: (k) => {
         if (!k.startsWith(WORKER_PREFIX)) return undefined;
         // Workers have no chat: background output (e.g. a human typing in its terminal) goes to the
@@ -468,10 +477,12 @@ export class ChannelManager {
     if (target === from) throw new Error("cannot ask yourself");
     this.checkNotHeld(target);
     const hop = this.checkHop(from);
+    // A blocking ask that would only be answered after the restart: refuse now instead of hanging the caller.
+    if (wait && this.draining && !this.isBusy(from)) throw new Error("UniQlaw is restarting; ask again in a moment (or use wait=false: it runs after the restart)");
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: target, mode: "ask", request: message });
     const done = wait ? this.waitTask(taskId) : undefined;
-    if (!wait) this.waiters.set(taskId, { resolve: (r) => this.deliverAsyncResult(from, target, taskId, hop, r) });
+    if (!wait) this.waiters.set(taskId, this.asyncWaiter("ask", from, target, taskId, hop));
     await this.runtime(target).enqueue({
       origin: { kind: "peer", fromSession: from, hop, mode: "ask", taskId, rootTarget: this.runtimes.get(from)?.rootTarget() },
       item: { text: message, receivedAt: Date.now(), sourceLine: `[Agent message from session ${from} — reply here; your reply is returned to that agent, no human sees it]`, raw: true },
@@ -500,6 +511,7 @@ export class ChannelManager {
   async runInbound(o: { profile: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }> {
     if (!this.deps.profiles.has(o.profile)) return { ok: false, text: `unknown profile "${o.profile}"` };
     if (o.hop > this.deps.settings.bus.maxHops) return { ok: false, text: "delegation chain too deep" };
+    if (this.draining) return { ok: false, text: "the agent's host is restarting; retry in a minute" };
     const key = `a2a:${o.profile}:${o.contextId}`;
     this.profileOverride.set(key, o.profile);
     this.deps.store.createTask({ taskId: o.taskId, fromSession: `a2a:${o.remote}`, toSession: key, mode: "ask", request: o.text });
@@ -524,10 +536,7 @@ export class ChannelManager {
     if (!deliverTo) throw new Error(`"${target}" has no chat to answer on; pass replyTo`);
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: target, mode: "trigger", request: prompt });
-    this.waiters.set(taskId, { resolve: (r) => {
-      // Only sessions get the echo; CLI/API callers ("cli", "api", …) are not sessions.
-      if (this.deps.store.getSession(from)) this.deps.store.pushPending(from, "peer-result", { label: `trigger response from ${target}`, text: r.text });
-    } });
+    this.waiters.set(taskId, this.asyncWaiter("trigger", from, target, taskId, hop));
     await rt.enqueue({
       origin: { kind: "peer", fromSession: from, hop, mode: "trigger", taskId, deliverTo },
       item: { text: prompt, receivedAt: Date.now(), sourceLine: `[Triggered by session ${from} — your reply goes to this channel's chat]`, raw: true },
@@ -612,6 +621,7 @@ export class ChannelManager {
   async complete(o: { channelKey: string; text: string; job: string; profile?: string; model?: string; timeoutMs?: number; fresh?: boolean }): Promise<{ ok: boolean; text: string }> {
     if (this.kindOf(o.channelKey) !== "internal") throw new Error(`complete() runs in internal sessions only, not ${o.channelKey}`);
     if (this.isBusy(o.channelKey)) return { ok: false, text: `${o.channelKey} is busy` };
+    if (this.draining) return { ok: false, text: "UniQlaw is restarting" };
     if (o.profile) await this.pinProfile(o.channelKey, o.profile, o.job);
     if (o.fresh) await this.runtime(o.channelKey).reset();
     const taskId = crypto.randomUUID();
@@ -828,8 +838,126 @@ export class ChannelManager {
   }
 
   isBusy(channelKey: string): boolean {
-    const st = this.runtimes.get(channelKey)?.state;
-    return st === "running" || st === "interrupting";
+    return this.runtimes.get(channelKey)?.busy ?? false;
+  }
+
+  // ── graceful restart (drain → persist → come back) ─────────────────────
+
+  get isDraining(): boolean { return !!this.draining; }
+
+  /** An operator's own DM session (the chat of a platform operator target). */
+  isOperatorChat(channelKey: string): boolean {
+    for (const p of this.deps.platforms.values()) {
+      for (const t of p.operatorTargets()) if (p.channelKeyForTarget(t) === channelKey) return true;
+    }
+    return false;
+  }
+
+  /** Stop starting turns: from now on new input is persisted and replayed after the restart. Input already
+   *  queued behind a running turn is deferred when that turn ends (ChannelRuntime.drain). */
+  beginDrain() {
+    if (this.draining) return;
+    this.draining = { since: Date.now(), acked: new Set() };
+    this.deps.log.info("draining for restart");
+  }
+
+  /** Restart canceled: turns may start again; everything deferred so far is replayed now. */
+  async endDrain(): Promise<number> {
+    if (!this.draining) return 0;
+    this.draining = undefined;
+    return this.replayDeferred();
+  }
+
+  /** Turns still in flight. */
+  inflightTurns(): InflightTurn[] {
+    return [...this.runtimes.values()].filter((r) => r.busy)
+      .map((r) => ({ channelKey: r.channelKey, origins: r.inflightOrigins(), detachable: r.canDetach }));
+  }
+
+  /** Just before stopping: move every runtime's not-yet-sent queue into deferred_input. */
+  flushQueuesForRestart(): number {
+    let n = 0;
+    for (const rt of this.runtimes.values()) {
+      for (const q of rt.takeQueue()) { this.deps.store.pushDeferred(rt.channelKey, q); n++; }
+      const dropped = rt.takeDropped();
+      if (dropped.length) this.deps.store.pushPending(rt.channelKey, "peer-result", { label: "messages dropped while your queue was full", text: dropped.join("\n") });
+    }
+    return n;
+  }
+
+  private deferInput(channelKey: string, input: QueuedInput): boolean {
+    if (!this.draining) return false;
+    // The running turn of the asker is waiting for this answer (agent_ask): let it run, the drain waits for it.
+    if (input.origin.kind === "peer" && input.origin.mode === "ask" && this.isBusy(input.origin.fromSession)) return false;
+    this.deps.store.pushDeferred(channelKey, input);
+    const o = input.origin;
+    if (o.kind === "human" && !this.draining.acked.has(channelKey)) {
+      this.draining.acked.add(channelKey);
+      void this.deps.platforms.get(o.platform)?.send({ ...o.replyTarget, replyToMessageId: o.ref.messageId },
+        "⏳ UniQlaw is restarting. Your message is saved and will be answered right after.").catch(() => {});
+    }
+    return true;
+  }
+
+  /** Replay input deferred during a drain (also after a crash mid-drain). At-most-once: rows are deleted as they
+   *  are read, so a crash right after this does not replay them twice. Returns how many were replayed. */
+  async replayDeferred(): Promise<number> {
+    const rows = this.deps.store.takeDeferred();
+    for (const r of rows) {
+      let input: QueuedInput;
+      try { input = JSON.parse(r.payload) as QueuedInput; } catch { continue; }
+      this.rearmTask(input.origin);
+      try { await this.runtime(r.channelKey).enqueue(input); }
+      catch (e) { this.deps.log.warn("deferred input dropped", { key: r.channelKey, e: String(e) }); }
+    }
+    if (rows.length) this.deps.log.info("replayed deferred input", { n: rows.length });
+    return rows.length;
+  }
+
+  /**
+   * After a restart nobody waits for the open tasks of the previous process. Each one is either
+   *  - re-armed: its request is about to be replayed, or the turn answering it kept running in a reattached session
+   *    (inflight-turn) → the answer goes to the asker as usual;
+   *  - failed: the turn answering it died with the daemon → the asking session is told (if the task is recent).
+   * Returns the failed tasks that were reported to their askers.
+   */
+  resumeTasks(): { taskId: string; from: string; to: string }[] {
+    // Call before restore(): reopening a session consumes its inflight-turn key.
+    const origins: Origin[] = [];
+    for (const [, v] of this.deps.store.entries("inflight-turn:")) { try { origins.push(...(JSON.parse(v) as Origin[])); } catch {} }
+    for (const r of this.deps.store.listDeferred()) { try { origins.push((JSON.parse(r.payload) as QueuedInput).origin); } catch {} }
+    for (const o of origins) this.rearmTask(o);
+    const armed = new Set(this.waiters.keys());
+    const failed: { taskId: string; from: string; to: string }[] = [];
+    const now = Date.now();
+    for (const t of this.deps.store.openTasks()) {
+      if (armed.has(t.taskId)) continue;
+      const why = "interrupted: the UniQlaw daemon restarted before it finished";
+      this.deps.store.updateTask(t.taskId, "failed", why);
+      if (now - t.updatedAt > STALE_TASK_MS || !this.deps.store.getSession(t.fromSession)) continue;
+      failed.push({ taskId: t.taskId, from: t.fromSession, to: t.toSession });
+      if (t.mode === "ask") this.deliverAsyncResult(t.fromSession, t.toSession, t.taskId, 0, { ok: false, text: `${why}. Ask again if you still need it.` });
+      else this.deps.store.pushPending(t.fromSession, "peer-result", { label: `your agent_trigger to ${t.toSession} (task ${t.taskId}) failed`, text: why });
+    }
+    return failed;
+  }
+
+  /** Register a waiter for a task that survived a restart (replayed or still running). */
+  private rearmTask(o: Origin): boolean {
+    if (o.kind !== "peer" || (o.mode !== "ask" && o.mode !== "trigger") || this.waiters.has(o.taskId)) return false;
+    const t = this.deps.store.getTask(o.taskId);
+    if (!t || (t.state !== "submitted" && t.state !== "working")) return false;
+    this.waiters.set(o.taskId, this.asyncWaiter(o.mode, o.fromSession, t.toSession, o.taskId, o.hop));
+    return true;
+  }
+
+  /** Where the answer of an asynchronous task goes: ask → a result turn for the asker, trigger → an echo. */
+  private asyncWaiter(mode: "ask" | "trigger", from: string, to: string, taskId: string, hop: number): TaskWaiter {
+    if (mode === "ask") return { resolve: (r) => this.deliverAsyncResult(from, to, taskId, hop, r) };
+    return { resolve: (r) => {
+      // Only sessions get the echo; CLI/API callers ("cli", "api", …) are not sessions.
+      if (this.deps.store.getSession(from)) this.deps.store.pushPending(from, "peer-result", { label: `trigger response from ${to}`, text: r.text });
+    } };
   }
 
   parseTargetString(s: string): Target | undefined {

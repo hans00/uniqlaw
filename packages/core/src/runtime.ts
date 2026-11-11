@@ -58,6 +58,9 @@ export interface RuntimeHost {
   onUsageLimit?(channelKey: string, failed: { origins: Origin[]; input?: TurnInput }): Promise<boolean>;
   /** Called when a peer ask/trigger turn finishes. */
   onTaskResult(taskId: string, ok: boolean, text: string): void;
+  /** Graceful restart: return true to take this input away (it is persisted and replayed after the restart)
+   *  instead of letting it start a turn now. */
+  deferInput?(channelKey: string, input: QueuedInput): boolean;
   /** Optional: bounded transcript for UIs. */
   transcript?: TranscriptStore;
   /** Optional: live runtime events (dashboard SSE). */
@@ -94,6 +97,8 @@ const STREAM_MIN_CHARS = 24;
 const MAX_RATE_LIMIT_RETRIES = 3;
 /** How long after reopening a turn may still claim the origins of the turn that was in flight at detach. */
 const RESUME_ORIGINS_MS = 120_000;
+/** How long a reopened session holds queued input back while its reattached turn may still claim the resumed origins. */
+const RESUME_GRACE_MS = 3000;
 /** First retry delay; doubles each attempt. Overridable for tests via UNIQLAW_RATE_LIMIT_BACKOFF_MS. */
 const rateLimitBackoffMs = () => Number(process.env.UNIQLAW_RATE_LIMIT_BACKOFF_MS ?? 30_000);
 const INTERRUPT_SETTLE_MS = 8000;
@@ -132,6 +137,13 @@ export class ChannelRuntime {
   private activeModel?: string;
   /** Set while a scheduled turn's model override is in effect: the model to switch back to. */
   private modelRestore?: { model?: string };
+  /** finishTurn calls still running (they post to platforms after the state went back to idle). */
+  private finishing = 0;
+  /** A rate-limited turn waiting for its retry (state stays "running", turn is undefined meanwhile). */
+  private retrying?: { origins: Origin[] };
+  /** After reopening on a turn that was in flight at detach: give the reattached turn a moment to claim its
+   *  origins before a queued input could start a turn of its own and take them. */
+  private resumeGraceUntil = 0;
 
   constructor(
     readonly channelKey: string,
@@ -150,6 +162,13 @@ export class ChannelRuntime {
   get capabilities() { return this.provider.capabilities(this.profile); }
   get queueLength() { return this.queue.length; }
   get currentOrigins(): Origin[] { return this.turn?.origins ?? []; }
+
+  /** A turn is in flight: running, being interrupted, waiting for a rate-limit retry, or still delivering its end. */
+  get busy(): boolean { return this.state === "running" || this.state === "interrupting" || this.finishing > 0; }
+  /** Who the in-flight turn answers (also during a rate-limit backoff, when there is no turn object). */
+  inflightOrigins(): Origin[] { return this.turn?.origins ?? this.retrying?.origins ?? []; }
+  /** The provider process survives a daemon stop (claude-tmux): an in-flight turn keeps running. */
+  get canDetach(): boolean { return !!this.session?.detach; }
 
   /** Max peer hop in the current turn (for delegation hop counting). */
   currentHop(): number {
@@ -188,6 +207,8 @@ export class ChannelRuntime {
   async enqueue(input: QueuedInput): Promise<void> {
     if (input.origin.kind === "human") this.rememberTarget(input.origin.replyTarget);
     this.touch();
+    // Draining for a restart: no new turn, no steer / interrupt into the running one; replayed after the restart.
+    if (this.host.deferInput?.(this.channelKey, input)) return;
     const slash = isPassthroughSlashCommand(input.item.text) && input.origin.kind === "human";
     if (this.state === "closed" || this.state === "opening") {
       this.push(input);
@@ -257,8 +278,11 @@ export class ChannelRuntime {
     if (this.session?.detach) {
       // A turn still running in the provider (e.g. claude-tmux keeps working through a reload): remember who it
       // answers, so the reattached session delivers the reply to them instead of treating it as background output.
-      const keep = (this.turn?.origins ?? []).filter((o) => o.kind === "human" || (o.kind === "scheduler" && !o.taskId));
-      if (this.state === "running" && keep.length) this.host.store.set(`inflight-turn:${this.channelKey}`, JSON.stringify(keep));
+      // Peer ask/trigger origins are kept too: the next daemon re-registers their tasks, so the answer still
+      // reaches the asking session (ChannelManager.resumeTasks).
+      const keep = this.inflightOrigins().filter((o) => o.kind === "human" || (o.kind === "scheduler" && !o.taskId)
+        || (o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")));
+      if (this.busy && keep.length) this.host.store.set(`inflight-turn:${this.channelKey}`, JSON.stringify(keep));
       const s = this.session;
       this.session = undefined;
       this.stopTyping();
@@ -275,6 +299,7 @@ export class ChannelRuntime {
 
   async close(): Promise<void> {
     clearTimeout(this.retryTimer);
+    this.retrying = undefined;
     clearTimeout(this.stallTimer);
     this.stopTyping();
     clearTimeout(this.interruptTimer);
@@ -323,14 +348,18 @@ export class ChannelRuntime {
           ...(worker ? { worker } : {}),
         }),
         mcp: gw,
-        env: await this.host.providerEnv(this.profile),
+        // UNIQLAW_SESSION: lets `uniqlaw restart` / `reload` run from the agent's shell name the session asking.
+        env: { ...(await this.host.providerEnv(this.profile)), UNIQLAW_SESSION: this.channelKey },
         instanceId: this.host.instanceId,
         nativeMemory: !this.host.settings.memory.enabled || this.host.settings.memory.nativeMemory,
       });
       const inflight = this.host.store.get(`inflight-turn:${this.channelKey}`);
       if (inflight) {
         this.host.store.del(`inflight-turn:${this.channelKey}`);
-        try { this.resumeOrigins = { origins: JSON.parse(inflight) as Origin[], until: Date.now() + RESUME_ORIGINS_MS }; } catch {}
+        try {
+          this.resumeOrigins = { origins: JSON.parse(inflight) as Origin[], until: Date.now() + RESUME_ORIGINS_MS };
+          this.resumeGraceUntil = Date.now() + RESUME_GRACE_MS;
+        } catch {}
       }
       this.session = session;
       this.state = "idle";
@@ -355,6 +384,12 @@ export class ChannelRuntime {
 
   private async drain(): Promise<void> {
     if (this.state !== "idle" || !this.session || this.queue.length === 0) return;
+    if (this.host.deferInput) {
+      this.queue = this.queue.filter((q) => !this.host.deferInput!(this.channelKey, q));
+      if (!this.queue.length) return;
+    }
+    // The reattached provider may still be in the turn that was in flight at detach: let it claim its origins first.
+    if (this.resumeOrigins && Date.now() < this.resumeGraceUntil) return this.scheduleDrain(250);
     const debounce = this.host.settings.queue.debounceMs;
     const wait = debounce - (Date.now() - this.lastEnqueuedAt);
     // Only debounce when several messages are piling up (first message goes out immediately).
@@ -416,6 +451,8 @@ export class ChannelRuntime {
 
   /** Queued inputs not yet sent (moved to the new runtime when the chat switches profile). */
   takeQueue(): QueuedInput[] { return this.queue.splice(0); }
+  /** Summaries of inputs dropped because the queue was full (not yet shown to the agent). */
+  takeDropped(): string[] { return this.dropped.splice(0); }
 
   private drainPendingNotes(): (PendingNote & { raw?: boolean })[] {
     return this.host.store.drainPending(this.channelKey).map((p) => {
@@ -733,6 +770,11 @@ export class ChannelRuntime {
   }
 
   private async finishTurn(reason: "done" | "interrupted" | "error", error?: string) {
+    this.finishing++;
+    try { await this.finishTurnInner(reason, error); } finally { this.finishing--; }
+  }
+
+  private async finishTurnInner(reason: "done" | "interrupted" | "error", error?: string) {
     clearTimeout(this.stallTimer);
     // Segments that streamed but never got a final (interrupt / error): freeze what was shown.
     for (const [id, seg] of [...this.live]) await this.finishLive(id, this.liveView(seg.buf));
@@ -764,8 +806,10 @@ export class ChannelRuntime {
       this.log.warn("rate limited; retrying", { attempt: n, delayMs: delay });
       if (n === 1) await this.postTo(turn, `⏳ Rate limited by the model provider — retrying automatically (up to ${MAX_RATE_LIMIT_RETRIES}×).`);
       this.state = "running"; // hold the queue until the retry has been sent
+      this.retrying = { origins: turn.origins };
       clearTimeout(this.retryTimer);
       this.retryTimer = setTimeout(() => {
+        this.retrying = undefined;
         this.state = this.session ? "idle" : "closed";
         void this.startTurn(turn.origins, turn.input!, n);
       }, delay);

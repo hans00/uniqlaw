@@ -233,6 +233,7 @@ export function busToolsPrompt(toolNames: string[]): string {
     "- `send_file`: post a local file (image, audio, voice note, video, document) to your chat or another chat target. Use it instead of calling a chat platform's API.",
     ...(toolNames.includes("worker_start") ? ["- `worker_start` / `worker_stop`: run another coding agent (a profile) in a directory on this machine and hand it work; follow up with `agent_ask` to `worker:<name>`."] : []),
     ...(toolNames.includes("cron_save") ? ["- `cron_list` / `cron_save` / `cron_delete`: manage your scheduled jobs (validated cron; prefer these over editing job files)."] : []),
+    ...(toolNames.includes("daemon_restart") ? ["- `daemon_restart` (operator's own chat only; `uniqlaw restart` / `reload` from a shell does the same): restart or reload UniQlaw gracefully. It returns at once: finish your reply as usual — the restart waits for it, and you get a `[uniqlaw]` notice as a new turn when it is back."] : []),
     "When you receive a message from another agent session, answer once and stop; do not reply to replies unless asked a question.",
   ].join("\n");
 }

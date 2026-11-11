@@ -102,6 +102,11 @@ export const settingsSchema = z.object({
      *  permission/input request waits for a human. Raise it for long silent tools. */
     stallTimeoutSec: z.number().int().nonnegative().default(900),
   }).prefault({}),
+  /** Graceful restart / reload (`uniqlaw restart`, `uniqlaw reload`, daemon_restart): new turns wait, running ones
+   *  get this long to finish; turns still running then are recorded as interrupted and their sessions told. */
+  restart: z.object({
+    drainTimeoutSec: z.number().int().nonnegative().default(120),
+  }).prefault({}),
   bus: z.object({
     maxHops: z.number().int().positive().default(4),
     askTimeoutSec: z.number().int().positive().default(600),
