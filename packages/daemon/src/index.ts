@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import {
   BRAND_PROMPT, ChannelManager, channelPolicyWarnings, ISOLATED_SCOPE_PROMPT, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
   createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, RestartCoordinator, type MemoryOriginKind, type RestartKind,
+  ApprovalAudit, type ApprovalJudge, type ApprovalJudgeConfig,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
   type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transcriber, type Transport,
 } from "@uniqlaw/core";
@@ -34,6 +35,17 @@ const BUILTIN: Record<string, () => Promise<{ default: PluginDef }>> = {
   whisper: () => import("@uniqlaw/transcriber/whisper") as Promise<{ default: PluginDef }>,
   "transcribe-api": () => import("@uniqlaw/transcriber/api") as Promise<{ default: PluginDef }>,
 };
+/** Approval judge providers (`permissions.approval.judge.provider`, docs §10.4). */
+export const JUDGE_PROVIDERS: Record<string, (cfg: ApprovalJudgeConfig) => Promise<ApprovalJudge>> = {
+  "typesafe-jev": async (cfg) => {
+    const ref = cfg.credential;
+    if (!ref) throw new Error("typesafe-jev needs judge.credential (a secret ref to the TypeSafe API key)");
+    const { JevJudge } = await import("@uniqlaw/judge-typesafe");
+    // The key is resolved on the first request (a command ref such as `nibwarden read …` runs only then).
+    return new JevJudge({ key: () => resolveSecret(ref), ...(cfg.model ? { model: cfg.model } : {}) });
+  },
+};
+
 /** Built-ins that load unless explicitly disabled. */
 const DEFAULT_ON = ["cron"];
 
@@ -134,6 +146,18 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
     }
     if (!profiles.has(settings.bindings.default)) throw new Error(`bindings.default "${settings.bindings.default}" is not a profile`);
 
+    // ── approval judges ── A judge that can't be built leaves its profile's requests with the operator.
+    const judges = new Map<string, ApprovalJudge>();
+    for (const p of profiles.values()) {
+      const cfg = p.permissions.approval.judge;
+      if (!cfg || cfg.mode === "off") continue;
+      const make = JUDGE_PROVIDERS[cfg.provider];
+      if (!make) { log.error(`profile "${p.name}": unknown approval judge provider "${cfg.provider}"; requests go to the operator`); continue; }
+      try { judges.set(p.name, await make(cfg)); log.info(`profile "${p.name}": approval judge ${cfg.provider} (${cfg.mode})`); }
+      catch (e) { log.error(`profile "${p.name}": approval judge ${cfg.provider} unavailable: ${e instanceof Error ? e.message : String(e)}; requests go to the operator`); }
+    }
+    const approvalAudit = new ApprovalAudit(join(stateDir, "approvals"));
+
     // ── memory ──
     const memory = settings.memory.enabled
       ? new MemoryStore(projectDir, store, { dir: settings.memory.dir, maxInjectBytes: settings.memory.maxInjectBytes, timezone: settings.timezone })
@@ -162,6 +186,8 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
     manager = new ChannelManager({
       log, settings, store, transcript, projectDir, instanceId, providers, platforms, profiles, ...(transcriber ? { transcriber } : {}),
       gatewayFor: (key) => gateway.endpointFor(key),
+      approvalJudge: (profile) => judges.get(profile.name),
+      approvalAudit,
       systemPrompt: (profile, multiparty, toolNames, session) => buildSystemPrompt(projectDir, settings, profile, multiparty, toolNames, session, memory),
       providerEnv: async () => {
         const env: Record<string, string> = {};

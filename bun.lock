@@ -53,6 +53,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@uniqlaw/core": "workspace:*",
+        "@uniqlaw/judge-typesafe": "workspace:*",
         "@uniqlaw/platform-discord": "workspace:*",
         "@uniqlaw/platform-line": "workspace:*",
         "@uniqlaw/platform-slack": "workspace:*",
@@ -71,6 +72,13 @@
       "devDependencies": {
         "@modelcontextprotocol/sdk": "^1.32.0",
         "zod": "^4.6.6",
+      },
+    },
+    "packages/judge-typesafe": {
+      "name": "@uniqlaw/judge-typesafe",
+      "version": "0.1.0",
+      "dependencies": {
+        "@uniqlaw/core": "workspace:*",
       },
     },
     "packages/platform-discord": {
@@ -500,6 +508,8 @@
     "@uniqlaw/credentials": ["@uniqlaw/credentials@workspace:packages/credentials"],
 
     "@uniqlaw/daemon": ["@uniqlaw/daemon@workspace:packages/daemon"],
+
+    "@uniqlaw/judge-typesafe": ["@uniqlaw/judge-typesafe@workspace:packages/judge-typesafe"],
 
     "@uniqlaw/platform-discord": ["@uniqlaw/platform-discord@workspace:packages/platform-discord"],
 

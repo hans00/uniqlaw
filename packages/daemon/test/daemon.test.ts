@@ -114,3 +114,13 @@ test("cron is on by default and its MCP tools manage job files", async () => {
   expect(JSON.parse(list.content[0]!.text)[0]).toMatchObject({ name: "standup", target: "tg:100" });
   await c.close();
 });
+
+test("a profile whose approval judge can't be built still boots (its requests go to the operator)", async () => {
+  const dir = project();
+  const p = join(dir, ".uniqlaw", "settings.json");
+  const s = JSON.parse(await Bun.file(p).text());
+  s.profiles.main.permissions = { approval: { judge: { provider: "no-such-judge", mode: "enforce" } } };
+  writeFileSync(p, JSON.stringify(s));
+  const d = await start(dir);
+  expect(d.manager.profileFor("tg:100").permissions.approval.judge!.provider).toBe("no-such-judge");
+});
