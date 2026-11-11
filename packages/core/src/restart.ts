@@ -386,7 +386,8 @@ export class RestartCoordinator {
 
   // ── agent tool ───────────────────────────────────────────────────────────
 
-  /** daemon_restart: operators' own chat sessions only (until per-channel tool policy gates it with "config"). */
+  /** daemon_restart: operators' own chat sessions only, in a turn the operator started (until per-channel tool policy
+   *  gates it with "config"). */
   tools(): GatewayTool[] {
     return [{
       name: "daemon_restart",
@@ -403,6 +404,8 @@ export class RestartCoordinator {
       },
       handler: async (a, caller) => {
         if (!this.d.manager.isOperatorChat(caller)) throw new Error("daemon_restart is only available in an operator's own chat session");
+        // Not on behalf of someone else: agent_ask / agent_trigger / cron turns reaching the operator's session are refused.
+        if (!this.d.manager.turnFromOperator(caller)) throw new Error("daemon_restart needs a message from the operator in this turn (not a peer, cron or async-result turn)");
         if (a.cancel) return this.cancel();
         const at = parseWhen({ in: a.in as string | undefined, at: a.at as string | undefined }, this.d.settings.timezone);
         return this.request({ kind: (a.kind as RestartKind | undefined) ?? "restart", requestedBy: caller, reason: a.reason as string | undefined,

@@ -850,6 +850,11 @@ export class ChannelManager {
 
   get isDraining(): boolean { return !!this.draining; }
 
+  /** The turn running in this session includes a message from an operator (not only peer / cron / result input). */
+  turnFromOperator(channelKey: string): boolean {
+    return (this.runtimes.get(channelKey)?.inflightOrigins() ?? []).some((o) => o.kind === "human" && o.trusted);
+  }
+
   /** An operator's own DM session (the chat of a platform operator target). */
   isOperatorChat(channelKey: string): boolean {
     for (const p of this.deps.platforms.values()) {

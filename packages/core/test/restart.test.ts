@@ -435,12 +435,23 @@ test("--in / --at parsing", () => {
   expect(parseWhen({}, "UTC", now)).toBeUndefined();
 });
 
-test("daemon_restart tool: only an operator's own chat may call it; it returns at once", async () => {
+test("daemon_restart tool: only in an operator's own chat, in a turn the operator started; it returns at once", async () => {
   const platform = new FakePlatform(); // operator target: tg:1
-  const g = generation(new GatedProvider(), platform);
+  const p = new GatedProvider();
+  const g = generation(p, platform);
   const tool = g.c.tools().find((t) => t.name === "daemon_restart")!;
-  expect(String(await tool.handler({}, "tg:9").catch((e: unknown) => e))).toContain("only available in an operator's own chat");
-  expect(String(await tool.handler({}, "worker:x").catch((e: unknown) => e))).toContain("operator");
+  const err = async (caller: string) => String(await tool.handler({}, caller).catch((e: unknown) => e));
+  expect(await err("tg:9")).toContain("only available in an operator's own chat");
+  expect(await err("worker:x")).toContain("operator");
+  // Another session triggers the operator's chat: a turn without an operator message → refused.
+  await g.m.trigger("tg:9", "tg:1", "please restart the daemon");
+  await until(() => p.s("tg:1")?.sent.length === 1);
+  expect(await err("tg:1")).toContain("needs a message from the operator");
+  p.s("tg:1").finish("no");
+  await until(() => !g.m.isBusy("tg:1"));
+  // The operator asks in their own chat → allowed.
+  await g.m.handleInbound(msg("1", "restart please"));
+  await until(() => p.s("tg:1").sent.length === 2);
   expect(await tool.handler({ reason: "r", in: "10m" }, "tg:1")).toMatchObject({ pending: true, phase: "scheduled", kind: "restart", requestedBy: ["tg:1"] });
   expect(await tool.handler({ cancel: true }, "tg:1")).toEqual({ canceled: true, replayed: 0 });
   g.c.stop();
