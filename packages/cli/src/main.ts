@@ -24,8 +24,9 @@ const USAGE = `uniqlaw <command> [options]
                                                --from SESSION names the asking session (default: $UNIQLAW_SESSION)
   status   [--project DIR]                     show daemon + session status
   ls                                           list UniQlaw instances on this machine
-  send     <target> <text...> [--project DIR]  post text to a chat (e.g. telegram:<chatId>)
-  trigger  <target> <prompt...> [--project DIR] make a session answer its own chat
+  send     <target> <text...> [--project DIR]  post text to a chat (e.g. telegram:<chatId>); text that starts
+                                               with "-": put -- before it
+  trigger  <target> <prompt...> [--project DIR] make a session answer its own chat (-- as for send)
   pairing  [list|approve <code>|deny <code>|revoke <platform> <userId>]  DM pairing requests and paired users
   workers  [--project DIR]                     list worker sessions (other coding agents started by sessions)
   worker   start <name> --profile P [--cwd DIR] [task...]   start a worker (and hand it a task)
@@ -68,7 +69,7 @@ const COMMAND_FLAGS: Record<string, string[]> = {
 };
 
 /** A command's lines from USAGE (with its continuation lines), or init's own longer help. */
-export function usageFor(cmd: string): string {
+function usageFor(cmd: string): string {
   if (cmd === "init") return INIT_HELP;
   const lines = USAGE.split("\n");
   const out: string[] = [];
@@ -81,7 +82,7 @@ export function usageFor(cmd: string): string {
 }
 
 /** Argument parsing. Everything after a bare `--` is positional (to send text that looks like a flag). */
-export function parse(argv: string[]) {
+function parse(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
   const pos: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -98,7 +99,7 @@ export function parse(argv: string[]) {
 }
 
 /** `--help` / `-h` anywhere before a bare `--`. Checked before anything else runs. */
-export function wantsHelp(args: string[]): boolean {
+function wantsHelp(args: string[]): boolean {
   const dd = args.indexOf("--");
   return (dd < 0 ? args : args.slice(0, dd)).some((a) => a === "--help" || a === "-h");
 }
@@ -121,16 +122,18 @@ async function main() {
   // Help first: no daemon contact, no file writes, no side effects of any kind.
   if (cmd === undefined || cmd === "help" || cmd === "--help" || cmd === "-h") {
     const topic = cmd === "help" ? rest[0] : undefined;
-    console.log(topic && topic in COMMAND_FLAGS ? usageFor(topic) : USAGE);
+    console.log(topic && Object.hasOwn(COMMAND_FLAGS, topic) ? usageFor(topic) : USAGE);
     return;
   }
-  if (!(cmd in COMMAND_FLAGS)) { console.error(`unknown command "${cmd}"\n\n${USAGE}`); process.exit(1); }
+  if (!Object.hasOwn(COMMAND_FLAGS, cmd)) { console.error(`unknown command "${cmd}"\n\n${USAGE}`); process.exit(1); }
   if (wantsHelp(rest)) { console.log(usageFor(cmd)); return; }
   const { flags, pos } = parse(rest);
   const allowed = new Set(["project", ...COMMAND_FLAGS[cmd]!]);
-  const unknown = Object.keys(flags).filter((k) => !allowed.has(k));
+  const dd = rest.indexOf("--");
+  const unknown = [...Object.keys(flags).filter((k) => !allowed.has(k)).map((k) => `--${k}`),
+    ...(dd < 0 ? rest : rest.slice(0, dd)).filter((a) => /^-[^-]/.test(a) && !Object.values(flags).includes(a))];
   if (unknown.length) {
-    console.error(`unknown option${unknown.length > 1 ? "s" : ""} ${unknown.map((k) => `--${k}`).join(", ")} for \`uniqlaw ${cmd}\`\n\n${usageFor(cmd)}`);
+    console.error(`unknown option${unknown.length > 1 ? "s" : ""} ${unknown.join(", ")} for \`uniqlaw ${cmd}\` (put -- before text that starts with "-")\n\n${usageFor(cmd)}`);
     process.exit(2);
   }
   const projectDir = flags.project !== undefined ? resolve(String(flags.project)) : cmd === "init" ? process.cwd() : findProjectDir(process.cwd());
@@ -359,7 +362,7 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
   }
 }
 
-if (import.meta.main) main().catch((e) => { console.error(`error: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); });
+main().catch((e) => { console.error(`error: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); });
 
 function formatDreamReport(r: DreamReport): string {
   const out = [`${r.dryRun ? "Dry run" : "Sweep"} ${r.day}: ${r.considered} recent entries, ${r.candidates.length} candidate(s).`];

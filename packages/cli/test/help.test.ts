@@ -96,7 +96,7 @@ test("`uniqlaw`, `uniqlaw --help`, `-h`, `help` print the global usage and exit 
 
 test("unknown options are rejected with exit 2 before anything runs", async () => {
   for (const args of [["stop", "--bogus"], ["restart", "--in", "1m", "--foce"], ["send", "telegram:1", "hi", "--bogus", "x"],
-    ["worker", "stop", "w1", "--forgett"], ["pairing", "approve", "ABCD1234", "--yes"], ["start", "--project=."], ["dream", "--dryrun"]]) {
+    ["worker", "stop", "w1", "--forgett"], ["pairing", "approve", "ABCD1234", "--yes"], ["start", "--project=."], ["dream", "--dryrun"], ["stop", "-x"], ["send", "telegram:1", "-v"]]) {
     hits.length = 0;
     const before = snapshot();
     const r = await cli(args);
@@ -109,11 +109,13 @@ test("unknown options are rejected with exit 2 before anything runs", async () =
 });
 
 test("unknown command exits 1 without contacting anything", async () => {
-  hits.length = 0;
-  const r = await cli(["stpo"]);
-  expect(r.code).toBe(1);
-  expect(r.stderr).toContain('unknown command "stpo"');
-  expect(hits).toEqual([]);
+  for (const c of ["stpo", "toString", "constructor"]) {
+    hits.length = 0;
+    const r = await cli([c, "--help"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain(`unknown command "${c}"`);
+    expect(hits).toEqual([]);
+  }
 });
 
 test("control: without --help the same harness does see the API call (so the checks above are meaningful)", async () => {
