@@ -126,7 +126,9 @@ export class ClaudeTmuxProvider implements AgentProvider {
 
     log.info("spawning claude", { name, resume: !!existing, providerSessionId });
     await spawn(!!existing);
-    rmSync(tailStateFile, { force: true }); // a new claude process: an old position means nothing
+    // A fresh session id: an old position means nothing. --resume (claude exited while the daemon was down) keeps
+    // appending to the same jsonl, so the saved position still applies.
+    if (!existing) rmSync(tailStateFile, { force: true });
     const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings, tailStateFile },
       existing ? "end" : "start");
     await s.start({ reattach: false, readyTimeoutMs: this.cfg.readyTimeoutMs });

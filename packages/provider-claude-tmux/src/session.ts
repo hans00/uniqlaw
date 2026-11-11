@@ -165,7 +165,11 @@ export class ClaudeTmuxSession implements AgentSession {
       this.tailer.start();
       // Otherwise (e.g. sitting on a permission dialog: neither busy nor ready) the first poll classifies it.
     } else {
-      this.tailer.start();
+      // Respawned with --resume after claude exited while the daemon was down: same session id, same jsonl. Continue
+      // from the saved position once it is ready (idle), so a reply written before it exited still comes out.
+      const saved = this.takeTailState();
+      if (saved) this.tailer.resumeFrom(saved);
+      else this.tailer.start();
       const r = await waitForReady(this.tmux, this.name, {
         timeoutMs: o.readyTimeoutMs,
         onPrompt: (label) => this.log.info(`startup prompt handled: ${label}`),
@@ -178,6 +182,7 @@ export class ClaudeTmuxSession implements AgentSession {
       }
       if (r.status === "ready") this.setIdle();
       else this.log.warn("claude needs login; waiting for operator");
+      if (saved) this.tailer.start();
     }
     this.schedulePoll(0);
   }
