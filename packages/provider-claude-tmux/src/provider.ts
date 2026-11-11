@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
 import {
-  baseChildEnv, buildPermissionArgs, nativeMemoryArgs, claudeEnvForCredential, composeAppendSystemPrompt, locateJsonl,
+  baseChildEnv, buildPermissionArgs, claudeSettingsArgs, claudeEnvForCredential, composeAppendSystemPrompt, locateJsonl,
   MCP_SERVER_NAME, mcpToolId, writeMcpConfig,
 } from "@uniqlaw/claude-common";
 import { Tmux } from "./tmux.ts";
@@ -90,7 +90,12 @@ export class ClaudeTmuxProvider implements AgentProvider {
         argv.push("--append-system-prompt-file", file);
       }
       if (spec.mcp) argv.push("--mcp-config", writeMcpConfig(join(dir, "mcp.json"), spec.mcp.url));
-      argv.push(...nativeMemoryArgs(spec.isolated ? false : spec.nativeMemory));
+      // Approval judge on: Claude Code's PermissionRequest hook hands the structured request to the daemon first
+      // (judge off: no hook, the flags stay exactly as before).
+      const judge = spec.profile.permissions.approval.judge;
+      const hookUrl = judge && judge.mode !== "off" && spec.profile.permissions.approval.mode === "ask-operator" ? spec.mcp?.permissionHookUrl : undefined;
+      argv.push(...claudeSettingsArgs({ nativeMemory: spec.isolated ? false : spec.nativeMemory,
+        ...(hookUrl ? { permissionHook: { url: hookUrl, timeoutSec: Math.ceil(judge!.timeoutMs / 1000) + 5 } } : {}) }));
       // Operator extras could re-add settings sources or MCP servers: not for remote-driven sessions.
       if (opts.extraArgs?.length && !spec.isolated) argv.push(...opts.extraArgs);
       return argv;

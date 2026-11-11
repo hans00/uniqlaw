@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ApprovalAudit, ChannelManager, DEFAULT_PERMISSIONS, StateStore, buildJudgeInput, decideOutcome, hardPolicyDeny, parseSettings,
+  ApprovalAudit, ChannelManager, DEFAULT_PERMISSIONS, McpGateway, StateStore, buildJudgeInput, decideOutcome, hardPolicyDeny, parseSettings,
   redactInput, runJudge, silentLogger, thresholdFor,
   type ApprovalJudge, type ApprovalJudgeConfig, type InboundMessage, type JudgeInput, type PermissionPolicy, type Profile,
 } from "../src/index.ts";
@@ -137,7 +137,7 @@ class FakeJudge implements ApprovalJudge {
   async judge(i: JudgeInput) { this.calls.push(i); return this.answer(i); }
 }
 
-function setup(script: Script, o: { judge?: Partial<ApprovalJudgeConfig> | "none"; fake?: FakeJudge; policy?: Partial<PermissionPolicy>; timeoutSec?: number } = {}) {
+function setup(script: Script, o: { judge?: Partial<ApprovalJudgeConfig> | "none"; fake?: FakeJudge; policy?: Partial<PermissionPolicy>; timeoutSec?: number; gateway?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "uq-judge-"));
   const store = new StateStore(join(dir, "state.db"));
   const settings = parseSettings({ profiles: { main: { provider: "fake" } }, output: { toolStatus: false }, queue: { debounceMs: 0 } });
@@ -148,10 +148,13 @@ function setup(script: Script, o: { judge?: Partial<ApprovalJudgeConfig> | "none
     permissions: { ...DEFAULT_PERMISSIONS, ...o.policy, approval: { mode: "ask-operator", timeoutSec: o.timeoutSec ?? 5, ...(judgeCfg ? { judge: judgeCfg } : {}) } } };
   const audit = new ApprovalAudit(join(dir, "approvals"));
   const judge = o.fake ?? new FakeJudge(() => ({ pSafe: 0.95 }));
-  const mgr = new ChannelManager({
+  let gw: McpGateway | undefined;
+  let mgr!: ChannelManager;
+  if (o.gateway) { gw = new McpGateway(() => mgr, silentLogger); gw.start("127.0.0.1", 0); cleanups.push(() => gw!.stop()); }
+  mgr = new ChannelManager({
     log: silentLogger, settings, store, projectDir: dir, instanceId: "test", a2aSessionsBase: dir,
     providers: new Map([["fake", provider]]), platforms: new Map([["tg", platform]]), profiles: new Map([["main", profile]]),
-    gatewayFor: () => undefined, systemPrompt: async () => ({ fragments: [] }), providerEnv: async () => ({}),
+    gatewayFor: (k) => gw?.endpointFor(k), systemPrompt: async () => ({ fragments: [] }), providerEnv: async () => ({}),
     approvalJudge: () => judge, approvalAudit: audit,
   });
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }), () => store.close(), () => mgr.stop());
@@ -160,7 +163,7 @@ function setup(script: Script, o: { judge?: Partial<ApprovalJudgeConfig> | "none
     if (!existsSync(d)) return [] as Record<string, unknown>[];
     return readdirSync(d).flatMap((f) => readFileSync(join(d, f), "utf8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>));
   };
-  return { mgr, provider, platform, judge, auditRows, dir };
+  return { mgr, provider, platform, judge, auditRows, dir, gw };
 }
 
 const inbound = (text: string, extra: Partial<InboundMessage> = {}): InboundMessage => ({ platform: "tg", channelKey: "global", replyTarget: { platform: "tg", chatId: "100" },
@@ -271,5 +274,77 @@ describe("judge stage in the runtime", () => {
     await permissionOf(r);
     expect(r.platform.choices).toHaveLength(1);
     expect(r.auditRows()[0]).toMatchObject({ outcome: "escalate", reason: "unstructured-input", structured: false });
+  });
+});
+
+// ── permission hook (claude-tmux PermissionRequest → gateway) ─────────────
+
+describe("permission hook", () => {
+  const post = async (r: ReturnType<typeof setup>, key: string, body: unknown) => {
+    const url = r.gw!.endpointFor(key)!.permissionHookUrl!;
+    const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    return { status: res.status, json: res.status === 200 ? await res.json() as Record<string, any> : undefined };
+  };
+  const hookBody = (tool: string, input: unknown) => ({ session_id: "s", cwd: "/x", permission_mode: "default", hook_event_name: "PermissionRequest", tool_name: tool, tool_input: input,
+    permission_suggestions: [{ type: "addRules", destination: "localSettings" }] });
+  /** A provider whose turn waits, so the hook arrives mid-turn like claude-tmux's. */
+  const waiting = (): { script: Script; release: () => void } => {
+    let release!: () => void;
+    const p = new Promise<void>((r) => (release = r));
+    return { script: async (_i, s) => { await p; s.emit({ type: "turn_end", turnId: s.turnId(), reason: "done" }); }, release: () => release() };
+  };
+
+  test("unknown token → 401; no session or judge off → {} (the dialog decides)", async () => {
+    const w = waiting();
+    const r = setup(w.script, { judge: { mode: "off" }, gateway: true });
+    const base = r.gw!.endpointFor("global")!.permissionHookUrl!;
+    expect((await fetch(base.replace(/hook\/[a-f0-9]+/, "hook/deadbeef"), { method: "POST", body: "{}" })).status).toBe(401);
+    expect((await post(r, "global", hookBody("Bash", { command: "ls" }))).json).toEqual({}); // no runtime yet
+    await r.mgr.handleInbound(inbound("go"));
+    await until(() => r.provider.sessions.get("global")?.sent.length === 1);
+    expect((await post(r, "global", hookBody("Bash", { command: "ls" }))).json).toEqual({});
+    expect(r.judge.calls).toHaveLength(0);
+    w.release();
+  });
+
+  test("enforce: allow and hard-policy deny answer the hook; nothing reaches the operator", async () => {
+    const w = waiting();
+    const r = setup(w.script, { judge: { mode: "enforce" }, gateway: true });
+    await r.mgr.handleInbound(inbound("list files"));
+    await until(() => r.provider.sessions.get("global")?.sent.length === 1);
+    expect((await post(r, "global", hookBody("Bash", { command: "ls", description: "List" }))).json)
+      .toEqual({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
+    expect(r.judge.calls[0]).toMatchObject({ tool: "Bash", input: { command: "ls" }, structured: true, humanRequest: "list files" });
+    expect((await post(r, "global", hookBody("Write", { file_path: "/etc/passwd", content: "x" }))).json)
+      .toEqual({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "blocked by policy: write outside scope: /etc/passwd" } } });
+    expect(r.judge.calls).toHaveLength(1);
+    expect(r.platform.choices).toHaveLength(0);
+    expect(r.auditRows().map((x) => x.outcome)).toEqual(["allow", "deny"]);
+    w.release();
+  });
+
+  test("escalated by the hook: the dialog that follows reuses the verdict (judged once) and the human decision joins it", async () => {
+    let s!: import("./fakes.ts").FakeSession;
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const r = setup(async (_i, sess) => { s = sess; await gate; }, { judge: { mode: "shadow" }, gateway: true, fake: new FakeJudge(() => ({ pSafe: 0.42 })) });
+    r.platform.choiceAnswer = 0;
+    await r.mgr.handleInbound(inbound("go"));
+    await until(() => !!s);
+    expect((await post(r, "global", hookBody("Bash", { command: "make deploy" }))).json).toEqual({});
+    // claude-tmux then scrapes the dialog: raw text, a guessed tool name.
+    s.emit({ type: "permission_request", id: "p1", tool: "Bash", input: "Bash command\n make deploy\n Deploy it", title: "t", options: ["Yes", "No"] });
+    await until(() => s.permissions.length === 1);
+    expect(r.judge.calls).toHaveLength(1);
+    expect(r.platform.choices[0]!.body!.split("\n")[0]).toBe("🤖 Jev: 0.42 safe (needs 0.90)");
+    const rows = r.auditRows();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ structured: true, input: { command: "make deploy" }, pSafe: 0.42, mode: "shadow" });
+    expect(rows[1]).toMatchObject({ id: rows[0]!.id, humanDecision: "allow" });
+    // A later dialog with no hook verdict waiting is judged on its own.
+    s.emit({ type: "permission_request", id: "p2", tool: "Bash", input: "Bash command\n ls", title: "t", options: ["Yes", "No"] });
+    await until(() => s.permissions.length === 2);
+    expect(r.judge.calls).toHaveLength(2);
+    release();
   });
 });

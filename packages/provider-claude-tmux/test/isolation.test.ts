@@ -26,7 +26,7 @@ const dirs: string[] = [];
 const provs: ClaudeTmuxProvider[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-async function launch(isolated: boolean) {
+async function launch(isolated: boolean, judge?: "off" | "shadow") {
   const state = mkdtempSync(join(tmpdir(), "uq-tmux-iso-"));
   dirs.push(state);
   const tmux = new FakeTmux();
@@ -34,8 +34,11 @@ async function launch(isolated: boolean) {
   p.tmuxFor = () => tmux as unknown as Tmux;
   provs.push(p);
   const spec: SessionSpec = { sessionId: isolated ? "a2a:main:alice:c" : "tg:1", cwd: "/home/op/project", instanceId: "t", env: { CLAUDE_CONFIG_DIR: state },
-    profile: { name: "main", provider: "claude-tmux", permissions: { ...DEFAULT_PERMISSIONS, level: "strict" }, options: { extraArgs: ["--add-dir", "/home/op"] } },
-    systemPrompt: { fragments: [{ id: "p", text: "PUBLIC PROMPT" }] }, mcp: { url: "http://127.0.0.1:1/mcp/x", token: "x", toolNames: [] },
+    profile: { name: "main", provider: "claude-tmux", options: { extraArgs: ["--add-dir", "/home/op"] },
+      permissions: { ...DEFAULT_PERMISSIONS, level: "strict", approval: { ...DEFAULT_PERMISSIONS.approval,
+        ...(judge ? { judge: { provider: "fake", mode: judge, allowAbove: 0.9, byKind: { chat: 0.9, worker: 0.93, cron: 0.97, peer: 0.97 }, timeoutMs: 5000, audit: true } } : {}) } } },
+    systemPrompt: { fragments: [{ id: "p", text: "PUBLIC PROMPT" }] },
+    mcp: { url: "http://127.0.0.1:1/mcp/x", token: "x", toolNames: [], permissionHookUrl: "http://127.0.0.1:1/hook/x/permission" },
     nativeMemory: true, ...(isolated ? { isolated: true } : {}) };
   const s = await p.open(spec);
   s.detach?.();
@@ -61,4 +64,15 @@ test("not isolated: chats keep the operator's settings sources, extraArgs and na
   for (const f of ["--tools", "--setting-sources", "--strict-mcp-config", "--settings"]) expect(argv).not.toContain(f);
   expect(argv).toContain("--add-dir");
   expect(prompt).toContain("/home/op/project");
+});
+
+test("approval judge on: one --settings with the PermissionRequest HTTP hook (also isolated); off: no hook", async () => {
+  const hook = { PermissionRequest: [{ matcher: "*", hooks: [{ type: "http", url: "http://127.0.0.1:1/hook/x/permission", timeout: 10 }] }] };
+  const chat = await launch(false, "shadow");
+  expect(chat.argv.filter((a) => a === "--settings")).toHaveLength(1);
+  expect(JSON.parse(chat.flag("--settings")!)).toEqual({ hooks: hook });
+  const iso = await launch(true, "shadow");
+  expect(JSON.parse(iso.flag("--settings")!)).toEqual({ autoMemoryEnabled: false, autoDreamEnabled: false, hooks: hook });
+  expect((await launch(false, "off")).argv).not.toContain("--settings");
+  expect((await launch(true, "off")).flag("--settings")).toBe('{"autoMemoryEnabled":false,"autoDreamEnabled":false}');
 });

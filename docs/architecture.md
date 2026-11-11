@@ -593,6 +593,17 @@ wouldOutcome, latencyMs, error`), then `{id, humanDecision, decidedAt}` when the
 
 **Escalated prompts** start with the score, e.g. `🤖 Jev: 0.87 safe (needs 0.90)` or `🤖 Jev: no score (…)`.
 
+**claude-tmux: the `PermissionRequest` hook.** With a judge on (and `ask-operator`), claude-tmux adds an HTTP hook to
+its one `--settings` flag that posts to the gateway (`/hook/<session token>/permission`). The runtime judges the
+**structured** `tool_name`/`tool_input` (scraped dialog text is never auto-allowed): allow or hard-policy deny
+answer the hook; escalate returns `{}`, Claude shows its dialog, and the scraped `permission_request` reuses that
+verdict (FIFO, 60 s), so nothing is judged twice. Checked on claude 2.1.322: the hook fires in `default` mode only
+when a dialog would appear; `{}`, an error or an unreachable daemon fall through to the dialog; an allow is not
+remembered; `--settings` hooks also apply under `--setting-sources ""`; `disableAllHooks: true` in any settings
+layer turns it off (then the dialog path works as before, scored on raw text). Under the `auto` permission mode the
+classifier decides first and the hook sees only what it escalates: the full benefit needs `default` mode
+(`profile.options.permissionMode`), a later, separate step.
+
 **typesafe-jev** (`packages/judge-typesafe`): `POST https://api.typesafe.ai/v1/systemone` with one Choice question
 (`safe | unsafe`); P(safe) is `answers.safety.probabilities.safe` (the probability of the option acted on, not
 `confidence`). The key is resolved from the SecretRef on the first request and kept in memory only. A `command`

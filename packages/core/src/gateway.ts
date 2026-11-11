@@ -78,16 +78,39 @@ export class McpGateway {
       this.tokens.set(token, channelKey);
       this.save();
     }
-    return { url: `http://${this.server.hostname}:${this.server.port}/mcp/${token}`, token, toolNames: this.toolNames(channelKey) };
+    const base = `http://${this.server.hostname}:${this.server.port}`;
+    return { url: `${base}/mcp/${token}`, token, toolNames: this.toolNames(channelKey), permissionHookUrl: `${base}/hook/${token}/permission` };
   }
 
   private async handle(req: Request): Promise<Response> {
-    const m = new URL(req.url).pathname.match(/^\/mcp\/([a-f0-9]+)$/);
+    const path = new URL(req.url).pathname;
+    const hook = path.match(/^\/hook\/([a-f0-9]+)\/permission$/);
+    if (hook) return this.permissionHook(req, hook[1]!);
+    const m = path.match(/^\/mcp\/([a-f0-9]+)$/);
     const caller = m ? this.tokens.get(m[1]!) : undefined;
     if (!caller) return new Response("unknown token", { status: 401 });
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     await this.build(caller).connect(transport);
     return transport.handleRequest(req);
+  }
+
+  /** Claude Code `PermissionRequest` HTTP hook (docs §10.4): the approval judge decides on the structured request.
+   *  `{}` defers to the normal dialog (judge off or escalated, or any error); the session is the token's. */
+  private async permissionHook(req: Request, token: string): Promise<Response> {
+    const caller = this.tokens.get(token);
+    if (!caller) return new Response("unknown token", { status: 401 });
+    if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+    try {
+      const body = await req.json() as { tool_name?: unknown; tool_input?: unknown };
+      if (typeof body?.tool_name !== "string" || !body.tool_input || typeof body.tool_input !== "object") return Response.json({});
+      const d = await this.manager().permissionHook(caller, { tool: body.tool_name, input: body.tool_input });
+      if (!d) return Response.json({});
+      return Response.json({ hookSpecificOutput: { hookEventName: "PermissionRequest",
+        decision: d.behavior === "allow" ? { behavior: "allow" } : { behavior: "deny", message: d.message } } });
+    } catch (e) {
+      this.log.warn("permission hook failed; deferring to the dialog", { caller, e: String(e) });
+      return Response.json({});
+    }
   }
 
   private build(caller: string): McpServer {

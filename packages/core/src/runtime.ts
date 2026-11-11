@@ -66,7 +66,7 @@ export interface RuntimeHost {
   /** Tool policy for this session (settings.channels for a chat, A2A_TOOL_POLICY for inbound A2A); undefined = unrestricted. */
   toolPolicyFor?(channelKey: string): ToolPolicy | undefined;
   /** Issue an MCP Gateway token for this channel. */
-  gatewayFor(channelKey: string): { url: string; token: string; toolNames: string[] } | undefined;
+  gatewayFor(channelKey: string): { url: string; token: string; toolNames: string[]; permissionHookUrl?: string } | undefined;
   /** Minimal isolated env for provider child processes. */
   providerEnv(profile: Profile): Promise<Record<string, string>>;
   /** A turn hit the provider's usage limit. Return true when the host took over telling the human
@@ -165,6 +165,10 @@ const RESUME_GRACE_MS = 3000;
 /** First retry delay; doubles each attempt. Overridable for tests via UNIQLAW_RATE_LIMIT_BACKOFF_MS. */
 const rateLimitBackoffMs = () => Number(process.env.UNIQLAW_RATE_LIMIT_BACKOFF_MS ?? 30_000);
 const INTERRUPT_SETTLE_MS = 8000;
+/** How long a hook-escalated verdict waits for the provider's dialog that follows it. */
+const HOOK_ESCALATED_TTL_MS = 60_000;
+
+type JudgeStageResult = { id: string; outcome: ReturnType<typeof decideOutcome>["outcome"]; pSafe?: number; note?: string; audit: boolean };
 
 export class ChannelRuntime {
   private _state: RuntimeState = "closed";
@@ -194,6 +198,9 @@ export class ChannelRuntime {
   private stallTimer?: ReturnType<typeof setTimeout>;
   /** A permission/input request is waiting for a human: the stall watchdog is paused. */
   private waitingForHuman = false;
+  /** Requests the permission hook judged and escalated: the provider's dialog for each follows, and reuses the
+   *  verdict instead of judging it again (oldest first, matched by tool when the dialog names it). */
+  private hookEscalated: { at: number; tool: string; judged: JudgeStageResult }[] = [];
   private readonly log: Logger;
   private router?: ModelRouter;
   /** Model the session is on, as far as we know (profile → /model → router → provider "model" events). */
@@ -1051,7 +1058,7 @@ export class ChannelRuntime {
     const mode = this.profile.permissions.approval.mode;
     if (mode === "auto-allow") return s.respondPermission(ev.id, { behavior: "allow" }, 1);
     if (mode === "auto-deny") return this.deny(s, ev, "auto-deny policy");
-    const judged = await this.judgeStage(ev);
+    const judged = this.takeHookEscalated(ev.tool) ?? await this.judgeStage(ev);
     if (judged?.outcome.action === "allow") {
       this.record("permission", `${ev.tool}: allow (${judged.note})`, { decision: "allow", by: "judge", pSafe: judged.pSafe });
       // Provider-native options: the plain "Yes"/"Allow", never an "always"/"don't ask again" one.
@@ -1117,10 +1124,40 @@ export class ChannelRuntime {
     return undefined;
   }
 
+  /**
+   * Permission hook (claude-tmux `PermissionRequest`, docs §10.4): judge the structured request before the provider
+   * shows its dialog. allow / deny answer it; undefined defers to the dialog, which then reuses this verdict.
+   */
+  async permissionHook(req: { tool: string; input: unknown }): Promise<{ behavior: "allow" } | { behavior: "deny"; message: string } | undefined> {
+    const cfg = this.profile.permissions.approval.judge;
+    if (!cfg || cfg.mode === "off" || this.profile.permissions.approval.mode !== "ask-operator" || !this.session) return undefined;
+    const ev = { type: "permission_request" as const, id: `hook:${crypto.randomUUID()}`, tool: req.tool, input: req.input, title: "" };
+    const judged = await this.judgeStage(ev);
+    if (!judged) return undefined;
+    if (judged.outcome.action === "allow") {
+      this.record("permission", `${req.tool}: allow (${judged.note})`, { decision: "allow", by: "judge", pSafe: judged.pSafe });
+      return { behavior: "allow" };
+    }
+    if (judged.outcome.action === "deny") {
+      this.record("permission", `${req.tool}: deny (${judged.outcome.rule})`, { decision: "deny", by: "policy" });
+      return { behavior: "deny", message: `blocked by policy: ${judged.outcome.rule}` };
+    }
+    const now = Date.now();
+    this.hookEscalated = this.hookEscalated.filter((h) => now - h.at < HOOK_ESCALATED_TTL_MS);
+    this.hookEscalated.push({ at: now, tool: req.tool, judged });
+    return undefined;
+  }
+
+  private takeHookEscalated(tool: string): JudgeStageResult | undefined {
+    const now = Date.now();
+    this.hookEscalated = this.hookEscalated.filter((h) => now - h.at < HOOK_ESCALATED_TTL_MS);
+    if (!this.hookEscalated.length) return undefined;
+    const i = Math.max(0, this.hookEscalated.findIndex((h) => h.tool === tool));
+    return this.hookEscalated.splice(i, 1)[0]!.judged;
+  }
+
   /** Judge stage (docs §10.4): hard policy, then the judge. undefined = no judge configured (mode off). */
-  private async judgeStage(ev: Extract<AgentEvent, { type: "permission_request" }>): Promise<{
-    id: string; outcome: ReturnType<typeof decideOutcome>["outcome"]; pSafe?: number; note?: string; audit: boolean;
-  } | undefined> {
+  private async judgeStage(ev: Extract<AgentEvent, { type: "permission_request" }>): Promise<JudgeStageResult | undefined> {
     const policy = this.profile.permissions;
     const cfg = policy.approval.judge;
     if (!cfg || cfg.mode === "off") return undefined;

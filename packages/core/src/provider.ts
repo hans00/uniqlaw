@@ -92,8 +92,9 @@ export interface SessionSpec {
    *  project settings, CLAUDE.md, hooks, skills or plugins, no MCP server but UniQlaw's, no native memory. `cwd` is
    *  an empty directory outside the project. Only honored by providers with the `isolation` capability. */
   isolated?: boolean;
-  /** MCP Gateway endpoint for this session (identity = token). */
-  mcp?: { url: string; token: string; toolNames: string[] };
+  /** MCP Gateway endpoint for this session (identity = token). `permissionHookUrl`: where a provider with
+   *  permission hooks (Claude Code `PermissionRequest`) posts a request for the approval judge (docs §10.4). */
+  mcp?: { url: string; token: string; toolNames: string[]; permissionHookUrl?: string };
   nativeTools?: ToolDef[];
   /** Base environment for the provider child process (never the daemon's full env).
    *  Core does NOT put credentials here: each adapter maps profile.credentialResolved

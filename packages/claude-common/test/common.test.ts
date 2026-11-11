@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { A2A_TOOL_POLICY, DEFAULT_PERMISSIONS, type ToolPolicy } from "@uniqlaw/core";
 import {
   buildPermissionArgs, claudeToolSets, ISOLATED_SDK_OPTIONS, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
-  isInterruptMarker, isRejectionText, nativeMemoryArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
+  isInterruptMarker, isRejectionText, nativeMemoryArgs, claudeSettingsArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
 } from "../src/index.ts";
 
 describe("permissions", () => {
@@ -144,6 +144,12 @@ describe("classify + prompt + mcp + credentials", () => {
     expect(nativeMemoryArgs(undefined)).toEqual([]);
     expect(nativeMemoryArgs(true)).toEqual([]);
     expect(nativeMemorySettings(false)).toEqual({ settings: { autoMemoryEnabled: false, autoDreamEnabled: false } });
+    // One --settings flag: without a permission hook exactly nativeMemoryArgs; with one, merged.
+    for (const m of [false, true, undefined]) expect(claudeSettingsArgs({ nativeMemory: m })).toEqual(nativeMemoryArgs(m));
+    const hook = { hooks: { PermissionRequest: [{ matcher: "*", hooks: [{ type: "http", url: "http://h/hook/t/permission", timeout: 10 }] }] } };
+    expect(JSON.parse(claudeSettingsArgs({ nativeMemory: false, permissionHook: { url: "http://h/hook/t/permission", timeoutSec: 10 } })[1]!))
+      .toEqual({ autoMemoryEnabled: false, autoDreamEnabled: false, ...hook });
+    expect(JSON.parse(claudeSettingsArgs({ nativeMemory: true, permissionHook: { url: "http://h/hook/t/permission", timeoutSec: 10 } })[1]!)).toEqual(hook);
     expect(nativeMemorySettings(true)).toEqual({});
   });
   test("credential env", async () => {

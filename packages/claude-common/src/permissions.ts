@@ -87,6 +87,23 @@ export const NO_NATIVE_MEMORY_SETTINGS = { autoMemoryEnabled: false, autoDreamEn
 export function nativeMemoryArgs(nativeMemory: boolean | undefined): string[] {
   return nativeMemory === false ? ["--settings", JSON.stringify(NO_NATIVE_MEMORY_SETTINGS)] : [];
 }
+
+/** Claude Code `PermissionRequest` HTTP hook to the approval judge (docs §10.4). Checked on claude 2.1.322: fires in
+ *  `default` mode only when a dialog would be shown, gets `tool_name` / `tool_input` / `cwd` / `permission_mode`;
+ *  `{}`, an error or an unreachable URL fall through to the dialog; an allow is not remembered. Hooks from
+ *  `--settings` also apply under `--setting-sources ""`, but `disableAllHooks: true` in any settings layer turns
+ *  it off (requests then reach the operator through the dialog as before). */
+export function permissionHookSettings(url: string, timeoutSec: number) {
+  return { hooks: { PermissionRequest: [{ matcher: "*", hooks: [{ type: "http", url, timeout: timeoutSec }] }] } };
+}
+
+/** The one `--settings` flag of a claude-tmux launch: native memory off and/or the permission hook (claude takes
+ *  a single `--settings`). Without a hook it is exactly nativeMemoryArgs. */
+export function claudeSettingsArgs(o: { nativeMemory: boolean | undefined; permissionHook?: { url: string; timeoutSec: number } }): string[] {
+  if (!o.permissionHook) return nativeMemoryArgs(o.nativeMemory);
+  return ["--settings", JSON.stringify({ ...(o.nativeMemory === false ? NO_NATIVE_MEMORY_SETTINGS : {}),
+    ...permissionHookSettings(o.permissionHook.url, o.permissionHook.timeoutSec) })];
+}
 /** SDK `settings` option for SessionSpec.nativeMemory (claude-sdk). */
 export function nativeMemorySettings(nativeMemory: boolean | undefined): { settings?: { autoMemoryEnabled: false; autoDreamEnabled: false } } {
   return nativeMemory === false ? { settings: { ...NO_NATIVE_MEMORY_SETTINGS } } : {};
