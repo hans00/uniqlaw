@@ -83,6 +83,18 @@ test("session maps notifications to AgentEvents and sends full settings each tur
   expect(sent.at(-1)!.params.model).toBe("m2");
 });
 
+test("a command's tool_end carries its output excerpt (the approval judge's trace), else the status", async () => {
+  const { s, events } = fakeSession();
+  s.onNotification("turn/started", { threadId: "th", turn: { id: "t1" } });
+  s.onNotification("item/started", { threadId: "th", item: { type: "commandExecution", id: "c", command: "df -h" } });
+  s.onNotification("item/completed", { threadId: "th", item: { type: "commandExecution", id: "c", status: "completed", exitCode: 0, aggregatedOutput: "/dev/sda1 30G 30G 0 100% /" } });
+  s.onNotification("item/started", { threadId: "th", item: { type: "commandExecution", id: "d", command: "true" } });
+  s.onNotification("item/completed", { threadId: "th", item: { type: "commandExecution", id: "d", status: "completed", exitCode: 0, aggregatedOutput: "" } });
+  await Bun.sleep(5);
+  const ends = events.filter((e) => e.type === "tool_end") as Extract<AgentEvent, { type: "tool_end" }>[];
+  expect(ends.map((e) => e.summary)).toEqual(["/dev/sda1 30G 30G 0 100% /", "completed"]);
+});
+
 test("unsolicited turn, approvals, steer fallback", async () => {
   const { s, sent, responses, events, setFailSteer } = fakeSession();
   s.onNotification("turn/started", { threadId: "th", turn: { id: "bg" } });

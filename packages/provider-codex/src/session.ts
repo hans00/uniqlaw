@@ -202,7 +202,9 @@ export class CodexSession implements AgentSession {
           this.reasoning.delete(it.id);
           if (text.trim()) this.emit({ type: "thinking", segmentId: it.id, text });
         } else if (toolFromItem(it)) {
-          this.emit({ type: "tool_end", id: it.id, ok: toolOk(it), summary: it.status ? String(it.status) : undefined });
+          // summary: the command's output excerpt when there is one (core's judge trace), else the status.
+          const out = typeof it.aggregatedOutput === "string" && it.aggregatedOutput ? it.aggregatedOutput.slice(0, 500) : undefined;
+          this.emit({ type: "tool_end", id: it.id, ok: toolOk(it), summary: out ?? (it.status ? String(it.status) : undefined) });
         }
         return;
       }
