@@ -629,6 +629,47 @@ outputs, fetched or file content, assistant text, the provider's title, or peer,
 input still reaches it. Calibrated thresholds and the hard rules are the defense; keep `shadow` until the audit
 pairs say the thresholds hold.
 
+**Context: what the judge knows besides the request.** So that sensible mid-task actions can pass (the human said
+"finish developing model X"; the agent hit a full disk and wants to clear old outputs), three more fields, each with
+an explicit trust level:
+
+- `actionTrace` (**trusted**, harness-observed): this turn's tool actions before the request, oldest first, at most
+  20: tool plus its command (shell) or redacted input, and `ok`. Read-only diagnostic commands (a generic table:
+  `df`, `du`, `free`, `ls`, `stat`, `wc`, `ps`, `lsblk`, `ip addr`, `nvidia-smi`/`rocm-smi`, `git status|log|branch|…`,
+  `systemctl status`, `docker ps`, `npm ls`, `pip list`, …, optionally piped through `head`/`grep`/`sort`/…; no
+  redirect, substitution or wrapper) also get `observedOutput`, the system's own output, capped at 400 chars. No other
+  output is ever included: it can carry injected text. The trace comes from the `tool_start` / `tool_end` events every
+  provider emits (claude-tmux: its session jsonl; claude-sdk, codex, opencode, pi, acp, agy: their structured
+  events; codex's `tool_end` summary now carries the command output). A provider declaring `toolTrace: false` sends
+  `available: false`: unknown, not empty.
+- `targets` (**computed, trusted**) and `unrecognized`: the resources the request acts on, for any tool and command
+  (`core/src/targets.ts`). Each target has a `kind` (`path`, `git-ref`, `url`, `process`, `package`, `service`,
+  `device`, `remote-host`, `secret-ish`), an `effect` (`read`, `create`, `modify`, `delete`, `execute`, `send`,
+  `install`, `publish`) and provenance: `createdThisSession`, `inScope`, `existsNow`, `unresolved` (+ `reason`),
+  `remote`, and kind details (paths: git `tracked`/`untracked`/`ignored`/`not-in-repo`, `category`
+  generated/source/config/data/secret, mtime, `modifiedThisSession`, size with a bounded walk,
+  `createdInsideThisSession`; git refs: `isDefaultBranch`, `isProtected`, `force`, `remote`; urls: `hostClass`
+  localhost/lan/project-remote/external and the method; processes: `ownedBySession`, `ownedByUser`, name; packages:
+  `scope` project/global/user/system, manager). Targets come from small extractors in registries: per normalized
+  shell command name (through the shell normalizer, so wrappers, `sh -c` and substitutions are seen), per structured
+  tool (Read/Write/Edit/WebFetch, …), and the obvious `path`/`url` arguments of MCP tools; per-kind enrichers add the
+  provenance. A new kind or command is one more registry entry. A command with no extractor gives no target and
+  appears in `unrecognized` (never guessed); `ssh host cmd` / `scp` / `rsync host:` give a `remote-host` target and
+  report what the remote command acts on as `remote: true`, unresolved locally. Globs and variables are `unresolved`.
+  **createdThisSession** comes from the session ledger: what this session's observed actions created (Write, `mkdir`,
+  `touch`, `>` redirects, `-o`/`--output` files, `git checkout -b`/`switch -c`/`branch`, package installs, `docker
+  run`, `tmux new`, background processes and the pids their output names). A path counts when a create action
+  targeted it (or a parent) and it was new then or born after the session started. The ledger is in memory; it
+  starts again when the session reopens.
+- `agentRationale` (**untrusted**, model-authored): what the agent wrote about its own call (Bash `description`,
+  codex `reason`, a TUI dialog's text), in its own labelled field; `input` keeps its stripped form.
+
+The judge's question states each field's trust level and a generic decision guide in terms of effect × provenance ×
+task: acting on resources this session created, inside scope, in service of the human's task is consistent;
+acting on pre-existing, tracked, protected, global, external, remote or secret resources the task did not mention
+needs much stronger evidence. The audit line records `actionTrace`, `targets`, `unrecognized` and `agentRationale`
+(redacted).
+
 **Audit**: `<stateDir>/approvals/YYYY-MM.jsonl` (UTC month), one line per request (`id, ts, channelKey, sessionKind,
 provider, tool, structured, inputHash, input` (redacted), `judge, model, pSafe, threshold, mode, outcome, reason,
 wouldOutcome, wouldReason, blockers, latencyMs, error`), then `{id, humanDecision, decidedAt}`
