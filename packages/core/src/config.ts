@@ -46,24 +46,35 @@ export const profileSchema = z.object({
   fallback: z.array(z.string()).default([]),
 });
 
-const groupSchema = z.object({
+// Fields without defaults: per-channel entries (`groups.channels.<key>`) must carry only what the user set, or
+// zod's defaults would overwrite the global `groups` values when merged.
+const groupFields = {
   /** mention: only messages addressed to the bot (@mention, reply to the bot, command) start a turn; the rest is
    *  kept as context for the next turn. always: every message starts a turn and the agent decides whether to answer. */
-  mode: z.enum(["mention", "always"]).default("mention"),
+  mode: z.enum(["mention", "always"]),
   /** always mode: a message that @mentions someone else but not the bot is context only (v2 `ignoreOtherMentions`). */
-  ignoreOtherMentions: z.boolean().default(false),
+  ignoreOtherMentions: z.boolean(),
   /** How many unanswered messages are kept as context for the next turn (0 = none). */
-  historyLimit: z.number().int().nonnegative().default(30),
-  /** Platform user ids allowed to wake the agent in this group ("telegram:<from.id>", "discord:<author.id>", or a bare
-   *  id). Matched on the platform's immutable user id, never a name. Empty = anyone the platform lets through. */
-  allowFrom: z.array(z.string()).default([]),
+  historyLimit: z.number().int().nonnegative(),
+  /** Platform user ids allowed to wake the agent in this group: "telegram:<from.id>", "discord:<author.id>", …
+   *  (in a per-channel entry a bare id means that channel's platform; in the global list it matches no one). Matched on the platform's immutable user id,
+   *  never a name. Empty = anyone the platform lets through. */
+  allowFrom: z.array(z.string()),
   /** Messages that don't wake the agent: context = kept as background for the next woken turn; ignore = dropped. */
-  others: z.enum(["context", "ignore"]).default("context"),
+  others: z.enum(["context", "ignore"]),
+};
+const groupSchema = z.object({
+  mode: groupFields.mode.default("mention"),
+  ignoreOtherMentions: groupFields.ignoreOtherMentions.default(false),
+  historyLimit: groupFields.historyLimit.default(30),
+  allowFrom: groupFields.allowFrom.default([]),
+  others: groupFields.others.default("context"),
 });
+const groupChannelSchema = z.object(groupFields).partial();
 export type GroupMode = z.infer<typeof groupSchema>["mode"];
 
 /** Tool groups a channel can be given (see TOOL_GROUPS in channel-policy.ts for the concrete tools). */
-export const TOOL_GROUP_NAMES = ["chat", "memory", "web", "files.read", "files.write", "bash", "cron", "worker", "xsession", "notify", "config"] as const;
+export const TOOL_GROUP_NAMES = ["chat", "memory", "web", "files.read", "files.write", "bash", "agents", "cron", "worker", "xsession", "notify", "config"] as const;
 const toolGroup = z.enum(TOOL_GROUP_NAMES);
 const channelPolicySchema = z.object({
   /** Allowed tool groups; "*" = all tools (including ones no group names). */
@@ -105,7 +116,7 @@ export const settingsSchema = z.object({
   groups: groupSchema.extend({
     /** Per-channel overrides, keyed by channel key ("telegram:<chatId>", "discord:<channelId>", "slack:<channel>", …).
      *  A Slack thread key ("slack:<channel>:<ts>") falls back to its channel's entry. */
-    channels: z.record(z.string(), groupSchema.partial()).prefault({}),
+    channels: z.record(z.string(), groupChannelSchema).prefault({}),
   }).prefault({}),
   sessionCleanup: z.object({
     idleTimeoutHours: z.number().nonnegative().default(168),
