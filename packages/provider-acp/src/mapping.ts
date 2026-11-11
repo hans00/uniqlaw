@@ -5,6 +5,8 @@ export type AcpPermissionOption = { optionId: string; name: string; kind: "allow
 
 /** UniQlaw decision → ACP permission option id (falls back by kind prefix). */
 export function pickOption(options: AcpPermissionOption[], d: PermissionDecision): string | undefined {
+  // scope "once" (an approval-judge allow) must never grant more than this call: no fallback to allow_always.
+  if (d.behavior === "allow" && d.scope === "once") return options.find((x) => x.kind === "allow_once")?.optionId;
   const want = d.behavior === "allow" ? (d.scope === "session" ? ["allow_always", "allow_once"] : ["allow_once", "allow_always"]) : ["reject_once", "reject_always"];
   for (const k of want) { const o = options.find((x) => x.kind === k); if (o) return o.optionId; }
   const prefix = d.behavior === "allow" ? "allow" : "reject";

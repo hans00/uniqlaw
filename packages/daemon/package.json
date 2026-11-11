@@ -22,7 +22,8 @@
     "@uniqlaw/platform-line": "workspace:*",
     "@uniqlaw/provider-agy": "workspace:*",
     "@uniqlaw/provider-opencode": "workspace:*",
-    "@uniqlaw/provider-acp": "workspace:*"
+    "@uniqlaw/provider-acp": "workspace:*",
+    "@uniqlaw/judge-typesafe": "workspace:*"
   },
   "devDependencies": {
     "zod": "^4.6.6",

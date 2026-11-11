@@ -1,7 +1,7 @@
 // SessionSpec.isolated (inbound A2A) → the claude launch command: no built-in tools, no settings files, only
 // UniQlaw's MCP server, native memory off, no operator extraArgs, path-free prompt. Uses a fake tmux.
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_PERMISSIONS, silentLogger, type SessionSpec } from "@uniqlaw/core";
@@ -23,25 +23,30 @@ class FakeTmux {
 }
 
 const dirs: string[] = [];
+const sessionsOpen: { close(): Promise<void> }[] = [];
 const provs: ClaudeTmuxProvider[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-async function launch(isolated: boolean) {
-  const state = mkdtempSync(join(tmpdir(), "uq-tmux-iso-"));
-  dirs.push(state);
+async function launch(isolated: boolean, judge?: "off" | "shadow", keepState?: string, attached = false) {
+  const state = keepState ?? mkdtempSync(join(tmpdir(), "uq-tmux-iso-"));
+  if (!keepState) dirs.push(state);
   const tmux = new FakeTmux();
   const p = new ClaudeTmuxProvider({ claudePath: "claude", readyTimeoutMs: 2000, width: 100, height: 30, takeOverLegacy: false }, { log: silentLogger, stateDir: state });
   p.tmuxFor = () => tmux as unknown as Tmux;
   provs.push(p);
   const spec: SessionSpec = { sessionId: isolated ? "a2a:main:alice:c" : "tg:1", cwd: "/home/op/project", instanceId: "t", env: { CLAUDE_CONFIG_DIR: state },
-    profile: { name: "main", provider: "claude-tmux", permissions: { ...DEFAULT_PERMISSIONS, level: "strict" }, options: { extraArgs: ["--add-dir", "/home/op"] } },
-    systemPrompt: { fragments: [{ id: "p", text: "PUBLIC PROMPT" }] }, mcp: { url: "http://127.0.0.1:1/mcp/x", token: "x", toolNames: [] },
+    profile: { name: "main", provider: "claude-tmux", options: { extraArgs: ["--add-dir", "/home/op"] },
+      permissions: { ...DEFAULT_PERMISSIONS, level: "strict", approval: { ...DEFAULT_PERMISSIONS.approval,
+        ...(judge ? { judge: { provider: "fake", mode: judge, allowAbove: 0.9, byKind: { chat: 0.9, worker: 0.93, cron: 0.97, peer: 0.97 }, timeoutMs: 5000, audit: true } } : {}) } } },
+    systemPrompt: { fragments: [{ id: "p", text: "PUBLIC PROMPT" }] },
+    mcp: { url: "http://127.0.0.1:1/mcp/x", token: "x", toolNames: [], permissionHookUrl: "http://127.0.0.1:1/hook/x/permission" },
     nativeMemory: true, ...(isolated ? { isolated: true } : {}) };
   const s = await p.open(spec);
-  s.detach?.();
+  sessionsOpen.push(s);
+  if (!attached) s.detach?.();
   const flag = (f: string) => tmux.argv[tmux.argv.indexOf(f) + 1];
   const prompt = readFileSync(flag("--append-system-prompt-file")!, "utf8");
-  return { argv: tmux.argv, flag, prompt };
+  return { argv: tmux.argv, flag, prompt, state, session: s };
 }
 
 test("isolated: --tools \"\", --setting-sources \"\", --strict-mcp-config, memory off, no extraArgs, no path in prompt", async () => {
@@ -61,4 +66,31 @@ test("not isolated: chats keep the operator's settings sources, extraArgs and na
   for (const f of ["--tools", "--setting-sources", "--strict-mcp-config", "--settings"]) expect(argv).not.toContain(f);
   expect(argv).toContain("--add-dir");
   expect(prompt).toContain("/home/op/project");
+});
+
+test("approval judge on: one --settings naming a 0600 file with the PermissionRequest HTTP hook (also isolated); off: no hook", async () => {
+  const hook = { PermissionRequest: [{ matcher: "*", hooks: [{ type: "http", url: "http://127.0.0.1:1/hook/x/permission", timeout: 10 }] }] };
+  const chat = await launch(false, "shadow");
+  expect(chat.argv.filter((a) => a === "--settings")).toHaveLength(1);
+  const file = chat.flag("--settings")!;
+  expect(file).toEndWith("settings.json");
+  expect(chat.argv.join(" ")).not.toContain("/hook/"); // the hook token never sits in argv
+  expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ hooks: hook });
+  expect(statSync(file).mode & 0o777).toBe(0o600);
+  const iso = await launch(true, "shadow");
+  expect(JSON.parse(readFileSync(iso.flag("--settings")!, "utf8"))).toEqual({ autoMemoryEnabled: false, autoDreamEnabled: false, hooks: hook });
+  expect((await launch(false, "off")).argv).not.toContain("--settings");
+  expect((await launch(true, "off")).flag("--settings")).toBe('{"autoMemoryEnabled":false,"autoDreamEnabled":false}');
+});
+
+test("the hook settings file (it holds a token) is deleted on a judge-off relaunch and when the session closes for good", async () => {
+  const on = await launch(false, "shadow");
+  const file = on.flag("--settings")!;
+  expect(existsSync(file)).toBe(true);
+  await launch(false, "off", on.state); // same session dir, judge now off
+  expect(existsSync(file)).toBe(false);
+  const again = await launch(false, "shadow", on.state, true);
+  expect(existsSync(file)).toBe(true);
+  await again.session.close();
+  expect(existsSync(file)).toBe(false);
 });

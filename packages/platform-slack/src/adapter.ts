@@ -31,7 +31,8 @@ interface PendingChoice {
   req: ChoiceRequest;
   text: string;
   resolve: (idx: number | null) => void;
-  timer: ReturnType<typeof setTimeout>;
+  /** undefined: timeoutMs 0, wait until answered. */
+  timer: ReturnType<typeof setTimeout> | undefined;
 }
 
 export class SlackAdapter implements PlatformAdapter {
@@ -304,12 +305,21 @@ export class SlackAdapter implements PlatformAdapter {
     const approverIds = req.approverIds.length ? req.approverIds : this.opts.operatorUserIds;
     const pend: Omit<PendingChoice, "resolve" | "timer"> = { channel: String(r.channel ?? channel), ts: String(r.ts), req: { ...req, approverIds }, text };
     return new Promise<number | null>((resolve) => {
-      const timer = setTimeout(async () => {
+      // timeoutMs 0 = wait for an answer indefinitely (permissions.approval.timeoutSec: 0).
+      const timer = req.timeoutMs > 0 ? setTimeout(async () => {
         if (!this.pending.delete(token)) return;
         await this.finishChoice({ ...pend, resolve, timer }, "⏱ Timed out — no answer").catch(() => {});
         resolve(null);
-      }, req.timeoutMs);
+      }, req.timeoutMs) : undefined;
       this.pending.set(token, { ...pend, resolve, timer });
+      // Settled elsewhere (provider UI, turn ended): drop the buttons and say so.
+      const cancel = async () => {
+        if (!this.pending.delete(token)) return;
+        clearTimeout(timer);
+        await this.finishChoice({ ...pend, resolve, timer }, "↩️ Cancelled — resolved elsewhere").catch(() => {});
+        resolve(null);
+      };
+      if (req.signal?.aborted) void cancel(); else req.signal?.addEventListener("abort", () => void cancel(), { once: true });
     });
   }
 

@@ -48,6 +48,8 @@ export interface Timings {
   busyHardCapMs: number;
   modelEchoMs: number;
   dialogGonePolls: number;
+  /** A dialog must stay gone this long before it is reported withdrawn (a redraw or resize can hide it briefly). */
+  dialogWithdrawnMs: number;
 }
 
 export const DEFAULT_TIMINGS: Timings = {
@@ -64,6 +66,7 @@ export const DEFAULT_TIMINGS: Timings = {
   busyHardCapMs: 1_800_000,
   modelEchoMs: 5000,
   dialogGonePolls: 3,
+  dialogWithdrawnMs: 3000,
 };
 
 type State = "starting" | "idle" | "running" | "dead";
@@ -83,6 +86,9 @@ export interface SessionInit {
   /** Where detach() saves the jsonl read position; a reattach continues from it, so a reply written while the
    *  daemon was down is still emitted (as an unsolicited turn) instead of skipped. */
   tailStateFile?: string;
+  /** The session's settings file (approval-judge hook, holds a token): deleted when the session closes for good
+   *  (kept on detach: the live claude still uses it). */
+  settingsFile?: string;
 }
 
 const fp = (s: string) => createHash("sha1").update(s).digest("hex").slice(0, 12);
@@ -120,6 +126,10 @@ export class ClaudeTmuxSession implements AgentSession {
   // dialogs
   private activeDialog: { id: string; dialog: PermissionDialog } | null = null;
   private dialogMiss = 0;
+  private dialogMissSince = 0;
+  /** A dialog that left the pane without our answer: reported withdrawn once it stays gone for dialogWithdrawnMs;
+   *  if the same request comes back first (redraw, resize), it is the same dialog again. */
+  private goneDialog: { id: string; dialog: PermissionDialog; since: number } | null = null;
   private pendingSteers: TurnInput[] = [];
 
   // login
@@ -194,6 +204,7 @@ export class ClaudeTmuxSession implements AgentSession {
     this.closed = true;
     this.stopAll();
     await this.tmux.killSession(this.name).catch(() => {});
+    if (this.init.settingsFile) rmSync(this.init.settingsFile, { force: true });
     this.state = "dead";
     this.events.end();
   }
@@ -279,7 +290,9 @@ export class ClaudeTmuxSession implements AgentSession {
   }
 
   async respondPermission(id: string, decision: PermissionDecision, optionIndex?: number): Promise<void> {
-    const cur = this.activeDialog;
+    // A dialog briefly off the pane (redraw) is still the one being answered.
+    const cur = this.activeDialog ?? (this.goneDialog?.id === id ? this.goneDialog : null);
+    this.goneDialog = null;
     if (!cur || cur.id !== id) {
       this.log.warn("respondPermission for a dialog that is no longer open", { id });
       return;
@@ -565,9 +578,17 @@ export class ClaudeTmuxSession implements AgentSession {
   private async checkDialogs(pane: string) {
     const d = parsePermissionDialog(pane);
     if (!d) {
-      if (this.activeDialog && ++this.dialogMiss >= this.t.dialogGonePolls) {
+      if (this.activeDialog && this.dialogMiss++ === 0) this.dialogMissSince = Date.now();
+      if (this.activeDialog && this.dialogMiss >= this.t.dialogGonePolls) {
+        this.goneDialog = { ...this.activeDialog, since: this.dialogMissSince };
         this.activeDialog = null;
         await this.flushSteers();
+      }
+      // Gone without our answer for long enough (answered in the terminal, or the request went away): core
+      // cancels its prompt.
+      if (this.goneDialog && Date.now() - this.goneDialog.since >= this.t.dialogWithdrawnMs) {
+        this.emit({ type: "permission_withdrawn", id: this.goneDialog.id });
+        this.goneDialog = null;
       }
       return;
     }
@@ -589,6 +610,16 @@ export class ClaudeTmuxSession implements AgentSession {
       return;
     }
     if (this.activeDialog?.id === d.fingerprint) return;
+    // The same request redrawn (resize, wrapping, rotating hints): keep its id, core's prompt still answers it.
+    const prev = this.activeDialog ?? this.goneDialog;
+    if (prev && (prev.id === d.fingerprint || sameRequest(prev.dialog, d))) {
+      this.activeDialog = { id: prev.id, dialog: d };
+      this.goneDialog = null;
+      return;
+    }
+    // A different dialog replaced the one still waiting for us: that one was settled elsewhere.
+    if (prev) this.emit({ type: "permission_withdrawn", id: prev.id });
+    this.goneDialog = null;
     if (this.state !== "running") { this.state = "running"; this.beginTurn(true); }
     this.activeDialog = { id: d.fingerprint, dialog: d };
     this.clearTimer("slashTimer");
@@ -689,3 +720,9 @@ function dialogTitle(d: PermissionDialog): string {
 }
 
 export function newProviderSessionId(): string { return randomUUID(); }
+
+/** Same tool and same request text (whitespace and rotating `Tip:` lines ignored): a redraw, not a new dialog. */
+function sameRequest(a: PermissionDialog, b: PermissionDialog): boolean {
+  const norm = (q: string) => q.split("\n").filter((l) => !/^\s*Tip:/i.test(l)).join("").replace(/\s+/g, "");
+  return a.kind === b.kind && guessTool(a.question) === guessTool(b.question) && norm(a.question) === norm(b.question);
+}

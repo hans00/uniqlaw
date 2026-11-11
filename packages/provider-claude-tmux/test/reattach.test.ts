@@ -34,7 +34,7 @@ afterEach(async () => {
 function make(tmux: FakeTmux, extra: { respawn?: () => Promise<void> } = {}) {
   dir = mkdtempSync(join(tmpdir(), "uq-tmux-"));
   const s = new ClaudeTmuxSession({ tmux: tmux as unknown as Tmux, name: "t", providerSessionId: "00000000-0000-0000-0000-000000000001",
-    cwd: dir, env: { CLAUDE_CONFIG_DIR: dir }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10 }, readyTimeoutMs: 2000, ...extra }, "end");
+    cwd: dir, env: { CLAUDE_CONFIG_DIR: dir }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10, dialogWithdrawnMs: 300 }, readyTimeoutMs: 2000, ...extra }, "end");
   sessions.push(s);
   const events: AgentEvent[] = [];
   void (async () => { for await (const ev of s.events) events.push(ev); })();
@@ -94,7 +94,7 @@ test("a reply written while the daemon was down is emitted after reattach (jsonl
   appendFileSync(jsonl, JSON.stringify({ type: "assistant", message: { id: "m1", stop_reason: "end_turn", content: [{ type: "text", text: "done while you were away" }] } }) + "\n");
 
   const second = new ClaudeTmuxSession({ tmux: tmux as unknown as Tmux, name: "t", providerSessionId: "00000000-0000-0000-0000-000000000001",
-    cwd: d, env: { CLAUDE_CONFIG_DIR: d }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10 }, readyTimeoutMs: 2000, tailStateFile: tail }, "end");
+    cwd: d, env: { CLAUDE_CONFIG_DIR: d }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10, dialogWithdrawnMs: 300 }, readyTimeoutMs: 2000, tailStateFile: tail }, "end");
   sessions.push(second);
   const events: AgentEvent[] = [];
   void (async () => { for await (const ev of second.events) events.push(ev); })();
@@ -123,7 +123,7 @@ test("claude exited while the daemon was down: the --resume respawn still emits 
   appendFileSync(jsonl, JSON.stringify({ type: "assistant", message: { id: "m2", stop_reason: "end_turn", content: [{ type: "text", text: "finished, then claude exited" }] } }) + "\n");
   // Pane dead → the provider spawns claude --resume (same session id, same jsonl) and starts a non-reattach session.
   const second = new ClaudeTmuxSession({ tmux: tmux as unknown as Tmux, name: "t", providerSessionId: "00000000-0000-0000-0000-000000000001",
-    cwd: d, env: { CLAUDE_CONFIG_DIR: d }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10 }, readyTimeoutMs: 2000, tailStateFile: tail }, "end");
+    cwd: d, env: { CLAUDE_CONFIG_DIR: d }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10, dialogWithdrawnMs: 300 }, readyTimeoutMs: 2000, tailStateFile: tail }, "end");
   sessions.push(second);
   const events: AgentEvent[] = [];
   void (async () => { for await (const ev of second.events) events.push(ev); })();
@@ -132,3 +132,61 @@ test("claude exited while the daemon was down: the --resume respawn still emits 
   expect(events.map((e) => e.type).filter((t) => t === "unsolicited_turn" || t === "text" || t === "turn_end")).toEqual(["unsolicited_turn", "text", "turn_end"]);
   expect(events.find((e) => e.type === "text")).toMatchObject({ final: "finished, then claude exited" });
 }, 15_000);
+
+test("a dialog answered in the terminal (or replaced by another) is reported withdrawn, so core cancels its prompt", async () => {
+  const tmux = new FakeTmux();
+  tmux.pane = DIALOG;
+  const { s, events } = make(tmux);
+  await s.start({ reattach: true });
+  await until(() => events.some((e) => e.type === "permission_request"));
+  const req = events.find((e) => e.type === "permission_request") as Extract<AgentEvent, { type: "permission_request" }>;
+  const gone = Date.now();
+  tmux.pane = READY; // someone answered it in the attached terminal
+  await until(() => events.some((e) => e.type === "permission_withdrawn"));
+  expect(Date.now() - gone).toBeGreaterThanOrEqual(290); // only after it stayed gone for dialogWithdrawnMs
+  expect(events.find((e) => e.type === "permission_withdrawn")).toEqual({ type: "permission_withdrawn", id: req.id });
+});
+
+test("a dialog we answered is not reported withdrawn", async () => {
+  const tmux = new FakeTmux();
+  tmux.pane = DIALOG;
+  const { s, events } = make(tmux);
+  await s.start({ reattach: true });
+  await until(() => events.some((e) => e.type === "permission_request"));
+  const req = events.find((e) => e.type === "permission_request") as Extract<AgentEvent, { type: "permission_request" }>;
+  await s.respondPermission!(req.id, { behavior: "allow" }, 1);
+  tmux.pane = READY;
+  await Bun.sleep(100);
+  expect(events.some((e) => e.type === "permission_withdrawn")).toBe(false);
+});
+
+test("a dialog hidden briefly by a redraw, or redrawn with other option text, is not withdrawn and not asked twice", async () => {
+  const tmux = new FakeTmux();
+  tmux.pane = DIALOG;
+  const { s, events } = make(tmux);
+  await s.start({ reattach: true });
+  await until(() => events.some((e) => e.type === "permission_request"));
+  const req = events.find((e) => e.type === "permission_request") as Extract<AgentEvent, { type: "permission_request" }>;
+  tmux.pane = READY; // gone for many polls, but shorter than dialogWithdrawnMs
+  await Bun.sleep(120);
+  tmux.pane = DIALOG;
+  await Bun.sleep(80);
+  tmux.pane = DIALOG.replace("Yes, and switch to auto mode · auto mode handles these prompts for you", "Yes, and don't ask again for this command");
+  await Bun.sleep(500);
+  expect(events.filter((e) => e.type === "permission_request")).toHaveLength(1);
+  expect(events.some((e) => e.type === "permission_withdrawn")).toBe(false);
+  // Our answer still reaches the (redrawn) dialog under its first id.
+  await s.respondPermission!(req.id, { behavior: "allow" }, 1);
+  expect(tmux.keys.length).toBeGreaterThan(0);
+});
+
+test("a different request replacing the dialog withdraws the old one at once", async () => {
+  const tmux = new FakeTmux();
+  tmux.pane = DIALOG;
+  const { s, events } = make(tmux);
+  await s.start({ reattach: true });
+  await until(() => events.some((e) => e.type === "permission_request"));
+  tmux.pane = DIALOG.replaceAll('FOO=$(date +%s); echo "$FOO" > out.txt', "rm -rf build");
+  await until(() => events.filter((e) => e.type === "permission_request").length === 2);
+  expect(events.some((e) => e.type === "permission_withdrawn")).toBe(true);
+});

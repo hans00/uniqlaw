@@ -296,6 +296,31 @@ describe("askChoice", () => {
     await waitFor(() => api.callsOf("answerCallbackQuery").find((c) => c.body.text === "Expired"));
   });
 
+  test("timeoutMs 0 (approval.timeoutSec 0) waits until answered", async () => {
+    const p = adapter.askChoice(target, req(0));
+    await waitFor(() => api.callsOf("sendMessage").length);
+    const tok = tokenOf();
+    let settled = false;
+    void p.then(() => { settled = true; });
+    await Bun.sleep(100);
+    expect(settled).toBe(false);
+    expect(api.callsOf("editMessageText").some((c) => /Timed out/.test(c.body.text))).toBe(false);
+    press(OWNER, `c:${tok}:0`);
+    expect(await p).toBe(0);
+  });
+
+  test("signal abort (settled elsewhere): resolves null, message says cancelled, a late press says Expired", async () => {
+    const ac = new AbortController();
+    const p = adapter.askChoice(target, { ...req(0), signal: ac.signal });
+    await waitFor(() => api.callsOf("sendMessage").length);
+    const tok = tokenOf();
+    ac.abort();
+    expect(await p).toBeNull();
+    expect(api.callsOf("editMessageText").at(-1)!.body.text).toContain("Cancelled — resolved elsewhere");
+    press(OWNER, `c:${tok}:0`);
+    await waitFor(() => api.callsOf("answerCallbackQuery").find((c) => c.body.text === "Expired"));
+  });
+
   test("stop() resolves pending choices with null", async () => {
     const p = adapter.askChoice(target, req(60_000));
     await waitFor(() => api.callsOf("sendMessage").length);

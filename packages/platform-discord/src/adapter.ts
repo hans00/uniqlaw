@@ -35,7 +35,8 @@ interface PendingChoice {
   req: ChoiceRequest;
   content: string;
   resolve: (idx: number | null) => void;
-  timer: ReturnType<typeof setTimeout>;
+  /** undefined: timeoutMs 0, wait until answered. */
+  timer: ReturnType<typeof setTimeout> | undefined;
 }
 
 export class DiscordAdapter implements PlatformAdapter {
@@ -422,12 +423,21 @@ export class DiscordAdapter implements PlatformAdapter {
     const messageId = String(r.json.id);
     const approverIds = req.approverIds.length ? req.approverIds : this.opts.operatorUserIds;
     return new Promise<number | null>((resolve) => {
-      const timer = setTimeout(async () => {
+      // timeoutMs 0 = wait for an answer indefinitely (permissions.approval.timeoutSec: 0).
+      const timer = req.timeoutMs > 0 ? setTimeout(async () => {
         if (!this.pending.delete(token)) return;
         await this.rest("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: clip(`⏱ Timed out — no answer\n\n${content}`), components: [] }).catch(() => {});
         resolve(null);
-      }, req.timeoutMs);
+      }, req.timeoutMs) : undefined;
       this.pending.set(token, { channelId, messageId, req: { ...req, approverIds }, content, resolve, timer });
+      // Settled elsewhere (provider UI, turn ended): drop the buttons and say so.
+      const cancel = async () => {
+        if (!this.pending.delete(token)) return;
+        clearTimeout(timer);
+        await this.rest("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: clip(`↩️ Cancelled — resolved elsewhere\n\n${content}`), components: [] }).catch(() => {});
+        resolve(null);
+      };
+      if (req.signal?.aborted) void cancel(); else req.signal?.addEventListener("abort", () => void cancel(), { once: true });
     });
   }
 

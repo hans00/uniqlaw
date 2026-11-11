@@ -529,7 +529,7 @@ A unified permission model, translated by each adapter into the provider's setti
 interface PermissionPolicy {
   level: "locked" | "strict" | "moderate" | "unrestricted";  // carried over from v2
   allowTools: string[]; denyTools: string[];
-  approval: { mode: "auto-deny" | "ask-operator" | "auto-allow"; timeoutSec: number };
+  approval: { mode: "auto-deny" | "ask-operator" | "auto-allow"; timeoutSec: number /* 0 = wait indefinitely */; judge?: ApprovalJudgeConfig };
   dirScope?: string[];
 }
 ```
@@ -540,7 +540,118 @@ interface PermissionPolicy {
 - pi → `tool_call` hook (our own gate, fail-closed)
 
 The Approval Broker receives every `permission_request`, finds the operator per §8.4, sends inline buttons,
-and denies on timeout.
+and denies on timeout. `approval.timeoutSec: 0` waits for the human indefinitely (no timer in core, the chat adapters or pi).
+
+### 10.4 Approval judge
+
+An optional decision model scores each request before the operator is asked (`packages/core/src/approval-judge.ts`).
+It runs in `ChannelRuntime.onPermissionInner` after the `auto-allow` / `auto-deny` short-circuits, so every provider
+that emits `permission_request` gets it (claude-sdk, codex, opencode, acp, pi, claude-tmux); agy has no callback.
+
+```jsonc
+"permissions": { "approval": { "mode": "ask-operator", "timeoutSec": 0,
+  "judge": {
+    "provider": "typesafe-jev",            // a judge provider (ApprovalJudge); the daemon's JUDGE_PROVIDERS
+    "mode": "shadow",                      // off (default) | shadow | enforce
+    "credential": { "command": "nibwarden read 'nw://TypeSafe API/password'" },   // any SecretRef (§10.1)
+    "model": "jev-latest",
+    "allowAbove": 0.9,                     // floor for every kind
+    "byKind": { "chat": 0.9, "worker": 0.93, "cron": 0.97, "peer": 0.97 },     // a number or "off"
+    "timeoutMs": 5000,
+    "audit": true
+  } } }
+```
+
+Guiding rule: **when in doubt, escalate**. The judge may only auto-allow input it fully and faithfully saw.
+
+Outcomes, in order:
+
+1. **deny**: only deterministic rules in code:
+   - the profile's `denyTools`: tool names (case-insensitive), `Bash(prefix:*)` (matched against every simple command
+     of the line, after leading `VAR=…` assignments and with `/bin/rm` read as `rm`, whitespace normalized; Claude,
+     pi `bash`, opencode `{patterns, metadata}` and codex string or argv `command`), and path globs;
+   - the channel tool policy (case-insensitive tool names) and the `locked` level (anything not read-only);
+   - writes (Write/Edit/MultiEdit/NotebookEdit, pi/opencode `write`/`edit`) outside the scope (`dirScope`, else the
+     session's cwd; not at `unrestricted`), and a codex `grantRoot` outside it. Paths are checked as written **and**
+     after `realpath` (the nearest existing parent for new files). **Writes made through a shell command are not
+     path-checked.**
+2. **allow**: only in `enforce`, when P(safe) ≥ the strictest threshold of the request's session kinds, no *allow
+   blocker* applies, and only for this request (`scope: "once"`: never `always`/session rules; ACP never falls back to
+   `allow_always`; a provider option list without a plain one-time "Yes"/"Allow" escalates).
+3. **escalate** (the operator flow) in every other case: low score, judge error or timeout, a kind set to `"off"`,
+   **any inbound A2A session or turn with an A2A origin (hard-coded: config cannot enable it)**, raw TUI dialog text,
+   and the allow blockers:
+   - `input-altered`: redaction or a size cap (4000 chars a string, 8000 in all, 50 items, depth 6) changed what the
+     judge saw;
+   - `empty-input`: nothing to judge once model-written fields are dropped (codex `fileChange` `{grantRoot}`, legacy
+     `applyPatch` `{}`);
+   - `interactive-tool`: `AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode` (allowing answers for the human) and codex
+     `SandboxPermissions` (granted for the turn);
+   - `complex-command`: when any `Bash(…)` deny rule exists, a command with `;` `&&` `||` `|` `` ` `` `$(` `<(`, a
+     newline, a leading env assignment, a first word that isn't a plain name (`r''m`, `"rm"`, `\rm`, `(rm …)`,
+     `{ rm …; }`, `! rm`, `$RM`), a binary called by path, or a wrapper that runs its arguments (`sh`, `eval`, `exec`,
+     `command`, `env`, `xargs`, `sudo`, `timeout`, `ionice`, `stdbuf`, `setsid`, `chroot`, `flock`, `parallel`,
+     `busybox`, interpreters, `find`, `git`, `make`, …);
+   - `suspicious-comment`: a shell `#` comment that talks to the reviewer (approved, authorized, safe, Hans, operator, …).
+
+`off` changes nothing in what is asked (no judge call, no audit, identical prompts and launch flags). `shadow` scores
+and logs every request (hard-policy rules and blockers included, as `wouldOutcome`/`wouldReason`/`blockers`) and
+still escalates all of them: deploy it first and calibrate.
+
+**Session kind**: one per origin of the turn (trusted human → `chat`; untrusted human, peer, system → `peer`;
+scheduler → `cron`; A2A → `a2a`), plus the session's own (`a2a` session, `worker`; a worker's peer origins are its
+owner's asks → `worker`). The strictest threshold among them applies, so a peer or cron message steered into a
+human's turn makes the whole request peer- or cron-strict.
+
+**Judge input** is minimal and trusted only, passed as typed fields: tool name, the structured input (secrets
+redacted; Bash `description` and codex `reason` dropped; size-capped), `inputTrust` (a fixed note that the input is
+the agent's own untrusted writing), cwd, write scope, level, session kind, a one-line channel-policy summary, and the
+latest human message **only when every origin of the turn is a trusted human** (as they wrote it, capped). Never tool
+outputs, fetched or file content, assistant text, the provider's title, or peer, cron or A2A message text.
+*Residual risk*: the input itself is model-written (shell comments, heredoc bodies, Write `content`, WebFetch/Task
+`prompt`); the judge is told so and reviewer-addressed shell comments escalate, but persuasive text elsewhere in the
+input still reaches it. Calibrated thresholds and the hard rules are the defense; keep `shadow` until the audit
+pairs say the thresholds hold.
+
+**Audit**: `<stateDir>/approvals/YYYY-MM.jsonl` (UTC month), one line per request (`id, ts, channelKey, sessionKind,
+provider, tool, structured, inputHash, input` (redacted), `judge, model, pSafe, threshold, mode, outcome, reason,
+wouldOutcome, wouldReason, blockers, latencyMs, error`), then `{id, humanDecision, decidedAt}`
+(`allow | deny | timeout | no-route | cancelled`). These pairs are the calibration data. The transcript
+`permission` record gains `by` (`judge | policy | operator`) and `pSafe`.
+
+**Escalated prompts** start with the score, e.g. `🤖 Jev: 0.87 safe (needs 0.90)` or `🤖 Jev: no score (…)`.
+
+**Prompts never block the session.** A permission request is handled off the event loop (prompts still one at a
+time, in order). `askChoice` takes an `AbortSignal`: when the provider withdraws the request
+(`permission_withdrawn`: claude-tmux's dialog stayed gone for 3 s (`timings.dialogWithdrawnMs`; a redraw or resize
+that hides it briefly, or redraws the same tool and request with other option text, keeps the same request) or was
+replaced by a different one; the Agent SDK aborted `canUseTool`), when the turn ends, or when the session closes, detaches or is reset, the chat prompt is cancelled
+("↩️ Cancelled — resolved elsewhere", buttons removed, the adapter's pending entry dropped) and nothing is answered.
+So `timeoutSec: 0` can't freeze a turn or a graceful restart's drain. This applies with the judge off too.
+
+**claude-tmux: the `PermissionRequest` hook.** With a judge on (and `ask-operator`), claude-tmux writes its settings
+(native memory and an HTTP hook) to `<stateDir>/claude-tmux/<session>/settings.json` (mode 0600) and passes
+`--settings <that file>`: the hook URL carries a token and must not sit in argv. The file is deleted when the session
+closes for good and when it is relaunched with the judge off (a daemon restart's detach keeps it: the live claude
+still uses it). The URL uses a **hook-only token**
+(`/hook/<token>/permission`; it cannot open `/mcp/…`, and the MCP token cannot open the hook). The runtime judges
+the **structured** `tool_name`/`tool_input`: allow or hard-policy deny answer the hook; escalate returns `{}` and
+Claude shows its dialog. The scraped `permission_request` reuses that verdict only when it shows the same request
+(tool, or `unknown`, and the command / path / URL found in the dialog text); otherwise it is escalated with no score
+(`hook-unmatched`). Hard-policy rules run again on the dialog, and verdicts are dropped when the turn ends or is
+interrupted (60 s at most). Judge off: no hook, and the launch flags stay exactly as before (inline
+`--settings` JSON only when native memory is off).
+Checked on claude 2.1.322: the hook fires in `default` mode only when a dialog would appear; `{}`, an error or an
+unreachable daemon fall through to the dialog; an allow is not remembered; `--settings` hooks also apply under
+`--setting-sources ""`; `disableAllHooks: true` in any settings layer turns it off (then the dialog path works as
+before). Under the `auto` permission mode the classifier decides first and the hook sees only what it escalates:
+the full benefit needs `default` mode (`profile.options.permissionMode`), a later, separate step.
+
+**typesafe-jev** (`packages/judge-typesafe`): `POST https://api.typesafe.ai/v1/systemone` with one Choice question
+(`safe | unsafe`); P(safe) is `answers.safety.probabilities.safe` (the probability of the option acted on, not
+`confidence`). The key is resolved from the SecretRef on the first request and kept in memory only. A `command`
+ref works with any secret CLI, e.g. `nibwarden read nw://<item>/<field>`, or start the daemon under
+`nibwarden run --` with an `{ "env": … }` ref.
 
 ### 10.3 Channel capabilities and group wake rules
 

@@ -9,6 +9,11 @@ import type { StateStore } from "./state.ts";
 import type { RuntimeEvent, TranscriptKind, TranscriptStore } from "./transcript.ts";
 import { ModelRouter, agenticSchema } from "./model-router.ts";
 import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
+import { isA2ASession } from "./a2a-policy.ts";
+import {
+  allowBlockers, buildJudgeInput, decideOutcome, hardPolicyDeny, inputFingerprint, inputHash, judgeNote, redactInput, runJudge, strictestKind,
+  type ApprovalAuditRecord, type ApprovalDecisionRecord, type ApprovalJudge, type JudgeResult, type SessionKind,
+} from "./approval-judge.ts";
 import {
   extractReactions, formatPendingForPrompt, formatToolStatus, isPassthroughSlashCommand, isSilentReplyText,
   mergeQueued, stripSilentToken, type PendingNote, type PromptItem,
@@ -61,7 +66,7 @@ export interface RuntimeHost {
   /** Tool policy for this session (settings.channels for a chat, A2A_TOOL_POLICY for inbound A2A); undefined = unrestricted. */
   toolPolicyFor?(channelKey: string): ToolPolicy | undefined;
   /** Issue an MCP Gateway token for this channel. */
-  gatewayFor(channelKey: string): { url: string; token: string; toolNames: string[] } | undefined;
+  gatewayFor(channelKey: string): { url: string; token: string; toolNames: string[]; permissionHookUrl?: string } | undefined;
   /** Minimal isolated env for provider child processes. */
   providerEnv(profile: Profile): Promise<Record<string, string>>;
   /** A turn hit the provider's usage limit. Return true when the host took over telling the human
@@ -74,6 +79,11 @@ export interface RuntimeHost {
   deferInput?(channelKey: string, input: QueuedInput): boolean;
   /** Replayed inputs left the queue for good (a turn started with them, or they were dropped). */
   releaseDeferred?(ids: number[]): void;
+  /** The approval judge of a profile with `permissions.approval.judge` (docs §10.4); undefined = it could not be
+   *  built (unknown provider…): requests then go to the operator. */
+  approvalJudge?(profile: Profile): ApprovalJudge | undefined;
+  /** Approval audit log (`<stateDir>/approvals/YYYY-MM.jsonl`). */
+  approvalAudit?: { append(rec: ApprovalAuditRecord | ApprovalDecisionRecord): void };
   /** Optional: bounded transcript for UIs. */
   transcript?: TranscriptStore;
   /** Optional: live runtime events (dashboard SSE). */
@@ -155,6 +165,10 @@ const RESUME_GRACE_MS = 3000;
 /** First retry delay; doubles each attempt. Overridable for tests via UNIQLAW_RATE_LIMIT_BACKOFF_MS. */
 const rateLimitBackoffMs = () => Number(process.env.UNIQLAW_RATE_LIMIT_BACKOFF_MS ?? 30_000);
 const INTERRUPT_SETTLE_MS = 8000;
+/** How long a hook-escalated verdict waits for the provider's dialog that follows it. */
+const HOOK_ESCALATED_TTL_MS = 60_000;
+
+type JudgeStageResult = { id: string; outcome: ReturnType<typeof decideOutcome>["outcome"]; pSafe?: number; note?: string; audit: boolean };
 
 export class ChannelRuntime {
   private _state: RuntimeState = "closed";
@@ -182,8 +196,14 @@ export class ChannelRuntime {
   private resumeOrigins?: { origins: Origin[]; until: number };
   private retryTimer?: ReturnType<typeof setTimeout>;
   private stallTimer?: ReturnType<typeof setTimeout>;
-  /** A permission/input request is waiting for a human: the stall watchdog is paused. */
-  private waitingForHuman = false;
+  /** Permission prompts waiting for a human, by provider request id (the stall watchdog is paused meanwhile). */
+  private pendingPermissions = new Map<string, AbortController>();
+  private permissionChain: Promise<void> = Promise.resolve();
+  /** Requests the permission hook judged and escalated: the provider's dialog for each follows and reuses the
+   *  verdict when it shows the same request (dialogVerdict). Dropped when the turn ends or is interrupted. */
+  private hookEscalated: { at: number; tool: string; input: unknown; fingerprint?: string; judged: JudgeStageResult }[] = [];
+  /** The provider's permission hook has reached this session (its dialogs follow a hook verdict). */
+  private hookActive = false;
   private readonly log: Logger;
   private router?: ModelRouter;
   /** Model the session is on, as far as we know (profile → /model → router → provider "model" events). */
@@ -384,6 +404,7 @@ export class ChannelRuntime {
     this.dropped = [];
     if (this.state !== "running") return false;
     if (!this.capabilities.interrupt) return false;
+    this.hookEscalated = [];
     await this.beginInterrupt(false);
     return true;
   }
@@ -415,6 +436,8 @@ export class ChannelRuntime {
       if (this.busy && keep.length) this.host.store.set(`inflight-turn:${this.channelKey}`, JSON.stringify(keep));
       const s = this.session;
       this.session = undefined;
+      this.cancelPermissions(); // the reattached session re-surfaces an open dialog
+      this.hookEscalated = [];
       this.stopTyping();
       clearTimeout(this.interruptTimer);
       clearTimeout(this.drainTimer);
@@ -438,6 +461,8 @@ export class ChannelRuntime {
     clearTimeout(this.drainTimer);
     const s = this.session;
     this.session = undefined;
+    this.cancelPermissions();
+    this.hookEscalated = [];
     this.state = "closed";
     this.turn = undefined;
     if (s) await s.close().catch((e) => this.log.warn("close failed", { e: String(e) }));
@@ -722,7 +747,10 @@ export class ChannelRuntime {
       case "tool_end":
         return;
       case "permission_request":
-        await this.onPermission(ev);
+        this.startPermission(ev);
+        return;
+      case "permission_withdrawn":
+        this.cancelPermissions(ev.id);
         return;
       case "input_request":
         await this.onInputRequest(ev);
@@ -932,7 +960,7 @@ export class ChannelRuntime {
 
   private async onStall() {
     if (!this.turn || this.state !== "running") return;
-    if (this.waitingForHuman || this.awaitingInput) return this.armStall();
+    if (this.pendingPermissions.size || this.awaitingInput) return this.armStall();
     this.log.warn("turn stalled; abandoning", { afterSec: this.host.settings.turn.stallTimeoutSec });
     const turn = this.turn;
     turn.stalled = true;
@@ -953,6 +981,9 @@ export class ChannelRuntime {
 
   private async finishTurnInner(reason: "done" | "interrupted" | "error", error?: string) {
     clearTimeout(this.stallTimer);
+    // The turn is over: a prompt still waiting has nothing left to answer, and hook verdicts belong to this turn.
+    this.cancelPermissions();
+    this.hookEscalated = [];
     // Segments that streamed but never got a final (interrupt / error): freeze what was shown.
     for (const [id, seg] of [...this.live]) await this.finishLive(id, this.liveView(seg.buf));
     if (this.turn?.stalled) { reason = "error"; error = "stall"; }
@@ -1030,21 +1061,54 @@ export class ChannelRuntime {
 
   // ── approvals / input requests ───────────────────────────────────────────
 
-  private async onPermission(ev: Extract<AgentEvent, { type: "permission_request" }>) {
-    this.waitingForHuman = true;
-    try { await this.onPermissionInner(ev); } finally { this.waitingForHuman = false; this.armStall(); }
+  /**
+   * A permission request is handled off the event loop (prompts still one at a time, in order), so the loop keeps
+   * seeing events while a human decides: a withdrawal (`permission_withdrawn`: the dialog was answered elsewhere or
+   * went away), the turn's end, or the session closing all cancel the waiting prompt instead of leaving the turn
+   * stuck behind it (with `timeoutSec: 0` it would never end).
+   */
+  private startPermission(ev: Extract<AgentEvent, { type: "permission_request" }>) {
+    const ac = new AbortController();
+    this.pendingPermissions.get(ev.id)?.abort();
+    this.pendingPermissions.set(ev.id, ac);
+    this.permissionChain = this.permissionChain
+      .then(() => (ac.signal.aborted ? undefined : this.onPermissionInner(ev, ac.signal)))
+      .catch((e) => this.log.error("permission handling failed", { tool: ev.tool, e: String(e) }))
+      .finally(() => {
+        if (this.pendingPermissions.get(ev.id) === ac) this.pendingPermissions.delete(ev.id);
+        this.armStall();
+      });
   }
 
-  private async onPermissionInner(ev: Extract<AgentEvent, { type: "permission_request" }>) {
+  /** Cancel one waiting permission prompt (the provider withdrew it), or all of them. */
+  private cancelPermissions(id?: string) {
+    for (const [k, ac] of this.pendingPermissions) if (id === undefined || k === id) ac.abort();
+  }
+
+  private async onPermissionInner(ev: Extract<AgentEvent, { type: "permission_request" }>, signal?: AbortSignal) {
     const s = this.session;
     if (!s?.respondPermission) return;
     const mode = this.profile.permissions.approval.mode;
     if (mode === "auto-allow") return s.respondPermission(ev.id, { behavior: "allow" }, 1);
     if (mode === "auto-deny") return this.deny(s, ev, "auto-deny policy");
+    const judged = await this.dialogVerdict(ev) ?? await this.judgeStage(ev);
+    if (signal?.aborted) return;
+    if (judged?.outcome.action === "allow") {
+      this.record("permission", `${ev.tool}: allow (${judged.note})`, { decision: "allow", by: "judge", pSafe: judged.pSafe });
+      return s.respondPermission(ev.id, { behavior: "allow", scope: "once" }, onceOption(ev.options));
+    }
+    if (judged?.outcome.action === "deny") {
+      this.record("permission", `${ev.tool}: deny (${judged.outcome.rule})`, { decision: "deny", by: "policy" });
+      return this.deny(s, ev, `blocked by policy: ${judged.outcome.rule}`);
+    }
+    const decided = (humanDecision: ApprovalDecisionRecord["humanDecision"]) => {
+      if (judged?.audit) this.audit({ id: judged.id, humanDecision, decidedAt: new Date().toISOString() });
+    };
     const target = this.approvalTarget();
     const platform = target && this.host.platform(target.platform);
     if (!target || !platform?.askChoice) {
       this.log.warn("no approval route; denying", { tool: ev.tool });
+      decided("no-route");
       return this.deny(s, ev, "no approver available");
     }
     const options = ev.options?.length ? ev.options : ["Allow", "Deny"];
@@ -1052,22 +1116,154 @@ export class ChannelRuntime {
     // strip rule lines / tips and show it once.
     const detail = cleanDialogText(typeof ev.input === "string" ? ev.input : JSON.stringify(ev.input, null, 2));
     const title = cleanDialogText(ev.title || "Permission request").split("\n")[0]!.slice(0, 120);
-    const body = [`**${this.channelKey}** wants to run **${ev.tool}**`, "```", truncate(detail, 1200), "```"].join("\n");
+    const body = [...(judged?.note ? [`🤖 ${judged.note}`] : []), `**${this.channelKey}** wants to run **${ev.tool}**`, "```", truncate(detail, 1200), "```"].join("\n");
     const choice = await platform.askChoice({ platform: target.platform, chatId: target.chatId, threadId: target.threadId }, {
       title, body, options, approverIds: [],
       timeoutMs: this.profile.permissions.approval.timeoutSec * 1000,
+      ...(signal ? { signal } : {}),
     }).catch(() => null);
-    if (choice === null) return this.deny(s, ev, "approval timed out");
+    // Withdrawn while the human was deciding: the provider moved on, there is nothing left to answer.
+    if (signal?.aborted) { decided("cancelled"); this.record("permission", `${ev.tool}: cancelled (resolved elsewhere)`, { decision: "cancelled" }); return; }
+    if (choice === null) { decided("timeout"); return this.deny(s, ev, "approval timed out"); }
+    const judgeMeta = judged ? { by: "operator", ...(judged.pSafe !== undefined ? { pSafe: judged.pSafe } : {}) } : {};
     if (ev.options?.length) {
       // Provider-native option list: deny iff the chosen label reads like a refusal.
       const label = options[choice] ?? "";
       const isDeny = /^(no|deny|cancel|reject)/i.test(label.trim());
       if (isDeny && this.turn) this.turn.denied = true;
-      this.record("permission", `${ev.tool}: ${label}`, { decision: isDeny ? "deny" : "allow" });
+      decided(isDeny ? "deny" : "allow");
+      this.record("permission", `${ev.tool}: ${label}`, { decision: isDeny ? "deny" : "allow", ...judgeMeta });
       return s.respondPermission(ev.id, isDeny ? { behavior: "deny" } : { behavior: "allow" }, choice + 1);
     }
-    this.record("permission", `${ev.tool}: ${choice === 0 ? "allow" : "deny"}`, { decision: choice === 0 ? "allow" : "deny" });
+    decided(choice === 0 ? "allow" : "deny");
+    this.record("permission", `${ev.tool}: ${choice === 0 ? "allow" : "deny"}`, { decision: choice === 0 ? "allow" : "deny", ...judgeMeta });
     return choice === 0 ? s.respondPermission(ev.id, { behavior: "allow" }, 1) : this.deny(s, ev, "denied by operator");
+  }
+
+  /** Session kinds this request answers to: the session's own (A2A, worker) and one per origin of the turn. The
+   *  strictest decides (strictestKind). A worker's peer origins are its owner's asks: "worker". */
+  sessionKinds(): SessionKind[] {
+    const worker = this.channelKey.startsWith("worker:");
+    const kinds = new Set<SessionKind>();
+    if (isA2ASession(this.channelKey)) kinds.add("a2a");
+    if (worker) kinds.add("worker");
+    const origins = this.turn?.origins ?? [];
+    for (const o of origins) {
+      kinds.add(o.kind === "human" ? (o.trusted ? "chat" : "peer") : o.kind === "a2a" ? "a2a" : o.kind === "scheduler" ? "cron"
+        : o.kind === "peer" && worker ? "worker" : "peer");
+    }
+    if (!origins.length) kinds.add(this.host.isInternal?.(this.channelKey) ? "cron" : worker ? "worker" : "peer");
+    return [...kinds];
+  }
+
+  /** The newest message of a trusted human, as they wrote it, only when every origin of the turn is a trusted
+   *  human: a steered-in peer, cron or A2A message must not make its own call look human-requested. */
+  private trustedHumanText(): string | undefined {
+    const origins = this.turn?.origins ?? [];
+    if (!origins.length || !origins.every((o) => o.kind === "human" && o.trusted)) return undefined;
+    for (const q of [...(this.turn?.inputs ?? [])].reverse()) {
+      if (q.origin.kind === "human" && q.origin.trusted && !q.item.raw) return q.item.text;
+    }
+    return undefined;
+  }
+
+  /**
+   * Permission hook (claude-tmux `PermissionRequest`, docs §10.4): judge the structured request before the provider
+   * shows its dialog. allow / deny answer it; undefined defers to the dialog, which then reuses this verdict.
+   */
+  async permissionHook(req: { tool: string; input: unknown }): Promise<{ behavior: "allow" } | { behavior: "deny"; message: string } | undefined> {
+    const cfg = this.profile.permissions.approval.judge;
+    if (!cfg || cfg.mode === "off" || this.profile.permissions.approval.mode !== "ask-operator" || !this.session) return undefined;
+    this.hookActive = true;
+    const ev = { type: "permission_request" as const, id: `hook:${crypto.randomUUID()}`, tool: req.tool, input: req.input, title: "" };
+    const judged = await this.judgeStage(ev);
+    if (!judged) return undefined;
+    if (judged.outcome.action === "allow") {
+      this.record("permission", `${req.tool}: allow (${judged.note})`, { decision: "allow", by: "judge", pSafe: judged.pSafe });
+      return { behavior: "allow" };
+    }
+    if (judged.outcome.action === "deny") {
+      this.record("permission", `${req.tool}: deny (${judged.outcome.rule})`, { decision: "deny", by: "policy" });
+      return { behavior: "deny", message: `blocked by policy: ${judged.outcome.rule}` };
+    }
+    this.hookEscalated.push({ at: Date.now(), tool: req.tool, input: req.input, fingerprint: inputFingerprint(req.tool, req.input), judged });
+    return undefined;
+  }
+
+  /**
+   * A provider dialog (raw text) after the permission hook has been active: reuse the hook's verdict only when the
+   * dialog shows the same request (tool, and the command / path / URL found in the dialog text). Unmatched: escalate
+   * with no score. Hard policy runs again either way. undefined = no hook in play: judge the dialog itself.
+   */
+  private async dialogVerdict(ev: Extract<AgentEvent, { type: "permission_request" }>): Promise<JudgeStageResult | undefined> {
+    const cfg = this.profile.permissions.approval.judge;
+    if (!cfg || cfg.mode === "off" || typeof ev.input !== "string" || !this.hookActive) return undefined;
+    const now = Date.now();
+    this.hookEscalated = this.hookEscalated.filter((h) => now - h.at < HOOK_ESCALATED_TTL_MS);
+    const text = ev.input.replace(/\s+/g, "");
+    const i = this.hookEscalated.findIndex((h) => !!h.fingerprint && text.includes(h.fingerprint)
+      && (ev.tool === "unknown" || ev.tool.toLowerCase() === h.tool.toLowerCase()));
+    const hit = i >= 0 ? this.hookEscalated.splice(i, 1)[0]! : undefined;
+    const policy = this.profile.permissions;
+    const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
+    const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
+    const rule = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured: false, policy, toolPolicy, cwd })
+      ?? (hit ? hardPolicyDeny({ tool: hit.tool, input: hit.input, structured: true, policy, toolPolicy, cwd }) : undefined);
+    if (rule && cfg.mode === "enforce") return { id: hit?.judged.id ?? crypto.randomUUID(), outcome: { action: "deny", rule }, audit: false };
+    if (hit) return hit.judged;
+    const id = crypto.randomUUID();
+    if (cfg.audit) {
+      this.audit({ id, ts: new Date().toISOString(), channelKey: this.channelKey, sessionKind: strictestKind(cfg, this.sessionKinds()).kind,
+        provider: this.profile.provider, tool: ev.tool, structured: false, inputHash: inputHash(ev.input), input: redactInput(ev.input),
+        mode: cfg.mode, outcome: "escalate", reason: "hook-unmatched", threshold: null });
+    }
+    return { id, outcome: { action: "escalate", reason: "hook-unmatched" }, audit: cfg.audit };
+  }
+
+  /** Judge stage (docs §10.4): hard policy, then the judge. undefined = no judge configured (mode off). */
+  private async judgeStage(ev: Extract<AgentEvent, { type: "permission_request" }>): Promise<JudgeStageResult | undefined> {
+    const policy = this.profile.permissions;
+    const cfg = policy.approval.judge;
+    if (!cfg || cfg.mode === "off") return undefined;
+    const id = crypto.randomUUID();
+    const { kind, threshold } = strictestKind(cfg, this.sessionKinds());
+    const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
+    const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
+    const structured = typeof ev.input !== "string";
+    const hardDeny = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured, policy, toolPolicy, cwd });
+    const human = this.trustedHumanText();
+    const { altered, ...input } = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind, ...(human ? { humanRequest: human } : {}) });
+    const blockers = allowBlockers({ tool: ev.tool, input: ev.input, structured, altered, policy });
+    if (ev.options?.length && onceOption(ev.options) === undefined) blockers.push("no-once-option");
+    let judge: ApprovalJudge | undefined;
+    try { judge = this.host.approvalJudge?.(this.profile); } catch (e) { this.log.warn("approval judge unavailable", { e: String(e) }); }
+    // A hard deny in enforce mode needs no score; shadow still scores it (calibration data).
+    let judged: JudgeResult | undefined;
+    if (!(hardDeny && cfg.mode === "enforce")) {
+      judged = judge ? await runJudge(judge, input, cfg.timeoutMs) : { ok: false, error: `judge provider "${cfg.provider}" is not available`, latencyMs: 0 };
+    }
+    const { outcome, would } = decideOutcome({ mode: cfg.mode, ...(hardDeny ? { hardDeny } : {}), ...(judged ? { judged } : {}), ...(threshold !== undefined ? { threshold } : {}), structured, blockers });
+    if (judged && !judged.ok) this.log.warn("approval judge failed; asking the operator", { tool: ev.tool, error: judged.error });
+    const name = judge?.name ?? cfg.provider;
+    const pSafe = judged?.ok ? judged.pSafe : undefined;
+    if (cfg.audit) {
+      this.audit({
+        id, ts: new Date().toISOString(), channelKey: this.channelKey, sessionKind: kind, provider: this.profile.provider,
+        tool: ev.tool, structured, inputHash: inputHash(ev.input), input: input.input, judge: name,
+        ...(judged?.ok && judged.model ? { model: judged.model } : {}), ...(pSafe !== undefined ? { pSafe } : {}),
+        threshold: threshold ?? null, mode: cfg.mode, outcome: outcome.action,
+        ...(outcome.action === "escalate" ? { reason: outcome.reason } : outcome.action === "deny" ? { reason: outcome.rule } : {}),
+        ...(cfg.mode === "shadow" ? { wouldOutcome: would.action, ...(would.action === "escalate" ? { wouldReason: would.reason } : {}) } : {}),
+        ...(blockers.length ? { blockers } : {}),
+        ...(judged ? { latencyMs: judged.latencyMs } : {}), ...(judged && !judged.ok ? { error: judged.error } : {}),
+      });
+    }
+    const note = judgeNote(name, judged, threshold);
+    return { id, outcome, ...(pSafe !== undefined ? { pSafe } : {}), ...(note ? { note } : {}), audit: cfg.audit };
+  }
+
+  private audit(rec: ApprovalAuditRecord | ApprovalDecisionRecord) {
+    try { this.host.approvalAudit?.append(rec); } catch (e) { this.log.warn("approval audit append failed", { e: String(e) }); }
   }
 
   private async deny(s: AgentSession, ev: { id: string; options?: string[] }, message: string) {
@@ -1163,6 +1359,13 @@ export class ChannelRuntime {
   idleSince(): number {
     return this.host.store.getSession(this.channelKey)?.lastActivityAt ?? 0;
   }
+}
+
+/** 1-based index of the provider's plain one-time allow option ("Yes" / "Allow", never "always" / "don't ask
+ *  again" / session-wide); undefined when there are options but none is that. */
+function onceOption(options: string[] | undefined): number | undefined {
+  const i = options?.findIndex((o) => /^(yes|allow)\b/i.test(o.trim()) && !/always|don't ask|do not ask|allow all|session|switch to/i.test(o)) ?? -1;
+  return i >= 0 ? i + 1 : undefined;
 }
 
 function truncate(s: string, n: number) { return s.length > n ? s.slice(0, n - 1) + "…" : s; }

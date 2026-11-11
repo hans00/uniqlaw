@@ -174,6 +174,12 @@ export class ChannelManager {
     return isA2ASession(channelKey) ? { ...p, permissions: a2aPermissions(p.permissions) } : p;
   }
 
+  /** A provider's permission hook (claude-tmux `PermissionRequest`): the session's judge stage on structured input.
+   *  undefined = defer to the provider's own dialog (no live session, judge off or escalated). */
+  async permissionHook(channelKey: string, req: { tool: string; input: unknown }) {
+    return this.runtimes.get(channelKey)?.permissionHook(req);
+  }
+
   runtime(channelKey: string, multiparty = false): ChannelRuntime {
     let rt = this.runtimes.get(channelKey);
     if (rt) return rt;

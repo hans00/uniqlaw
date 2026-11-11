@@ -1,6 +1,7 @@
 // PermissionPolicy → claude CLI flags. Port of v2 buildSecurityArgs with two
 // M0 rules: ALWAYS pin --permission-mode (user settings may say "auto"), and
 // ALWAYS disallow the native cross-session tools.
+import { chmodSync, writeFileSync } from "node:fs";
 import { claudeToolLists, type PermissionPolicy, type ToolPolicy } from "@uniqlaw/core";
 
 export const NATIVE_CROSS_SESSION_TOOLS = ["ListAgents", "SendMessage"];
@@ -86,6 +87,27 @@ export const NO_NATIVE_MEMORY_SETTINGS = { autoMemoryEnabled: false, autoDreamEn
 /** CLI flags for SessionSpec.nativeMemory (claude-tmux). */
 export function nativeMemoryArgs(nativeMemory: boolean | undefined): string[] {
   return nativeMemory === false ? ["--settings", JSON.stringify(NO_NATIVE_MEMORY_SETTINGS)] : [];
+}
+
+/** Claude Code `PermissionRequest` HTTP hook to the approval judge (docs §10.4). Checked on claude 2.1.322: fires in
+ *  `default` mode only when a dialog would be shown, gets `tool_name` / `tool_input` / `cwd` / `permission_mode`;
+ *  `{}`, an error or an unreachable URL fall through to the dialog; an allow is not remembered. Hooks from
+ *  `--settings` also apply under `--setting-sources ""`, but `disableAllHooks: true` in any settings layer turns
+ *  it off (requests then reach the operator through the dialog as before). */
+export function permissionHookSettings(url: string, timeoutSec: number) {
+  return { hooks: { PermissionRequest: [{ matcher: "*", hooks: [{ type: "http", url, timeout: timeoutSec }] }] } };
+}
+
+/** The one `--settings` flag of a claude-tmux launch (claude takes a single `--settings`). Without a hook it is
+ *  exactly nativeMemoryArgs (inline JSON). With the permission hook the merged settings go to `file` (mode 0600) and
+ *  the flag names the file: the hook URL carries a token and must not sit in argv (`ps`, /proc/<pid>/cmdline). */
+export function claudeSettingsArgs(o: { nativeMemory: boolean | undefined; permissionHook?: { url: string; timeoutSec: number; file: string } }): string[] {
+  if (!o.permissionHook) return nativeMemoryArgs(o.nativeMemory);
+  const settings = { ...(o.nativeMemory === false ? NO_NATIVE_MEMORY_SETTINGS : {}),
+    ...permissionHookSettings(o.permissionHook.url, o.permissionHook.timeoutSec) };
+  writeFileSync(o.permissionHook.file, JSON.stringify(settings), { mode: 0o600 });
+  chmodSync(o.permissionHook.file, 0o600);
+  return ["--settings", o.permissionHook.file];
 }
 /** SDK `settings` option for SessionSpec.nativeMemory (claude-sdk). */
 export function nativeMemorySettings(nativeMemory: boolean | undefined): { settings?: { autoMemoryEnabled: false; autoDreamEnabled: false } } {

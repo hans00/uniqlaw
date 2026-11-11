@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { A2A_TOOL_POLICY, DEFAULT_PERMISSIONS, type ToolPolicy } from "@uniqlaw/core";
 import {
   buildPermissionArgs, claudeToolSets, ISOLATED_SDK_OPTIONS, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
-  isInterruptMarker, isRejectionText, nativeMemoryArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
+  isInterruptMarker, isRejectionText, nativeMemoryArgs, claudeSettingsArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
 } from "../src/index.ts";
 
 describe("permissions", () => {
@@ -144,6 +144,21 @@ describe("classify + prompt + mcp + credentials", () => {
     expect(nativeMemoryArgs(undefined)).toEqual([]);
     expect(nativeMemoryArgs(true)).toEqual([]);
     expect(nativeMemorySettings(false)).toEqual({ settings: { autoMemoryEnabled: false, autoDreamEnabled: false } });
+    // One --settings flag: without a permission hook exactly nativeMemoryArgs; with one, merged.
+    for (const m of [false, true, undefined]) expect(claudeSettingsArgs({ nativeMemory: m })).toEqual(nativeMemoryArgs(m));
+    // With the hook: merged settings in a 0600 file, the flag names the file (the hook URL carries a token: not in argv).
+    const hook = { hooks: { PermissionRequest: [{ matcher: "*", hooks: [{ type: "http", url: "http://h/hook/t/permission", timeout: 10 }] }] } };
+    const sdir = mkdtempSync(join(tmpdir(), "uq-settings-"));
+    try {
+      const file = join(sdir, "settings.json");
+      const args = claudeSettingsArgs({ nativeMemory: false, permissionHook: { url: "http://h/hook/t/permission", timeoutSec: 10, file } });
+      expect(args).toEqual(["--settings", file]);
+      expect(args.join(" ")).not.toContain("/hook/");
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ autoMemoryEnabled: false, autoDreamEnabled: false, ...hook });
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      claudeSettingsArgs({ nativeMemory: true, permissionHook: { url: "http://h/hook/t/permission", timeoutSec: 10, file } });
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(hook);
+    } finally { rmSync(sdir, { recursive: true, force: true }); }
     expect(nativeMemorySettings(true)).toEqual({});
   });
   test("credential env", async () => {

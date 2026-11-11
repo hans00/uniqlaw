@@ -124,6 +124,22 @@ describe("PiProvider (faux model, real harness)", () => {
     expect(b.events.some((e) => e.type === "text" && e.final?.includes("BLOCKED") && e.final.includes("nope from operator"))).toBe(true);
   });
 
+  test("timeoutSec 0: the permission waits for the operator indefinitely", async () => {
+    const steps: FauxResponseFactory[] = [
+      () => fauxAssistantMessage([fauxToolCall("bash", { command: "echo x" })], { stopReason: "toolUse" }),
+      (ctx) => fauxAssistantMessage(lastToolResult(ctx)?.isError ? "BLOCKED" : "RAN"),
+    ];
+    const { open } = harness(steps);
+    const a = await open({ permissions: { approval: { mode: "ask-operator", timeoutSec: 0 } } });
+    await a.s.send({ text: "go", attachments: [] });
+    const p = await a.until((e) => e.type === "permission_request");
+    await Bun.sleep(150);
+    expect(a.events.some((e) => e.type === "turn_end" || (e.type === "text" && e.final === "BLOCKED"))).toBe(false);
+    await a.s.respondPermission!((p as { id: string }).id, { behavior: "allow" });
+    await a.until((e) => e.type === "turn_end");
+    expect(a.events.some((e) => e.type === "text" && e.final === "RAN")).toBe(true);
+  });
+
   test("permission times out to deny; auto-deny never asks; bus tools are not gated", async () => {
     const steps: FauxResponseFactory[] = [
       () => fauxAssistantMessage([fauxToolCall("bash", { command: "echo x" })], { stopReason: "toolUse" }),
