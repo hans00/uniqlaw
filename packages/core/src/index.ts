@@ -22,3 +22,4 @@ export * from "./restart.ts";
 export * from "./approval-judge.ts";
 export * from "./shell.ts";
 export * from "./targets.ts";
+export * from "./taint.ts";

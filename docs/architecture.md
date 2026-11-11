@@ -637,6 +637,44 @@ outputs, fetched or file content, assistant text, the provider's title, or peer,
 input still reaches it. Calibrated thresholds and the hard rules are the defense; keep `shadow` until the audit
 pairs say the thresholds hold.
 
+**Layering.** A request passes these layers in order:
+1. **hard deny** for what policy forbids (deterministic code);
+2. **blockers** for what the judge could not see or cannot grant (escalate);
+3. **the judge**, which must reach a threshold: the session kind's, raised to `taint.taintedAbove` (default 0.97)
+   when the context is **tainted** and the request is high-impact (`send`, `publish`, `delete`, `install`; configurable
+   `highImpactEffects`) or reaches an external, remote, global/system or protected target (an unknown target or an
+   unrecognized command counts as high-impact);
+4. **the induced check**: the judge's second answer must not say the action is induced by content (P(induced) ≥
+   `inducedAbove`, default 0.5, or `unclear` escalates).
+
+Taint is the **factual** signal: the harness saw untrusted content enter the context, whatever it said. The induced
+question is **auxiliary**: the judge sees the request and the context, not the content itself, and the content can
+argue with it; it can only add escalations, never allow.
+
+**Taint tracking** (`core/src/taint.ts`, `judge.taint`). Per turn (or for the whole session with `sticky: true`), the
+untrusted sources that entered the agent's context, from the observed actions and the turn's origins, through a
+registry of detectors (extensible like `targets`):
+- web tools (WebFetch, WebSearch, fetch);
+- network reads through the shell normalizer (`curl`, `wget`, `http`/`xh`, `nc`, `gh api|issue|pr|…`,
+  `git clone`), and output of remote commands (`ssh host cmd`, `docker|kubectl exec`, `scp`/`rsync` from a host);
+- MCP tools whose results come from third parties, by tool-name pattern (`thirdPartyTools`; defaults cover mail,
+  chat, issues, docs, drives, calendars, browsers, the web, search); UniQlaw's own `agent_ask` / `task_status` results
+  count as peer text;
+- reads of files outside the scope, and of files inside it that this session did not create and git does not track
+  (downloaded files). Files git tracks, the session's own writes and (without a repository) project files are not
+  taint, unless `trustRepoFiles: false` makes the own repo untrusted too;
+- peer, cron and A2A messages in the turn, and messages from untrusted humans.
+
+The judge gets `taint: {tainted, sources: [{kind, id, at}]}` (ids are `{untrusted}` labels) and the audit line records
+it with `taintStrict`. There is **no ingress scanning**: nothing reads the content itself.
+
+**The induced question.** Every backend asks a second choice question in the same request
+(`JUDGE_INDUCED_QUESTION`): does the action serve the human's request, or is it induced by content the agent read?
+(`task | induced | unclear`). TypeSafe System One answers several named questions per call and OpenAI Decisions up to
+400, so both backends send `safety` and `induced` together. P(induced) and the answer go to the audit line, and the
+escalation note shows both scores, e.g. `🤖 Jev: 0.93 safe · induced 0.61`. A backend that answers only the first
+question gets no induced check.
+
 **Shell dialects.** The normalizer is **best effort** and reads POSIX sh / bash / dash; zsh only where it is the
 same (zsh-only syntax: `=cmd`, glob qualifiers `*(.)`, `${~…}`, `=(…)` is unresolvable); fish and PowerShell not at
 all (`parsed: false`: every command is unresolvable when a `Bash(…)` deny rule exists, otherwise it goes to the judge

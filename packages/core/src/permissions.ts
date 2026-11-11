@@ -24,6 +24,17 @@ export interface ApprovalJudgeConfig {
   timeoutMs: number;
   /** Write `<stateDir>/approvals/YYYY-MM.jsonl`. */
   audit: boolean;
+  /** Escalate when P(induced by content) reaches this, or the judge answers "unclear" (default 0.5). */
+  inducedAbove?: number;
+  /** Taint tracking (docs §10.4); defaults when absent. */
+  taint?: {
+    enabled: boolean;
+    taintedAbove: number;
+    sticky: boolean;
+    trustRepoFiles: boolean;
+    highImpactEffects: ("read" | "create" | "modify" | "delete" | "execute" | "send" | "install" | "publish")[];
+    thirdPartyTools?: string[];
+  };
 }
 
 export interface PermissionPolicy {

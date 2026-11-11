@@ -4,7 +4,7 @@
 // `confidence`).
 //  - provider "typesafe-compatible": any server speaking that protocol (self-hosted), baseUrl and auth configurable;
 //  - provider "typesafe-jev": the hosted TypeSafe service (the same backend with its default baseUrl and model).
-import { JUDGE_QUESTION, secretRefSchema, type ApprovalJudge, type JudgeInput, type JudgeVerdict } from "@uniqlaw/core";
+import { JUDGE_INDUCED_QUESTION, JUDGE_QUESTION, secretRefSchema, type ApprovalJudge, type JudgeInput, type JudgeVerdict } from "@uniqlaw/core";
 import { z } from "zod";
 
 export const TYPESAFE_API = "https://api.typesafe.ai";
@@ -47,8 +47,11 @@ export const SAFETY_QUESTION = {
   criteria: JUDGE_QUESTION.criteria,
 } as const;
 
+/** The second question, in the same request (System One answers several named questions per call). */
+export const INDUCED_QUESTION = { type: "choice", instructions: JUDGE_INDUCED_QUESTION.task, criteria: JUDGE_INDUCED_QUESTION.criteria } as const;
+
 export function systemOneRequestBody(req: JudgeInput, model: string) {
-  return { model, state: { request: req }, questions: { safety: SAFETY_QUESTION } };
+  return { model, state: { request: req }, questions: { safety: SAFETY_QUESTION, induced: INDUCED_QUESTION } };
 }
 /** @deprecated name kept for callers of the first version. */
 export const jevRequestBody = (req: JudgeInput, model = DEFAULT_JEV_MODEL) => systemOneRequestBody(req, model);
@@ -59,7 +62,11 @@ export function parseSystemOneResponse(j: unknown): JudgeVerdict {
   const a = r?.answers?.safety;
   const p = a?.probabilities?.safe;
   if (a?.type !== "choice" || typeof p !== "number" || !Number.isFinite(p)) throw new Error("unexpected TypeSafe response: no choice probability for \"safe\"");
-  return { pSafe: p, ...(typeof a.choice === "string" ? { label: a.choice } : {}), ...(typeof r.model === "string" ? { model: r.model } : {}) };
+  const ind = (r.answers as Record<string, { type?: unknown; choice?: unknown; probabilities?: Record<string, unknown> }> | undefined)?.induced;
+  const pi = ind?.type === "choice" ? ind.probabilities?.induced : undefined;
+  return { pSafe: p, ...(typeof a.choice === "string" ? { label: a.choice } : {}), ...(typeof r.model === "string" ? { model: r.model } : {}),
+    ...(typeof pi === "number" && Number.isFinite(pi) ? { pInduced: pi } : {}),
+    ...(ind?.choice === "task" || ind?.choice === "induced" || ind?.choice === "unclear" ? { inducedLabel: ind.choice } : {}) };
 }
 export const parseJevResponse = parseSystemOneResponse;
 
