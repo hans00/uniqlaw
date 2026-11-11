@@ -84,7 +84,7 @@ interface TurnState {
   denied: boolean;
   unsolicited: boolean;
   /** For task_status while the turn runs: recent activity (texts, tools) and the text being streamed now. */
-  progress?: { lines: string[]; partial: string };
+  progress?: TurnProgress;
 }
 
 /** What task_status shows about a task its session is still working on. */
@@ -93,12 +93,27 @@ export interface TaskProgress {
   phase: "running" | "queued";
   /** queued: 1 = next. */
   queuePosition?: number;
-  /** running: when the turn started (ms). */
+  /** running: when this task's work started (ms): the turn's start, or when it joined a running turn (steer). */
   turnStartedAt?: number;
-  /** running: the latest assistant text of the turn (the one being streamed, else the last finished one), tail-bounded. */
+  /** running: the latest assistant text since this task joined the turn (the one being streamed, else the last
+   *  finished one), tail-bounded. A steered turn still mixes askers' work after the join: it is one conversation. */
   latestText?: string;
-  /** running: the last few activity lines ("text: …", "tool: …"), oldest first. */
+  /** running: the last few activity lines since this task joined ("text: …", "tool: <name>"; no tool inputs), oldest first. */
   recent: string[];
+}
+
+/** Activity of a running turn, numbered so each asker sees only what happened after its origin joined the turn. */
+interface TurnProgress {
+  seq: number;
+  lines: { seq: number; line: string }[];
+  /** Assistant text being streamed now, and the seq at which it started. */
+  partial: string;
+  partialSeq: number;
+  partialSegment?: string;
+  lastText?: { seq: number; text: string };
+  /** taskId → seq when its origin joined (steered or merged in mid-turn); absent = there from the start (0). */
+  joined: Record<string, number>;
+  joinedAt?: Record<string, number>;
 }
 
 const PROGRESS_LINES = 10;
@@ -185,21 +200,49 @@ export class ChannelRuntime {
     const has = (o: Origin) => "taskId" in o && o.taskId === taskId;
     const t = this.turn;
     if (t && this.state !== "idle" && t.origins.some(has)) {
-      const latest = t.progress?.partial.trim() || t.texts.at(-1)?.trim();
-      return { phase: "running", turnStartedAt: t.startedAt, ...(latest ? { latestText: tailOf(latest, PROGRESS_TEXT_CHARS) } : {}),
-        recent: [...(t.progress?.lines ?? [])] };
+      const p = t.progress;
+      const from = p?.joined[taskId] ?? 0;
+      const partial = p && p.partialSeq >= from ? p.partial.trim() : "";
+      const latest = partial || (p?.lastText && p.lastText.seq >= from ? p.lastText.text.trim() : "");
+      return { phase: "running", turnStartedAt: p?.joinedAt?.[taskId] ?? t.startedAt,
+        ...(latest ? { latestText: tailOf(latest, PROGRESS_TEXT_CHARS) } : {}),
+        recent: (p?.lines ?? []).filter((l) => l.seq >= from).map((l) => l.line) };
     }
     const i = this.queue.findIndex((q) => has(q.origin));
     return i >= 0 ? { phase: "queued", queuePosition: i + 1, recent: [] } : undefined;
   }
 
-  private noteProgress(line?: string, partial?: { reset?: boolean; delta?: string }) {
+  private progressState(t: TurnState): TurnProgress {
+    return (t.progress ??= { seq: 0, lines: [], partial: "", partialSeq: 0, joined: {} });
+  }
+
+  /** An origin joined the running turn (steer): its task's progress starts here. */
+  private noteJoined(origin: Origin) {
+    const t = this.turn;
+    if (!t || !("taskId" in origin) || !origin.taskId) return;
+    const p = this.progressState(t);
+    p.joined[origin.taskId] = ++p.seq;
+    (p.joinedAt ??= {})[origin.taskId] = Date.now();
+  }
+
+  private noteProgress(o: { line?: string; text?: string; delta?: string; segment?: string }) {
     const t = this.turn;
     if (!t) return;
-    const p = (t.progress ??= { lines: [], partial: "" });
-    if (line) { p.lines.push(oneLine(line, PROGRESS_LINE_CHARS)); if (p.lines.length > PROGRESS_LINES) p.lines.splice(0, p.lines.length - PROGRESS_LINES); }
-    if (partial?.reset) p.partial = "";
-    if (partial?.delta) p.partial = tailOf(p.partial + partial.delta, PROGRESS_TEXT_CHARS);
+    const p = this.progressState(t);
+    // A finished text that was streaming belongs to when its stream began (it may predate a later joiner).
+    const seq = o.text !== undefined && p.partial ? p.partialSeq : ++p.seq;
+    if (o.line) {
+      p.lines.push({ seq, line: oneLine(o.line, PROGRESS_LINE_CHARS) });
+      if (p.lines.length > PROGRESS_LINES) p.lines.splice(0, p.lines.length - PROGRESS_LINES);
+    }
+    if (o.text !== undefined) p.lastText = { seq, text: tailOf(o.text, PROGRESS_TEXT_CHARS) };
+    if (o.delta !== undefined) {
+      if (o.segment !== p.partialSegment) { p.partial = ""; p.partialSegment = o.segment; }
+      if (!p.partial) p.partialSeq = seq;
+      p.partial = tailOf(p.partial + o.delta, PROGRESS_TEXT_CHARS);
+      return;
+    }
+    p.partial = "";
   }
 
   /** Human target at the root of whatever the current turn is serving. */
@@ -248,6 +291,7 @@ export class ChannelRuntime {
     if (this.state === "running" && mode === "steer" && !slash && this.session?.steer && this.capabilities.steer) {
       const prompt = mergeQueued([input.item], this.host.settings.timezone);
       this.turn?.origins.push(input.origin);
+      this.noteJoined(input.origin);
       this.steerLog.push({ origin: input.origin, at: Date.now() });
       try {
         await this.session.steer({ text: prompt, attachments: input.attachments });
@@ -555,7 +599,7 @@ export class ChannelRuntime {
         this.state = "running";
         return;
       case "text":
-        if (ev.delta !== undefined && ev.final === undefined) { this.noteProgress(undefined, { delta: ev.delta }); this.onDelta(ev.segmentId, ev.delta); return; }
+        if (ev.delta !== undefined && ev.final === undefined) { this.noteProgress({ delta: ev.delta, segment: ev.segmentId }); this.onDelta(ev.segmentId, ev.delta); return; }
         if (ev.final !== undefined) await this.onFinalText(ev.final, ev.segmentId);
         return;
       case "thinking":
@@ -563,7 +607,7 @@ export class ChannelRuntime {
         return;
       case "tool_start":
         this.record("tool", formatToolStatus(ev.name, ev.input));
-        this.noteProgress(`tool: ${formatToolStatus(ev.name, ev.input)}`, { reset: true });
+        this.noteProgress({ line: `tool: ${ev.name}` }); // name only: inputs may belong to another asker's work
         if (this.host.settings.output.toolStatus) await this.postToolStatus(formatToolStatus(ev.name, ev.input));
         return;
       case "tool_end":
@@ -665,7 +709,7 @@ export class ChannelRuntime {
     if (!this.turn) this.turn = { origins: [{ kind: "system", reason: "background" }], startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: true };
     if (!raw.trim()) return;
     this.turn.texts.push(raw);
-    this.noteProgress(`text: ${raw}`, { reset: true });
+    this.noteProgress({ line: `text: ${raw}`, text: raw });
     this.record("assistant", raw);
     if (isSilentReplyText(raw)) { await this.finishLive(segmentId, undefined); return; }
     const { cleanText, reactions } = extractReactions(stripSilentToken(raw));

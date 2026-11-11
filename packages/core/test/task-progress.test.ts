@@ -54,7 +54,8 @@ test("a running task reports elapsed time, the text being streamed and recent ac
   expect(r).toMatchObject({ state: "working", result: null, progress: { phase: "running" } });
   expect(r.elapsedSec).toBeGreaterThanOrEqual(5);
   expect(r.progress!.turnElapsedSec).toBeGreaterThanOrEqual(5);
-  expect(r.progress!.recent).toEqual(["tool: 🛠️ Bash · bun test", "text: Running the tests now."]);
+  expect(r.progress!.recent).toEqual(["tool: Bash", "text: Running the tests now."]); // tool names only, no inputs
+  expect(JSON.stringify(r)).not.toContain("bun test");
 
   // The same through the MCP tool, for the asker.
   const c = new Client({ name: "t", version: "0" });
@@ -91,8 +92,19 @@ test("queue.mode steer: agent_ask to a session mid-turn joins the running turn a
   const first = await mgr.ask("tg:-1", "tg:-2", "long job", false);
   await until(() => mgr.taskReport(first.taskId)?.progress?.phase === "running");
   const second = await mgr.ask("tg:-3", "tg:-2", "quick question", false);
-  expect(provider.sessions.get("tg:-2")!.steered).toHaveLength(1);
-  expect(mgr.taskReport(second.taskId)!.progress).toMatchObject({ phase: "running", latestText: "Half of them pass so far" });
+  const s = provider.sessions.get("tg:-2")!;
+  expect(s.steered).toHaveLength(1);
+  // The second asker joined mid-turn: nothing from before (the first asker's tool, texts, half-streamed text).
+  const joined = mgr.taskReport(second.taskId)!.progress!;
+  expect(joined.phase).toBe("running");
+  expect(joined.latestText).toBeUndefined();
+  expect(joined.recent).toBeUndefined();
+  s.emit({ type: "tool_start", id: "t2", name: "Read", input: { file_path: "/secret/of/first/asker" } },
+    { type: "text", segmentId: "c", delta: "Answering the quick one" });
+  await until(() => mgr.taskReport(second.taskId)?.progress?.latestText === "Answering the quick one");
+  expect(mgr.taskReport(second.taskId)!.progress!.recent).toEqual(["tool: Read"]);
+  expect(mgr.taskReport(first.taskId)!.progress!.recent).toEqual(["tool: Bash", "text: Running the tests now.", "tool: Read"]);
+  expect(JSON.stringify(mgr.taskReport(second.taskId))).not.toContain("/secret");
   gate.release!();
   await until(() => mgr.taskReport(second.taskId)?.state === "completed");
   expect(mgr.taskReport(second.taskId)!.result).toBe(mgr.taskReport(first.taskId)!.result!);

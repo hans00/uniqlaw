@@ -357,8 +357,11 @@ How `agent_ask` replies:
 `elapsedSec` (until now while open, until it finished otherwise). While the task is still open and its session is local,
 it also returns `progress`:
 - `phase: "running"`: the session's current turn is answering it. `turnElapsedSec`, `latestText` (the assistant text
-  being streamed right now, else the last finished one; at most 1500 chars, tail kept) and `recent` (the last 10
-  activity lines, `text: …` / `tool: …`, one line each, at most 200 chars) come with it.
+  being streamed right now, else the last finished one; at most 1500 chars, tail kept) and `recent` (the turn's last 10
+  activity lines, `text: …` / `tool: <name>`, one line each, at most 200 chars; tool inputs are never shown) come with it.
+  All of it counts from when this task's ask joined the turn: an ask steered into a running turn sees nothing from
+  before it arrived (`turnElapsedSec` also starts then). After that the turn is one conversation, so its texts can
+  still be about another asker's work.
 - `phase: "queued"`, `queuePosition`: it waits for the session's current turn to end.
 
 Progress lives in memory with the turn: it is not persisted, and a reload loses it until the next turn starts.
