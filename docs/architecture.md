@@ -436,22 +436,36 @@ UniQlaw has its own long-term memory so it survives provider changes (Claude Cod
   JSON-RPC, REST, gRPC. The README's "gRPC Node-only" means "cannot run in Workers / browsers",
   not "does not work on Bun". Tested on Bun 1.3.4 with an `@grpc/grpc-js` server + `GrpcTransportFactory`
   client; both `SendMessage` and `SendStreamingMessage` work. Agent Card location: `/.well-known/agent-card.json` (confirmed in the SDK source).
-- **What is exposed**: exposed per **Agent Profile** (one Agent Card per profile), not per
-  chat channel. On a remote call, the `contextId` maps to an `a2a:<remote>:<contextId>` session
-  (isolated, never mixed into human conversations).
+- **What is exposed**: exposed per **Agent Profile** (one Agent Card per profile, at `/<profile>/.well-known/agent-card.json`;
+  the root `/.well-known/agent-card.json` serves the first exposed profile), not per chat channel. On a remote call, the session is
+  `a2a:<profile>:<caller>:<contextId>`, where `<caller>` is the authenticated token name (URI-encoded; `anonymous` when the server
+  runs without tokens). The caller chooses the `contextId`, so it is never enough on its own: another caller reusing it gets its own
+  session. These sessions are isolated and never mixed into human conversations.
 - **Same shape inside and out**: the bus already uses Envelope (A2A-shaped) internally. A local `agent_ask` is an A2A `SendMessage`
   short-circuited in-process; when the target is remote it goes over HTTP instead. For the agent, both are used exactly the same way.
 
 | bus | A2A v1.0 |
 |---|---|
-| `agent_ask` | `SendMessage` / `SendStreamingMessage` (task result → caller) |
-| `agent_trigger` | `SendMessage` + extension metadata `uniqlaw.deliver = "own-human"` (A2A has no such concept, so it is expressed as an extension; only valid between uniqlaw↔uniqlaw) |
-| `task_status` / `task_cancel` | `GetTask` / `CancelTask` |
-| Async push-back | `SubscribeToTask` or push notification config |
-| Turn state | SUBMITTED → WORKING → COMPLETED / FAILED / CANCELED; human input needed → INPUT_REQUIRED |
+| `agent_ask` | `SendMessage` (task result → caller; a non-terminal task is polled with `GetTask`) |
+| `agent_trigger` | Not supported for remote agents (it throws: a remote agent has no chat here). A `uniqlaw.deliver = "own-human"` extension is a possible future addition. |
+| `task_status` | Local task table (the remote task id is not exposed) |
+| Inbound `GetTask` / `CancelTask` / `SubscribeToTask` | Served for the caller that created the task only; any other caller gets "task not found" |
+| Turn state | SUBMITTED → WORKING → COMPLETED / FAILED / CANCELED (INPUT_REQUIRED and push notifications are not used) |
 
-- **Security**: the A2A server binds only to 127.0.0.1 by default. External exposure requires auth (bearer / mTLS, declared in the Agent Card's
-  securitySchemes), and external agents can only use profiles specified in settings. These profiles default to strict permissions.
+- **Security** (what the code enforces today):
+  - The A2A server binds to 127.0.0.1 by default and speaks plain HTTP / insecure gRPC (no TLS yet; put a TLS proxy in front for
+    anything beyond loopback).
+  - Auth is bearer tokens (`auth.bearerTokens`), declared in the Agent Card's `securitySchemes`. Exposing on a non-loopback host
+    without tokens is refused; on loopback without tokens every request is accepted as `anonymous`. Missing or wrong token → 401
+    with `WWW-Authenticate: Bearer`. A named token may be limited to some exposed profiles (`profiles`); any other profile → 403
+    (gRPC `PERMISSION_DENIED`). mTLS is not supported.
+  - External agents can only reach profiles listed in `expose`.
+  - Inbound `a2a:` sessions are deny-by-default (`packages/core/src/a2a-policy.ts`): the profile's permissions are capped at
+    `strict` (`locked` stays `locked`; `auto-allow` approval becomes `ask-operator`), Claude Code's shell, file-write, scheduling,
+    cross-session and notification tools plus reads of `.uniqlaw/` are denied, and the MCP gateway does not offer them `notify`,
+    `send_file`, `agents_list`, `agent_ask`, `agent_trigger`, `task_status`, `worker_*`, `cron_*` or `memory_*` (so MEMORY.md is not
+    injected either). Native tool denials are Claude Code names; other providers enforce what their adapters map from `denyTools`
+    and the level.
 
 ---
 
