@@ -22,7 +22,8 @@ Successor to [ClaudeClaw v2](https://github.com/hans00/claudeclaw2) (Claude-only
 
 - **Per-chat sessions**: every DM is its own session (per user, per platform, like OpenClaw), and groups/channels/threads get their own too, queue / steer / interrupt handling for messages that arrive mid-turn, `/stop`, `/new`, `/status`, `/model`.
 - **Switching profiles**: `/profile <name>` moves a chat to another profile (another agent or model) and `/profile reset` moves it back. The conversation follows: providers that share sessions (same provider, or Claude Code TUI ↔ SDK) keep the same session; otherwise the new profile gets the raw transcript, and a profile you return to resumes its own session plus what happened meanwhile. When a profile hits its usage limit, the owner is asked in chat whether to switch to one of its `fallback` profiles and the message is re-sent there; anyone else gets the error.
-- **Group modes**: in `mention` mode (default) the bot answers only when @mentioned or replied to, and keeps the other messages (the last `historyLimit`) as context for its next turn; in `always` mode it reads every message and decides whether to answer (`NO_REPLY`), optionally skipping messages that @mention someone else. Set it in `groups` (per channel in `groups.channels`) or switch a group with `/activation mention|always|reset`.
+- **Group modes**: in `mention` mode (default) the bot answers only when @mentioned or replied to, and keeps the other messages (the last `historyLimit`) as context for its next turn; in `always` mode it reads every message and decides whether to answer (`NO_REPLY`), optionally skipping messages that @mention someone else. Set it in `groups` (per channel in `groups.channels`) or switch a group with `/activation mention|always|reset`. `allowFrom` limits who can wake the agent in a group (matched on the platform user id, never a name); `others: "context" | "ignore"` keeps or drops messages that don't wake it.
+- **Per-channel capabilities**: `channels` gives each chat a set of tool groups (`chat`, `memory`, `web`, `files.read`, `files.write`, `bash`, `cron`, `worker`, `xsession`, `notify`, `config`; `"*"` = all, `deny` subtracts). The session only gets those tools: the MCP gateway hides the rest and Claude Code is launched with matching `--tools` / `--disallowedTools`. Chats with no entry use `defaults`; with no `defaults`, chats keep every tool (so upgrading changes nothing). Cron jobs, workers and the heartbeat keep their own settings. See [`docs/architecture.md`](docs/architecture.md) §10.3.
 - **Approvals on your phone**: permission prompts from any provider become buttons on the chat that triggered the work (or the operator).
 - **A provider-independent message bus** exposed to every agent as MCP tools: `agents_list`, `agent_ask`, `agent_trigger`, `notify`, `send_file`, `task_status`, `worker_start`, `worker_stop`, `memory_write` / `memory_search` / `memory_get`, plus `cron_list` / `cron_save` / `cron_delete`. Provider-native cross-session features are disabled so nothing bypasses routing.
 - **A2A v1.0**: expose profiles as A2A agents; remote A2A agents show up in `agents_list` and answer `agent_ask`.
@@ -108,7 +109,13 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
   "credentials": { "gcp": { "kind": "gcp", "project": "my-proj", "location": "us-central1" } },
   "bindings": { "default": "main", "channels": { "discord:1234": "coder" } },
   "queue": { "mode": "steer" },
-  "groups": { "mode": "mention", "historyLimit": 30, "channels": { "discord:1234": { "mode": "always", "ignoreOtherMentions": true } } },
+  "groups": { "mode": "mention", "historyLimit": 30, "channels": { "discord:1234": { "mode": "always", "ignoreOtherMentions": true },
+    "discord:5678": { "allowFrom": ["discord:111222333"], "others": "context" } } },
+  "channels": {
+    "defaults": { "tools": ["chat", "memory"] },
+    "telegram:123456789": { "tools": "*" },
+    "discord:5678": { "tools": ["chat", "memory", "web", "files.read"] }
+  },
   "workers": { "roots": ["~/Projects"], "profiles": ["main", "coder"] },
   "plugins": {
     "telegram": { "token": { "env": "TELEGRAM_BOT_TOKEN" }, "allowedUserIds": ["123456789"] },

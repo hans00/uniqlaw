@@ -54,8 +54,24 @@ const groupSchema = z.object({
   ignoreOtherMentions: z.boolean().default(false),
   /** How many unanswered messages are kept as context for the next turn (0 = none). */
   historyLimit: z.number().int().nonnegative().default(30),
+  /** Platform user ids allowed to wake the agent in this group ("telegram:<from.id>", "discord:<author.id>", or a bare
+   *  id). Matched on the platform's immutable user id, never a name. Empty = anyone the platform lets through. */
+  allowFrom: z.array(z.string()).default([]),
+  /** Messages that don't wake the agent: context = kept as background for the next woken turn; ignore = dropped. */
+  others: z.enum(["context", "ignore"]).default("context"),
 });
 export type GroupMode = z.infer<typeof groupSchema>["mode"];
+
+/** Tool groups a channel can be given (see TOOL_GROUPS in channel-policy.ts for the concrete tools). */
+export const TOOL_GROUP_NAMES = ["chat", "memory", "web", "files.read", "files.write", "bash", "cron", "worker", "xsession", "notify", "config"] as const;
+const toolGroup = z.enum(TOOL_GROUP_NAMES);
+const channelPolicySchema = z.object({
+  /** Allowed tool groups; "*" = all tools (including ones no group names). */
+  tools: z.union([z.literal("*"), z.array(toolGroup)]).optional(),
+  /** Groups subtracted from `tools`. */
+  deny: z.array(toolGroup).optional(),
+});
+export type ChannelPolicyConfig = z.infer<typeof channelPolicySchema>;
 
 export const settingsSchema = z.object({
   instance: z.object({
@@ -80,6 +96,11 @@ export const settingsSchema = z.object({
     cap: z.number().int().positive().default(20),
     dropPolicy: z.enum(["old", "new", "summarize"]).default("summarize"),
   }).prefault({}),
+  /** Per-channel capabilities: what a chat's session may do, keyed by channel key ("telegram:<chatId>",
+   *  "discord:<channelId>", …; a Slack thread key falls back to its channel). "defaults" applies to chats with no
+   *  entry. No "defaults" = every chat keeps all tools (the behavior before this setting existed). Only chat
+   *  sessions are affected: cron jobs, workers, heartbeat and A2A sessions keep their own settings. */
+  channels: z.record(z.string(), channelPolicySchema).prefault({}),
   /** Group chats (multiparty channels). DMs are never gated. */
   groups: groupSchema.extend({
     /** Per-channel overrides, keyed by channel key ("telegram:<chatId>", "discord:<channelId>", "slack:<channel>", …).

@@ -25,6 +25,22 @@ describe("permissions", () => {
     expect(s[s.indexOf("--allowedTools") + 1]).toBe("mcp__uniqlaw");
     expect(buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "locked" })).toContain("Read,Grep,Glob");
   });
+  test("channel tool policy: allow mode keeps only the granted built-ins and drops other MCP servers; deny mode disallows", () => {
+    const none = buildPermissionArgs(DEFAULT_PERMISSIONS, { extraAllowed: ["mcp__uniqlaw"] });
+    expect(none).not.toContain("--tools");
+    expect(none).not.toContain("--strict-mcp-config");
+    const a = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "allow", groups: ["chat", "memory", "web", "files.read"] } });
+    expect(a[a.indexOf("--tools") + 1]).toBe("TodoWrite,WebSearch,WebFetch,Read,Grep,Glob");
+    expect(a).toContain("--strict-mcp-config");
+    const empty = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "allow", groups: ["memory"] } });
+    expect(empty[empty.indexOf("--tools") + 1]).toBe(""); // no built-in tools at all
+    const locked = buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "locked" }, { toolPolicy: { mode: "allow", groups: ["files.read", "bash"] } });
+    expect(locked[locked.indexOf("--tools") + 1]).toBe("Read,Grep,Glob"); // the profile level still caps it
+    const d = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "deny", groups: ["bash", "web", "cron"] } });
+    expect(d).not.toContain("--tools");
+    expect(d).not.toContain("--strict-mcp-config");
+    expect(d[d.indexOf("--disallowedTools") + 1].split(" ")).toEqual(expect.arrayContaining(["Bash", "WebSearch", "WebFetch", "SendMessage"]));
+  });
 });
 
 describe("jsonl", () => {

@@ -1,7 +1,7 @@
 // PermissionPolicy → claude CLI flags. Port of v2 buildSecurityArgs with two
 // M0 rules: ALWAYS pin --permission-mode (user settings may say "auto"), and
 // ALWAYS disallow the native cross-session tools.
-import type { PermissionPolicy } from "@uniqlaw/core";
+import { claudeToolLists, type PermissionPolicy, type ToolPolicy } from "@uniqlaw/core";
 
 export const NATIVE_CROSS_SESSION_TOOLS = ["ListAgents", "SendMessage"];
 
@@ -23,19 +23,34 @@ export interface PermissionArgsOptions {
   extraAllowed?: string[];
   /** profile.options.permissionMode override. */
   modeOverride?: string;
+  /** Channel capabilities (SessionSpec.toolPolicy). */
+  toolPolicy?: ToolPolicy;
+}
+
+const LOCKED_TOOLS = ["Read", "Grep", "Glob"];
+
+/** Built-in tools to keep (undefined = Claude Code's default set) and to deny, from the profile's permission level
+ *  and the channel's tool policy. Allow-mode policies also cut every MCP server but UniQlaw's (strictMcp). */
+export function claudeToolSets(p: PermissionPolicy, policy?: ToolPolicy): { tools?: string[]; deny: string[]; strictMcp: boolean } {
+  const deny = new Set<string>([...NATIVE_CROSS_SESSION_TOOLS, ...p.denyTools]);
+  let tools: string[] | undefined = p.level === "locked" ? [...LOCKED_TOOLS] : undefined;
+  if (p.level === "strict") for (const t of ["Bash", "WebSearch", "WebFetch"]) deny.add(t);
+  if (policy) {
+    const l = claudeToolLists(policy);
+    for (const t of l.disallowed) deny.add(t);
+    if (l.tools) tools = tools ? tools.filter((t) => l.tools!.includes(t)) : l.tools;
+  }
+  return { ...(tools ? { tools } : {}), deny: [...deny], strictMcp: policy?.mode === "allow" };
 }
 
 export function buildPermissionArgs(p: PermissionPolicy, o: PermissionArgsOptions = {}): string[] {
   const args: string[] = ["--permission-mode", permissionModeFor(p, o.modeOverride)];
-  const deny = new Set<string>([...NATIVE_CROSS_SESSION_TOOLS, ...p.denyTools]);
+  const sets = claudeToolSets(p, o.toolPolicy);
   const allow = new Set<string>([...p.allowTools, ...(o.extraAllowed ?? [])]);
-  switch (p.level) {
-    case "locked": args.push("--tools", "Read,Grep,Glob"); break;
-    case "strict": for (const t of ["Bash", "WebSearch", "WebFetch"]) deny.add(t); break;
-    case "moderate": case "unrestricted": break;
-  }
+  if (sets.tools) args.push("--tools", sets.tools.join(","));
+  if (sets.strictMcp) args.push("--strict-mcp-config");
   if (allow.size) args.push("--allowedTools", [...allow].join(" "));
-  args.push("--disallowedTools", [...deny].join(" "));
+  args.push("--disallowedTools", sets.deny.join(" "));
   return args;
 }
 

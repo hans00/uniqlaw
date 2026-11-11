@@ -8,6 +8,7 @@ import type { Settings } from "./config.ts";
 import type { StateStore } from "./state.ts";
 import type { RuntimeEvent, TranscriptKind, TranscriptStore } from "./transcript.ts";
 import { ModelRouter, agenticSchema } from "./model-router.ts";
+import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
 import {
   extractReactions, formatPendingForPrompt, formatToolStatus, isPassthroughSlashCommand, isSilentReplyText,
   mergeQueued, stripSilentToken, type PendingNote, type PromptItem,
@@ -49,6 +50,8 @@ export interface RuntimeHost {
   workerOf?(channelKey: string): { owner?: string } | undefined;
   /** Override where background output goes: a target, null = nowhere, undefined = backgroundNotify policy. */
   backgroundTarget?(channelKey: string): Target | null | undefined;
+  /** Channel capabilities (settings.channels) for this session; undefined = unrestricted. */
+  toolPolicyFor?(channelKey: string): ToolPolicy | undefined;
   /** Issue an MCP Gateway token for this channel. */
   gatewayFor(channelKey: string): { url: string; token: string; toolNames: string[] } | undefined;
   /** Minimal isolated env for provider child processes. */
@@ -309,10 +312,15 @@ export class ChannelRuntime {
       });
     }
     const cur = this.host.store.getSession(this.channelKey)!;
+    const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const gw = this.host.gatewayFor(this.channelKey);
     const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
     const worker = this.host.workerOf?.(this.channelKey);
     try {
+      if (restrictsNativeTools(toolPolicy) && !this.capabilities.toolPolicy) {
+        throw new Error(`settings.channels limits this chat's tools, but provider "${this.profile.provider}" can't restrict its own tools; `
+          + "bind this chat to a profile whose provider can (claude-tmux, claude-sdk), or allow every native tool group here");
+      }
       const session = await this.provider.open({
         sessionId: this.channelKey,
         providerSessionId: cur.providerSessionId ?? undefined,
@@ -322,6 +330,7 @@ export class ChannelRuntime {
           channelKey: this.channelKey, internal: this.host.isInternal?.(this.channelKey) ?? false, cwd,
           ...(worker ? { worker } : {}),
         }),
+        ...(toolPolicy ? { toolPolicy } : {}),
         mcp: gw,
         env: await this.host.providerEnv(this.profile),
         instanceId: this.host.instanceId,

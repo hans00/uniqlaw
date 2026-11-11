@@ -5,7 +5,7 @@ import type {
   AgentEvent, AgentSession, Logger, PermissionDecision, ProviderCapabilities, SessionSpec, TurnInput,
 } from "@uniqlaw/core";
 import {
-  MCP_SERVER_NAME, NATIVE_CROSS_SESSION_TOOLS, baseChildEnv, claudeEnvForCredential, composeAppendSystemPrompt,
+  MCP_SERVER_NAME, claudeToolSets, baseChildEnv, claudeEnvForCredential, composeAppendSystemPrompt,
   mcpToolId, permissionModeFor, nativeMemorySettings,
 } from "@uniqlaw/claude-common";
 import { InputQueue } from "./input.ts";
@@ -24,6 +24,7 @@ export const CLAUDE_SDK_CAPABILITIES: ProviderCapabilities = {
   nativeTools: false,
   attachments: ["image", "file"],
   slashCommands: true,
+  toolPolicy: true,
 };
 
 export interface ClaudeSdkConfig {
@@ -70,8 +71,7 @@ export class ClaudeSdkSession implements AgentSession {
       CLAUDE_AGENT_SDK_CLIENT_APP: "uniqlaw",
     };
 
-    const deny = new Set<string>([...NATIVE_CROSS_SESSION_TOOLS, ...policy.denyTools]);
-    if (policy.level === "strict") for (const t of ["Bash", "WebSearch", "WebFetch"]) deny.add(t);
+    const sets = claudeToolSets(policy, spec.toolPolicy);
     const allow = new Set<string>(policy.allowTools);
     if (spec.mcp) for (const t of spec.mcp.toolNames) allow.add(mcpToolId(t));
 
@@ -92,9 +92,10 @@ export class ClaudeSdkSession implements AgentSession {
         permissionMode: mode,
         ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
         canUseTool,
-        ...(policy.level === "locked" ? { tools: ["Read", "Grep", "Glob"] } : {}),
+        ...(sets.tools ? { tools: sets.tools } : {}),
+        ...(sets.strictMcp ? { strictMcpConfig: true } : {}),
         ...(allow.size ? { allowedTools: [...allow] } : {}),
-        disallowedTools: [...deny],
+        disallowedTools: sets.deny,
         systemPrompt: {
           type: "preset", preset: "claude_code",
           append: composeAppendSystemPrompt({ parts: spec.systemPrompt, permissions: policy, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames }),
