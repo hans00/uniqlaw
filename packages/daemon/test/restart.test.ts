@@ -12,6 +12,8 @@ const xdg = mkdtempSync(join(tmpdir(), "uq-restart-xdg-"));
 const dirs: string[] = [];
 const pids = new Set<number>();
 afterAll(() => {
+  // Re-exec'd daemons are not our children: also kill whatever each project's runtime.json names.
+  for (const d of dirs) { const pid = runtime(d)?.pid; if (pid) pids.add(pid); }
   for (const pid of pids) { try { process.kill(pid, "SIGKILL"); } catch {} }
   for (const d of [...dirs, xdg]) rmSync(d, { recursive: true, force: true });
 });
