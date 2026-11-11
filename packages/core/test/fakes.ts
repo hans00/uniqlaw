@@ -37,7 +37,9 @@ export class FakeSession implements AgentSession {
 }
 
 export const CAPS: ProviderCapabilities = { streaming: "segment", interrupt: true, steer: true, resume: "native", denyEndsTurn: false,
-  modelSwitch: "live", permissionCallback: true, mcp: "per-session", nativeTools: false, attachments: [], slashCommands: true };
+  modelSwitch: "live", permissionCallback: true, mcp: "per-session", nativeTools: false, attachments: [], slashCommands: true,
+  // Fakes honor SessionSpec.isolated trivially (they read no settings or files); tests of the fail-closed path pass caps without it.
+  isolation: true };
 
 export class FakeProvider implements AgentProvider {
   name = "fake";

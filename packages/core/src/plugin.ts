@@ -71,11 +71,28 @@ export interface RemoteAgent {
   ask(o: { from: string; message: string; hop: number; signal?: AbortSignal }): Promise<{ ok: boolean; text: string }>;
 }
 
+export interface InboundRequest {
+  profile: string;
+  /** Authenticated identity (token name, or "anonymous"); part of the session key. */
+  caller: string;
+  /** Display label for the caller. */
+  remote: string;
+  contextId: string;
+  taskId: string;
+  text: string;
+  hop: number;
+  /** The exposed profile's own system prompt (persona files are never given to remote callers). */
+  prompt?: string;
+  /** The operator allowed this profile although its provider lacks the `isolation` capability. */
+  unsafeProvider?: boolean;
+}
+
 export interface TransportApi {
-  /** Run an inbound request from a remote agent against a local profile. Resolves with the answer. */
-  runInbound(o: { profile: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }>;
-  /** Profiles that may be exposed (name + provider). */
-  profiles(): { name: string; provider: string }[];
+  /** Run an inbound request from a remote agent against a local profile. Resolves with the answer.
+   *  `caller` is the authenticated identity (token name, or "anonymous"); `remote` is a display label. */
+  runInbound(o: InboundRequest): Promise<{ ok: boolean; text: string }>;
+  /** Profiles that may be exposed (name + provider; `isolation` = its provider can isolate remote-driven sessions). */
+  profiles(): { name: string; provider: string; isolation?: boolean }[];
   maxHops: number;
 }
 

@@ -472,22 +472,52 @@ UniQlaw has its own long-term memory so it survives provider changes (Claude Cod
   JSON-RPC, REST, gRPC. The README's "gRPC Node-only" means "cannot run in Workers / browsers",
   not "does not work on Bun". Tested on Bun 1.3.4 with an `@grpc/grpc-js` server + `GrpcTransportFactory`
   client; both `SendMessage` and `SendStreamingMessage` work. Agent Card location: `/.well-known/agent-card.json` (confirmed in the SDK source).
-- **What is exposed**: exposed per **Agent Profile** (one Agent Card per profile), not per
-  chat channel. On a remote call, the `contextId` maps to an `a2a:<remote>:<contextId>` session
-  (isolated, never mixed into human conversations).
+- **What is exposed**: exposed per **Agent Profile** (one Agent Card per profile, at `/<profile>/.well-known/agent-card.json`;
+  the root `/.well-known/agent-card.json` serves the first exposed profile), not per chat channel. On a remote call, the session is
+  `a2a:<profile>:<caller>:<contextId>`, where `<caller>` is the authenticated token name (URI-encoded; `anonymous` when the server
+  runs without tokens). The caller chooses the `contextId`, so it is never enough on its own: another caller reusing it gets its own
+  session. These sessions are isolated and never mixed into human conversations.
 - **Same shape inside and out**: the bus already uses Envelope (A2A-shaped) internally. A local `agent_ask` is an A2A `SendMessage`
   short-circuited in-process; when the target is remote it goes over HTTP instead. For the agent, both are used exactly the same way.
 
 | bus | A2A v1.0 |
 |---|---|
-| `agent_ask` | `SendMessage` / `SendStreamingMessage` (task result → caller) |
-| `agent_trigger` | `SendMessage` + extension metadata `uniqlaw.deliver = "own-human"` (A2A has no such concept, so it is expressed as an extension; only valid between uniqlaw↔uniqlaw) |
-| `task_status` / `task_cancel` | `GetTask` / `CancelTask` |
-| Async push-back | `SubscribeToTask` or push notification config |
-| Turn state | SUBMITTED → WORKING → COMPLETED / FAILED / CANCELED; human input needed → INPUT_REQUIRED |
+| `agent_ask` | `SendMessage` (task result → caller; a non-terminal task is polled with `GetTask`) |
+| `agent_trigger` | Not supported for remote agents (it throws: a remote agent has no chat here). A `uniqlaw.deliver = "own-human"` extension is a possible future addition. |
+| `task_status` | Local task table (the remote task id is not exposed) |
+| Inbound `GetTask` / `CancelTask` / `SubscribeToTask` | Served for the caller that created the task only; any other caller gets "task not found" |
+| Turn state | SUBMITTED → WORKING → COMPLETED / FAILED / CANCELED (INPUT_REQUIRED and push notifications are not used) |
 
-- **Security**: the A2A server binds only to 127.0.0.1 by default. External exposure requires auth (bearer / mTLS, declared in the Agent Card's
-  securitySchemes), and external agents can only use profiles specified in settings. These profiles default to strict permissions.
+- **Security** (what the code enforces today):
+  - The A2A server binds to 127.0.0.1 by default and speaks plain HTTP / insecure gRPC (no TLS yet; put a TLS proxy in front for
+    anything beyond loopback).
+  - Auth is bearer tokens (`auth.bearerTokens`), declared in the Agent Card's `securitySchemes`. Exposing on a non-loopback host
+    without tokens is refused. Missing or wrong token → 401 with `WWW-Authenticate: Bearer`. A named token may be limited to some
+    exposed profiles (`profiles`); any other profile → 403 (gRPC `PERMISSION_DENIED`). Token names are the caller identity: they
+    must be unique and must not look like the generated `token#<n>`. mTLS is not supported.
+  - **Anonymous mode** (loopback, no tokens): every local process — any user's — can call the exposed profiles, and all of them
+    are the same caller `anonymous`, so they share sessions (per `contextId`) and can read each other's tasks. The daemon logs a
+    warning at startup. Configure tokens if more than one client may connect.
+  - External agents can only reach profiles listed in `expose`.
+  - Inbound `a2a:` sessions are deny-by-default (`packages/core/src/a2a-policy.ts`): the profile's permissions are capped at
+    `strict` (`locked` stays `locked`; `auto-allow` approval becomes `ask-operator`), and they get a fixed tool policy
+    (`A2A_TOOL_POLICY`, §10.3) that denies every tool group but `web`: `chat`, `memory`, `files.read`,
+    `files.write`, `bash`, `agents` (Task/Agent/Workflow/Skill), `cron`, `worker`, `xsession`, `notify` and `config`, whatever
+    `settings.channels` says. The group tables are channel-policy's `TOOL_GROUPS`; the denied built-ins also go into the
+    profile's `denyTools`. So the MCP gateway does not offer them `send_file`, `notify`, `agents_list`, `agent_ask`,
+    `agent_trigger`, `task_status`, `worker_*`, `cron_*`, `memory_*` or any `config` tool (so MEMORY.md is not injected either).
+  - They are **isolated** (`SessionSpec.isolated`): the working directory is an empty directory of their own outside the project
+    and outside any git repository (`$TMPDIR/uniqlaw-a2a-<instance>/<hash of the session key>`, mode 0700, refused if someone
+    else owns it or can write to it), so no project files, CLAUDE.md, git status or git user reach the context. Claude providers
+    launch them with `--tools ""` (no built-in tools), `--setting-sources ""` (no user/project/local settings, CLAUDE.md, hooks,
+    skills or plugins), `--strict-mcp-config` (UniQlaw's MCP server only), native memory off and without `extraArgs` — verified
+    with claude 2.1.322 (`packages/claude-common/test/a2a-isolation.e2e.test.ts`).
+  - Their system prompt is the exposed profile's own `expose.<profile>.prompt` / `promptFiles` plus a path-free scope instruction;
+    the brand prompt, `settings.prompts.files` (IDENTITY/USER/SOUL), memory and absolute paths are never included.
+  - **Fail closed**: only providers with the `isolation` capability (claude-tmux, claude-sdk) can serve remote callers. Exposing a
+    profile on any other provider (codex, opencode, acp, agy, pi) is a startup error, and the core refuses to open such a session,
+    unless the operator sets `expose.<profile>.unsafeProvider: true` (logged as UNSAFE at startup): those providers would run the
+    remote request with the operator's settings, MCP servers and file access.
 
 ---
 
@@ -565,8 +595,9 @@ so `path: "."` with `glob: ".uniqlaw/**"` finds nothing there (checked on claude
 - The MCP gateway never registers a tool the caller's channel lacks (not listed, not callable), checked per request.
 - Enforcement of built-in tools is the provider's job (`ProviderCapabilities.toolPolicy`, implemented by claude-tmux and
   claude-sdk). If a channel restricts built-in tools and its provider can't, the session refuses to open (fail closed).
-- Only chat sessions take a policy. Internal sessions (heartbeat, `cron:<job>`), workers and A2A sessions keep their own
-  settings, also when they post into a chat. A job whose target *is* a chat session runs inside that session, with its tools.
+- Only chat sessions take a policy from `settings.channels`. Inbound A2A sessions always get the fixed `A2A_TOOL_POLICY`
+  (see A2A above; their built-in tools are covered by the `isolation` capability). Internal sessions (heartbeat,
+  `cron:<job>`) and workers keep their own settings, also when they post into a chat. A job whose target *is* a chat session runs inside that session, with its tools.
 - A policy change is a launch-flag change, so a claude-tmux process reattached after a reload is respawned (`--resume`)
   with the new tool set (same fingerprint mechanism as a permission-mode change). Until then it keeps its old built-in
   tools: a turn that was running across the reload finishes with them, and the respawn happens once the pane is idle.

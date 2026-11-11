@@ -54,7 +54,8 @@ export class McpGateway {
   /** Plugin-contributed tools (registered before sessions open, so prompts list them). */
   addTools(tools: GatewayTool[]) { this.extra.push(...tools); }
 
-  /** Tools a session may see and call: all of them, minus what its channel policy (settings.channels) leaves out. */
+  /** Tools a session may see and call: all of them, minus what its tool policy leaves out (settings.channels for a
+   *  chat, the fixed A2A_TOOL_POLICY for an inbound A2A session; see ChannelManager.toolPolicy). */
   toolNames(channelKey?: string) {
     const all = [...GATEWAY_TOOL_NAMES, ...this.extra.map((t) => t.name)];
     if (channelKey === undefined) return all;
@@ -89,8 +90,9 @@ export class McpGateway {
   private build(caller: string): McpServer {
     const real = new McpServer({ name: "uniqlaw", version: "0.1.0" });
     const mgr = this.manager();
-    // Channel capabilities: a tool the caller's channel was not given is never registered, so it is neither
-    // listed nor callable (checked per request, so a settings change applies at once).
+    // Tool policy (channel capabilities, or the A2A deny-by-default policy): a tool the caller was not given is
+    // never registered, so it is neither listed nor callable ("tool not found"; checked per request, so a settings
+    // change applies at once).
     const policy = mgr.toolPolicy(caller);
     const s = { registerTool: ((name: string, ...rest: unknown[]) => {
       if (mcpToolAllowed(policy, name)) (real.registerTool as (...a: unknown[]) => unknown)(name, ...rest);

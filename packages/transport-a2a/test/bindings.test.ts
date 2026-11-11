@@ -11,7 +11,7 @@ async function server(cfg: Record<string, unknown>) {
   process.env.A2A_BIND_TOKEN = "t0ken";
   const calls: Inbound[] = [];
   const api: TransportApi = { runInbound: async (o) => { calls.push(o); return { ok: true, text: `answer[${o.profile}]: ${o.text}` }; },
-    profiles: () => [{ name: "main", provider: "fake" }, { name: "other", provider: "fake" }], maxHops: 4 };
+    profiles: () => [{ name: "main", provider: "fake", isolation: true }, { name: "other", provider: "fake", isolation: true }], maxHops: 4 };
   const t = new A2ATransport(a2aConfigSchema.parse(cfg), silentLogger);
   await t.start(api);
   stops.push(() => t.stop());

@@ -25,6 +25,9 @@ export interface PermissionArgsOptions {
   modeOverride?: string;
   /** Channel capabilities (SessionSpec.toolPolicy). */
   toolPolicy?: ToolPolicy;
+  /** SessionSpec.isolated (see ISOLATED_CLI_ARGS): replaces the --tools / --strict-mcp-config the profile level and
+   *  tool policy would set. */
+  isolated?: boolean;
 }
 
 const LOCKED_TOOLS = ["Read", "Grep", "Glob"];
@@ -44,12 +47,24 @@ export function claudeToolSets(p: PermissionPolicy, policy?: ToolPolicy): { tool
   return { ...(tools ? { tools } : {}), deny: [...deny], strictMcp: !!policy };
 }
 
+/** SessionSpec.isolated → claude CLI flags: no built-in tools at all, no settings files (so no CLAUDE.md, hooks,
+ *  skills, plugins or `permissions.allow` from the operator's user/project/local settings), and no MCP server but
+ *  the one given with --mcp-config (UniQlaw's). Native memory is turned off separately (nativeMemoryArgs(false)).
+ *  Checked against claude 2.1.322: `--setting-sources ""` loads no CLAUDE.md and no user plugins/MCP servers. */
+export const ISOLATED_CLI_ARGS = ["--tools", "", "--setting-sources", "", "--strict-mcp-config"];
+
+/** The same for the Agent SDK (claude-sdk) query options. */
+export const ISOLATED_SDK_OPTIONS = { tools: [] as string[], settingSources: [] as [], strictMcpConfig: true } as const;
+
 export function buildPermissionArgs(p: PermissionPolicy, o: PermissionArgsOptions = {}): string[] {
   const args: string[] = ["--permission-mode", permissionModeFor(p, o.modeOverride)];
   const sets = claudeToolSets(p, o.toolPolicy);
   const allow = new Set<string>([...p.allowTools, ...(o.extraAllowed ?? [])]);
-  if (sets.tools) args.push("--tools", sets.tools.join(","));
-  if (sets.strictMcp) args.push("--strict-mcp-config");
+  if (o.isolated) args.push(...ISOLATED_CLI_ARGS); // no built-in tools whatever the level or policy would keep
+  else {
+    if (sets.tools) args.push("--tools", sets.tools.join(","));
+    if (sets.strictMcp) args.push("--strict-mcp-config");
+  }
   if (allow.size) args.push("--allowedTools", [...allow].join(" "));
   args.push("--disallowedTools", sets.deny.join(" "));
   return args;

@@ -17,3 +17,4 @@ export * from "./memory.ts";
 export * from "./dreaming.ts";
 export * from "./pairing.ts";
 export * from "./channel-policy.ts";
+export * from "./a2a-policy.ts";

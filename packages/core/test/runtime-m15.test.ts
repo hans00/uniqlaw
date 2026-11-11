@@ -112,12 +112,39 @@ test("remote agents appear in agents_list and agent_ask reaches them with the ho
 
 test("inbound A2A request runs on the addressed profile and returns the answer (no platform output)", async () => {
   const { mgr, platform } = setup((input, s) => s.emit({ type: "text", segmentId: "a", final: `local answer to: ${input.text.split("\n").at(-1)}` }, { type: "turn_end", turnId: s.turnId(), reason: "done" }));
-  const r = await mgr.runInbound({ profile: "main", remote: "peer-claw", contextId: "ctx1", taskId: "t-1", text: "hello from afar", hop: 1 });
+  const r = await mgr.runInbound({ profile: "main", caller: "peer-claw", remote: "peer-claw", contextId: "ctx1", taskId: "t-1", text: "hello from afar", hop: 1 });
   expect(r).toEqual({ ok: true, text: "local answer to: hello from afar" });
   expect(platform.sent).toHaveLength(0);
-  expect(store.getSession("a2a:main:ctx1")).toBeDefined();
-  expect(await mgr.runInbound({ profile: "nope", remote: "x", contextId: "c", taskId: "t-2", text: "?", hop: 1 })).toMatchObject({ ok: false });
-  expect(await mgr.runInbound({ profile: "main", remote: "x", contextId: "c", taskId: "t-3", text: "?", hop: 99 })).toMatchObject({ ok: false });
+  expect(store.getSession("a2a:main:peer-claw:ctx1")).toBeDefined();
+  expect(await mgr.runInbound({ profile: "nope", caller: "x", remote: "x", contextId: "c", taskId: "t-2", text: "?", hop: 1 })).toMatchObject({ ok: false });
+  expect(await mgr.runInbound({ profile: "main", caller: "x", remote: "x", contextId: "c", taskId: "t-3", text: "?", hop: 99 })).toMatchObject({ ok: false });
+});
+
+test("inbound A2A: a second caller reusing a contextId gets its own session, not the first caller's", async () => {
+  const { mgr, provider } = setup((input, s) => s.emit({ type: "text", segmentId: "a", final: `ok: ${input.text.split("\n").at(-1)}` }, { type: "turn_end", turnId: s.turnId(), reason: "done" }));
+  await mgr.runInbound({ profile: "main", caller: "alice", remote: "alice", contextId: "shared", taskId: "t-a", text: "alice's secret", hop: 1 });
+  await mgr.runInbound({ profile: "main", caller: "bob", remote: "bob", contextId: "shared", taskId: "t-b", text: "what did alice say?", hop: 1 });
+  expect(provider.specs.map((s) => s.sessionId)).toEqual(["a2a:main:alice:shared", "a2a:main:bob:shared"]);
+  expect(store.getSession("a2a:main:alice:shared")).toBeDefined();
+  expect(store.getSession("a2a:main:bob:shared")).toBeDefined();
+  // A caller name can't forge another field of the key.
+  await mgr.runInbound({ profile: "main", caller: "eve:shared", remote: "eve", contextId: "x", taskId: "t-e", text: "?", hop: 1 });
+  expect(provider.specs.at(-1)!.sessionId).toBe("a2a:main:eve%3Ashared:x");
+});
+
+test("inbound A2A sessions run deny-by-default: at most strict, no shell/write tools, no auto-allow", async () => {
+  const { mgr, provider } = setup((_i, s) => s.emit({ type: "turn_end", turnId: s.turnId(), reason: "done" }),
+    { profiles: { main: { provider: "fake", permissions: { level: "unrestricted", allowTools: ["Bash(git:*)", "Read"], approval: { mode: "auto-allow" } } } } });
+  await mgr.runInbound({ profile: "main", caller: "alice", remote: "alice", contextId: "c", taskId: "t-1", text: "rm -rf /", hop: 1 });
+  const perms = (provider.specs[0] as unknown as { profile: { permissions: import("../src/index.ts").PermissionPolicy } }).profile.permissions;
+  expect(perms.level).toBe("strict");
+  expect(perms.approval.mode).toBe("ask-operator");
+  expect(perms.allowTools).toEqual([]); // Bash and Read are both denied groups
+  for (const t of ["Bash", "Write", "Edit", "CronCreate", "SendMessage", "PushNotification", "Read(./.uniqlaw/**)"]) expect(perms.denyTools).toContain(t);
+  // A chat on the same profile keeps the profile's own permissions.
+  expect(mgr.profileFor("global").permissions.level).toBe("unrestricted");
+  // locked stays locked.
+  expect(core.a2aPermissions({ ...perms, level: "locked" }).level).toBe("locked");
 });
 
 test("model router: phrase switches immediately, keywords respect hysteresis, scheduled turns are not routed", async () => {

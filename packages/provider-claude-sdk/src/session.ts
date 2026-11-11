@@ -6,7 +6,7 @@ import type {
 } from "@uniqlaw/core";
 import {
   MCP_SERVER_NAME, claudeToolSets, baseChildEnv, claudeEnvForCredential, composeAppendSystemPrompt,
-  mcpToolId, permissionModeFor, nativeMemorySettings,
+  mcpToolId, permissionModeFor, nativeMemorySettings, ISOLATED_SDK_OPTIONS,
 } from "@uniqlaw/claude-common";
 import { InputQueue } from "./input.ts";
 import { SdkMapper } from "./mapper.ts";
@@ -25,6 +25,7 @@ export const CLAUDE_SDK_CAPABILITIES: ProviderCapabilities = {
   attachments: ["image", "file"],
   slashCommands: true,
   toolPolicy: true,
+  isolation: true,
 };
 
 export interface ClaudeSdkConfig {
@@ -88,7 +89,7 @@ export class ClaudeSdkSession implements AgentSession {
         ...(spec.providerSessionId ? { resume: spec.providerSessionId } : { sessionId: this.providerSessionId }),
         includePartialMessages: true,
         settingSources: opts.userSettings === false ? ["project", "local"] : ["user", "project", "local"],
-        ...nativeMemorySettings(spec.nativeMemory),
+        ...nativeMemorySettings(spec.isolated ? false : spec.nativeMemory),
         permissionMode: mode,
         ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
         canUseTool,
@@ -98,12 +99,14 @@ export class ClaudeSdkSession implements AgentSession {
         disallowedTools: sets.deny,
         systemPrompt: {
           type: "preset", preset: "claude_code",
-          append: composeAppendSystemPrompt({ parts: spec.systemPrompt, permissions: policy, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames }),
+          append: composeAppendSystemPrompt({ parts: spec.systemPrompt, permissions: policy, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames, isolated: !!spec.isolated }),
         },
         ...(spec.mcp ? { mcpServers: { [MCP_SERVER_NAME]: { type: "http", url: spec.mcp.url, alwaysLoad: true } } } : {}),
         env,
         ...(this.cfg.claudePath ? { pathToClaudeCodeExecutable: this.cfg.claudePath } : {}),
-        ...(this.cfg.extraArgs ? { extraArgs: this.cfg.extraArgs } : {}),
+        ...(this.cfg.extraArgs && !spec.isolated ? { extraArgs: this.cfg.extraArgs } : {}),
+        // Remote-driven session: no built-in tools, no settings files, no MCP server but UniQlaw's (last: wins).
+        ...(spec.isolated ? ISOLATED_SDK_OPTIONS : {}),
         stderr: (d: string) => this.log.debug("claude stderr", { d: d.slice(0, 500) }),
       },
     });

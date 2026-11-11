@@ -29,6 +29,7 @@ export const CLAUDE_TMUX_CAPABILITIES: ProviderCapabilities = {
   attachments: ["image", "file"],
   slashCommands: true,
   toolPolicy: true,
+  isolation: true,
 };
 
 export interface Timings {

@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_PERMISSIONS, type ToolPolicy } from "@uniqlaw/core";
+import { A2A_TOOL_POLICY, DEFAULT_PERMISSIONS, type ToolPolicy } from "@uniqlaw/core";
 import {
-  buildPermissionArgs, claudeToolSets, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
+  buildPermissionArgs, claudeToolSets, ISOLATED_SDK_OPTIONS, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
   isInterruptMarker, isRejectionText, nativeMemoryArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
 } from "../src/index.ts";
 
@@ -68,6 +68,23 @@ describe("permissions", () => {
     // Deny mode never drops it: plugin MCP tools no group names are still served by the gateway.
     expect(denied(allMcp)).not.toContain("ToolSearch");
   });
+  test("isolated (inbound A2A): no built-in tools, no settings files, only UniQlaw's MCP server", () => {
+    const a = buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "locked" }, { isolated: true, extraAllowed: ["mcp__uniqlaw"] });
+    const flag = (f: string) => a[a.indexOf(f) + 1];
+    expect(a.filter((x) => x === "--tools")).toHaveLength(1); // locked's Read,Grep,Glob is not added back
+    expect(flag("--tools")).toBe("");
+    expect(flag("--setting-sources")).toBe("");
+    expect(a).toContain("--strict-mcp-config");
+    expect(flag("--allowedTools")).toBe("mcp__uniqlaw");
+    for (const f of ["--tools", "--setting-sources", "--strict-mcp-config"]) expect(buildPermissionArgs(DEFAULT_PERMISSIONS)).not.toContain(f);
+    // With the A2A tool policy (deny mode) on top: still one empty --tools and one --strict-mcp-config.
+    const p = buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "locked" }, { isolated: true, toolPolicy: A2A_TOOL_POLICY });
+    expect(p.filter((x) => x === "--tools")).toHaveLength(1);
+    expect(p[p.indexOf("--tools") + 1]).toBe("");
+    expect(p.filter((x) => x === "--strict-mcp-config")).toHaveLength(1);
+    expect(p[p.indexOf("--disallowedTools") + 1].split(" ")).toEqual(expect.arrayContaining(["Bash", "Read", "Skill", "Read(./.uniqlaw/**)"]));
+    expect(ISOLATED_SDK_OPTIONS).toEqual({ tools: [], settingSources: [], strictMcpConfig: true });
+  });
 });
 
 describe("jsonl", () => {
@@ -115,6 +132,12 @@ describe("classify + prompt + mcp + credentials", () => {
     expect(s).toContain("mcp__uniqlaw__agent_ask");
     expect(s).toContain("/w");
     expect(mcpConfigObject("http://x").mcpServers.uniqlaw.alwaysLoad).toBe(true);
+  });
+  test("isolated prompt names no path (the remote caller must not learn the project location)", () => {
+    const s = composeAppendSystemPrompt({ parts: { fragments: [{ id: "a", text: "PUBLIC" }] }, permissions: { ...DEFAULT_PERMISSIONS, level: "strict" }, cwd: "/home/op/secret-project", isolated: true });
+    expect(s).toContain("PUBLIC");
+    expect(s).not.toContain("/home/op");
+    expect(composeAppendSystemPrompt({ parts: { fragments: [] }, permissions: { ...DEFAULT_PERMISSIONS, level: "strict" }, cwd: "/home/op/x" })).toContain("/home/op/x");
   });
   test("native memory off → Claude auto-memory and auto-dream disabled (CLI flag and SDK option)", () => {
     expect(nativeMemoryArgs(false)).toEqual(["--settings", '{"autoMemoryEnabled":false,"autoDreamEnabled":false}']);
