@@ -108,12 +108,12 @@ export function restrictsNativeTools(policy: ToolPolicy | undefined): boolean {
  *  restricted chat also loses read access to UniQlaw's state directory. */
 export function claudeToolLists(policy: ToolPolicy): { tools?: string[]; disallowed: string[] } {
   const names = new Set(policy.groups.flatMap((g) => TOOL_GROUPS[g].claude));
-  // ToolSearch loads deferred MCP tools: keep it while any UniQlaw MCP group is granted, even without `chat`.
-  const mcpGranted = (Object.keys(TOOL_GROUPS) as ToolGroup[]).some((g) => TOOL_GROUPS[g].mcp.length > 0 && groupAllowed(policy, g));
-  if (mcpGranted) {
-    if (policy.mode === "allow") names.add("ToolSearch");
-    else names.delete("ToolSearch");
-  }
+  // ToolSearch loads deferred MCP tools, and it can only load what the gateway lists (already filtered by the policy).
+  // Deny mode: never take it away. Plugin tools no group names stay callable there, and with --strict-mcp-config
+  // the UniQlaw gateway is the only MCP server left, so even denying every MCP group may leave tools to load.
+  // Allow mode: unnamed plugin tools are off, so keep it only while a group with UniQlaw MCP tools is granted.
+  if (policy.mode === "deny") names.delete("ToolSearch");
+  else if (policy.groups.some((g) => TOOL_GROUPS[g].mcp.length > 0)) names.add("ToolSearch");
   return policy.mode === "allow" ? { tools: [...names], disallowed: [...PROTECTED_READ_RULES] } : { disallowed: [...names, ...PROTECTED_READ_RULES] };
 }
 

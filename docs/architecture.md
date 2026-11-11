@@ -497,7 +497,10 @@ core resolves it into `SessionSpec.toolPolicy` when the chat's session opens. On
 | `notify` | `notify` (and `send_file` to other chats) | `PushNotification`, `Artifact*`, `DesignSync` |
 | `config` | reserved (no tools yet) | — |
 
-¹ `ToolSearch` loads deferred MCP tools, so it stays whenever any group with UniQlaw MCP tools is granted, even if `chat` is not.
+¹ `ToolSearch` loads deferred MCP tools, so it is not tied to `chat`. Deny mode never removes it: UniQlaw plugin tools
+that no group names stay callable there. Allow mode keeps it while any group with UniQlaw MCP tools is granted.
+`--strict-mcp-config` (any policy) leaves the UniQlaw gateway as the only MCP server: on claude 2.1.322 it also drops
+Claude Code plugin servers and claude.ai connectors, not just the user's `mcpServers`.
 
 **⚠ Admin-level groups (v1).** `bash`, `files.write`, `cron`, `worker` and `xsession` grant effectively full access,
 because each one lets a restricted chat reach something unrestricted:

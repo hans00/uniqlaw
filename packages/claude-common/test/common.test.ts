@@ -65,7 +65,8 @@ describe("permissions", () => {
     expect(denied(["chat"])).not.toContain("ToolSearch");
     expect(denied(["chat"])).toContain("TaskCreate");
     const allMcp = ["chat", "memory", "cron", "worker", "xsession", "notify"];
-    expect(denied(allMcp)).toContain("ToolSearch"); // nothing left to load
+    // Deny mode never drops it: plugin MCP tools no group names are still served by the gateway.
+    expect(denied(allMcp)).not.toContain("ToolSearch");
   });
 });
 

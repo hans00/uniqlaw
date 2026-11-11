@@ -77,7 +77,8 @@ export type GroupMode = z.infer<typeof groupSchema>["mode"];
 export const TOOL_GROUP_NAMES = ["chat", "memory", "web", "files.read", "files.write", "bash", "agents", "cron", "worker", "xsession", "notify", "config"] as const;
 const toolGroup = z.enum(TOOL_GROUP_NAMES);
 const channelPolicySchema = z.object({
-  /** Allowed tool groups; "*" = all tools (including ones no group names). */
+  /** Allowed tool groups; "*" = every group, plus UniQlaw plugin tools no group names. MCP servers from the user's own
+   *  Claude Code config are cut by any policy (--strict-mcp-config), "*" included once `deny` makes it a policy. */
   tools: z.union([z.literal("*"), z.array(toolGroup)]).optional(),
   /** Groups subtracted from `tools`. */
   deny: z.array(toolGroup).optional(),
