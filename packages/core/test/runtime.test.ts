@@ -21,11 +21,11 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function setup(script: Script, opts: { settings?: Record<string, unknown>; caps?: ProviderCapabilities; approval?: Profile["permissions"]["approval"]["mode"] } = {}) {
+function setup(script: Script, opts: { settings?: Record<string, unknown>; caps?: ProviderCapabilities; approval?: Profile["permissions"]["approval"]["mode"]; timeoutSec?: number } = {}) {
   const settings = parseSettings({ timezone: "UTC+8", profiles: { main: { provider: "fake" } }, output: { toolStatus: false }, queue: { debounceMs: 0 }, ...opts.settings });
   const provider = new FakeProvider(script, opts.caps);
   const platform = new FakePlatform();
-  const profile: Profile = { name: "main", provider: "fake", permissions: { ...settings.profiles.main!.permissions, approval: { mode: opts.approval ?? "ask-operator", timeoutSec: 5 } }, options: {} };
+  const profile: Profile = { name: "main", provider: "fake", permissions: { ...settings.profiles.main!.permissions, approval: { mode: opts.approval ?? "ask-operator", timeoutSec: opts.timeoutSec ?? 5 } }, options: {} };
   const mgr = new ChannelManager({
     log: silentLogger, settings, store, projectDir: dir, instanceId: "test",
     providers: new Map([["fake", provider]]), platforms: new Map([["tg", platform]]), profiles: new Map([["main", profile]]),
@@ -122,6 +122,18 @@ describe("ChannelRuntime", () => {
     await until(() => s.permissions.length === 1);
     expect(platform.choices[0]!.options).toEqual(["Allow", "Deny"]);
     expect(s.permissions[0]!.d.behavior).toBe("deny");
+  });
+
+  test("approval.timeoutSec 0 = no deadline: accepted by the schema and passed to askChoice as 0", async () => {
+    const s = parseSettings({ profiles: { main: { provider: "x", permissions: { approval: { timeoutSec: 0 } } } } });
+    expect(s.profiles.main!.permissions.approval.timeoutSec).toBe(0);
+    expect(parseSettings({}).profiles.main!.permissions.approval.timeoutSec).toBe(300);
+    expect(() => parseSettings({ profiles: { main: { provider: "x", permissions: { approval: { timeoutSec: -1 } } } } })).toThrow();
+    const { mgr, provider, platform } = setup((_i, sess) => sess.emit({ type: "permission_request", id: "p1", tool: "Bash", input: { command: "ls" }, title: "Run?" }),
+      { timeoutSec: 0 });
+    await mgr.handleInbound(inbound("go"));
+    await until(() => provider.sessions.get("global")?.permissions.length === 1);
+    expect(platform.choices[0]!.timeoutMs).toBe(0);
   });
 
   test("denyEndsTurn: provider ending the turn on deny gets a recovery turn", async () => {

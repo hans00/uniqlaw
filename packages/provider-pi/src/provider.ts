@@ -169,7 +169,7 @@ interface StartArgs {
   opts: z.infer<typeof profileOptionsSchema>;
 }
 
-type Pending = { resolve: (d: PermissionDecision) => void; timer: ReturnType<typeof setTimeout> };
+type Pending = { resolve: (d: PermissionDecision) => void; timer: ReturnType<typeof setTimeout> | undefined };
 
 class PiAgentSession implements AgentSession {
   readonly capabilities = PI_CAPABILITIES;
@@ -247,8 +247,9 @@ class PiAgentSession implements AgentSession {
     if (d.action === "allow") return undefined;
     if (d.action === "deny") return { block: true, reason: d.reason };
     const decision = await new Promise<PermissionDecision>((resolve) => {
-      const timer = setTimeout(() => { this.pending.delete(id); resolve({ behavior: "deny", message: "approval timed out" }); },
-        this.spec.profile.permissions.approval.timeoutSec * 1000);
+      // timeoutSec 0 = wait for the operator indefinitely (core's own prompt has no deadline either).
+      const sec = this.spec.profile.permissions.approval.timeoutSec;
+      const timer = sec > 0 ? setTimeout(() => { this.pending.delete(id); resolve({ behavior: "deny", message: "approval timed out" }); }, sec * 1000) : undefined;
       this.pending.set(id, { resolve, timer });
       this.events.push({ type: "permission_request", id, tool, input, title: summarize(tool, input), kind: "permission" });
     });

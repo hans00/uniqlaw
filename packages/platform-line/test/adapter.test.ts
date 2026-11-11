@@ -119,4 +119,15 @@ describe("askChoice", () => {
     expect(await adapter.askChoice({ platform: "line", chatId: OWNER }, { title: "Q", options: ["a"], approverIds: [], timeoutMs: 80 })).toBeNull();
     expect(fake.callsTo("/v2/bot/message/push").at(-1)!.body.messages[0].text).toContain("Timed out");
   });
+
+  test("timeoutMs 0 (approval.timeoutSec 0) never times out", async () => {
+    let settled = false;
+    const p = adapter.askChoice({ platform: "line", chatId: OWNER }, { title: "Q", options: ["a"], approverIds: [], timeoutMs: 0 });
+    void p.then(() => { settled = true; });
+    await Bun.sleep(150);
+    expect(settled).toBe(false);
+    expect(fake.callsTo("/v2/bot/message/push").some((c) => /Timed out/.test(String(c.body?.messages?.[0]?.text)))).toBe(false);
+    await adapter.stop();
+    expect(await p).toBeNull();
+  });
 });

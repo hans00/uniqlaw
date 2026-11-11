@@ -32,7 +32,8 @@ interface PendingChoice {
   to: string;
   req: ChoiceRequest;
   resolve: (idx: number | null) => void;
-  timer: ReturnType<typeof setTimeout>;
+  /** undefined: timeoutMs 0, wait until answered. */
+  timer: ReturnType<typeof setTimeout> | undefined;
 }
 
 const CONTENT_TYPES: Record<string, { kind: Attachment["kind"]; mime: string; ext: string }> = {
@@ -279,11 +280,12 @@ export class LineAdapter implements PlatformAdapter {
     if (!id) return null;
     const approverIds = req.approverIds.length ? req.approverIds : this.opts.operatorUserIds;
     return new Promise<number | null>((resolve) => {
-      const timer = setTimeout(async () => {
+      // timeoutMs 0 = wait for an answer indefinitely (permissions.approval.timeoutSec: 0).
+      const timer = req.timeoutMs > 0 ? setTimeout(async () => {
         if (!this.pending.delete(token)) return;
         await this.pushMessages(target.chatId, [{ type: "text", text: `⏱ Timed out — no answer: ${clip(req.title, 200)}` }]).catch(() => {});
         resolve(null);
-      }, req.timeoutMs);
+      }, req.timeoutMs) : undefined;
       this.pending.set(token, { to: target.chatId, req: { ...req, approverIds }, resolve, timer });
     });
   }

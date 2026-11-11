@@ -7,6 +7,7 @@ export interface PermissionPolicy {
   denyTools: string[];
   approval: {
     mode: "ask-operator" | "auto-deny" | "auto-allow";
+    /** How long to wait for the operator before denying; 0 = wait indefinitely. */
     timeoutSec: number;
   };
   /** Restrict file access to these dirs (enforced by prompt + provider flags where possible). */

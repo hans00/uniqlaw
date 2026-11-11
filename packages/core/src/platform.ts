@@ -68,6 +68,7 @@ export interface ChoiceRequest {
   options: string[];
   /** Platform user ids allowed to answer. */
   approverIds: string[];
+  /** Resolve null after this long without an answer; 0 = no deadline (wait until answered). */
   timeoutMs: number;
 }
 

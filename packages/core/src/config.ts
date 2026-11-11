@@ -28,7 +28,8 @@ export const permissionSchema = z.object({
   denyTools: z.array(z.string()).default([]),
   approval: z.object({
     mode: z.enum(["ask-operator", "auto-deny", "auto-allow"]).default("ask-operator"),
-    timeoutSec: z.number().int().positive().default(300),
+    /** Seconds to wait for the operator before denying; 0 = wait indefinitely. */
+    timeoutSec: z.number().int().nonnegative().default(300),
   }).prefault({}),
   dirScope: z.array(z.string()).optional(),
 });

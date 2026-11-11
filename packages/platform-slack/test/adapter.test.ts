@@ -133,4 +133,15 @@ describe("askChoice", () => {
     expect(await adapter.askChoice({ platform: "slack", chatId: "C1" }, { title: "Q", options: ["a"], approverIds: [FRIEND], timeoutMs: 80 })).toBeNull();
     expect(fake.callsOf("chat.update").at(-1)!.body.text).toContain("Timed out");
   });
+
+  test("timeoutMs 0 (approval.timeoutSec 0) never times out", async () => {
+    let settled = false;
+    const p = adapter.askChoice({ platform: "slack", chatId: "C1" }, { title: "Q", options: ["a"], approverIds: [FRIEND], timeoutMs: 0 });
+    void p.then(() => { settled = true; });
+    await Bun.sleep(150);
+    expect(settled).toBe(false);
+    expect(fake.callsOf("chat.update").some((c) => /Timed out/.test(String(c.body?.text)))).toBe(false);
+    await adapter.stop();
+    expect(await p).toBeNull();
+  });
 });

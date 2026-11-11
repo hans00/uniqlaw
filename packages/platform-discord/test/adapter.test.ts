@@ -168,4 +168,15 @@ describe("askChoice", () => {
     expect(patch.body.components).toEqual([]);
     expect(patch.body.content).toContain("Timed out");
   });
+
+  test("timeoutMs 0 (approval.timeoutSec 0) never times out", async () => {
+    let settled = false;
+    const p = adapter.askChoice({ platform: "discord", chatId: CH }, { title: "Q", options: ["a"], approverIds: [FRIEND], timeoutMs: 0 });
+    void p.then(() => { settled = true; });
+    await Bun.sleep(150);
+    expect(settled).toBe(false);
+    expect(fake.callsTo("PATCH", /messages\/\d+$/).some((c) => /Timed out/.test(String(c.body?.content)))).toBe(false);
+    await adapter.stop();
+    expect(await p).toBeNull();
+  });
 });
