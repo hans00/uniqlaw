@@ -107,13 +107,19 @@ test("a new process that fails to start: the old one starts again in-process, ne
   expect(st.ok).toBe(true);
 }, 60_000);
 
-test("restart mode: a systemd service exits for its supervisor; a terminal under systemd's user manager does not", () => {
+test("restart mode: only a service systemd started directly exits for its supervisor; everything else spawns", () => {
   const svc = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/uniqlaw.service\n";
   const term = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-1.scope\n";
-  expect(restartMode({ INVOCATION_ID: "x" }, svc)).toBe("exit");
-  expect(restartMode({ NOTIFY_SOCKET: "/run/x" }, "0::/system.slice/uniqlaw.service\n")).toBe("exit");
-  expect(restartMode({ INVOCATION_ID: "x" }, term)).toBe("spawn");
-  expect(restartMode({}, svc)).toBe("spawn");
-  expect(restartMode({ INVOCATION_ID: "x", UNIQLAW_RESTART_MODE: "spawn" }, svc)).toBe("spawn");
-  expect(restartMode({ UNIQLAW_RESTART_MODE: "exit" }, term)).toBe("exit");
+  const sys = "0::/system.slice/uniqlaw.service\n";
+  // Started by systemd itself (pid 1) as a service: exit for the supervisor.
+  expect(restartMode({ INVOCATION_ID: "x" }, sys, 1)).toBe("exit");
+  expect(restartMode({ NOTIFY_SOCKET: "/run/x" }, sys, 1)).toBe("exit");
+  // Any other .service cgroup (a cron.service job, a CI runner, the user manager's units): spawn — exit mode
+  // there could leave nothing running (Restart=no, or not our unit at all).
+  expect(restartMode({ INVOCATION_ID: "x" }, sys, 4242)).toBe("spawn");
+  expect(restartMode({ INVOCATION_ID: "x" }, svc, 4242)).toBe("spawn");
+  expect(restartMode({ INVOCATION_ID: "x" }, term, 1)).toBe("spawn");
+  expect(restartMode({}, sys, 1)).toBe("spawn");
+  expect(restartMode({ INVOCATION_ID: "x", UNIQLAW_RESTART_MODE: "spawn" }, sys, 1)).toBe("spawn");
+  expect(restartMode({ UNIQLAW_RESTART_MODE: "exit" }, term, 4242)).toBe("exit");
 });

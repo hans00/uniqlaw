@@ -17,15 +17,17 @@ import { isAlive, readRuntime, stateDirOf } from "./instance.ts";
 export const RESTART_EXIT_CODE = 75;
 
 /**
- * spawn: start the new process ourselves. exit: exit 75 for a supervisor. UNIQLAW_RESTART_MODE wins; otherwise
- * a systemd service (INVOCATION_ID / NOTIFY_SOCKET set and our cgroup is a *.service unit) means exit. A process
- * merely started from a systemd-managed terminal has its own scope, not a .service cgroup.
+ * spawn: start the new process ourselves. exit: exit 75 for a supervisor. UNIQLAW_RESTART_MODE wins. Otherwise
+ * exit only for a system service systemd started directly: INVOCATION_ID / NOTIFY_SOCKET set, our cgroup is a
+ * *.service unit, and our parent is pid 1. Anything else — a terminal (its own scope), a cron.service job or CI
+ * runner, a user-manager unit (parent is not pid 1) — spawns; set UNIQLAW_RESTART_MODE=exit there explicitly.
+ * Guessing "exit" wrong leaves nothing running; guessing "spawn" wrong at worst loses the child to KillMode.
  */
-export function restartMode(env: Record<string, string | undefined> = process.env, cgroup = readOwnCgroup()): "spawn" | "exit" {
+export function restartMode(env: Record<string, string | undefined> = process.env, cgroup = readOwnCgroup(), ppid = process.ppid): "spawn" | "exit" {
   const m = env.UNIQLAW_RESTART_MODE;
   if (m === "exit" || m === "spawn") return m;
   const unit = cgroup.trim().split("\n").map((l) => l.split(":").slice(2).join(":")).find(Boolean)?.split("/").filter(Boolean).at(-1) ?? "";
-  return (env.INVOCATION_ID || env.NOTIFY_SOCKET) && unit.endsWith(".service") ? "exit" : "spawn";
+  return (env.INVOCATION_ID || env.NOTIFY_SOCKET) && unit.endsWith(".service") && ppid === 1 ? "exit" : "spawn";
 }
 
 function readOwnCgroup(): string {
