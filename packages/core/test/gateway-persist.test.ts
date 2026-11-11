@@ -9,7 +9,7 @@ const log = { debug() {}, info() {}, warn() {}, error() {}, child() { return log
 
 test("MCP URL survives a daemon restart (claude-tmux sessions are reattached with it)", async () => {
   const file = join(mkdtempSync(join(tmpdir(), "uq-gw-")), "gateway.json");
-  const mgr = () => ({}) as ChannelManager;
+  const mgr = () => ({ toolPolicy: () => undefined }) as unknown as ChannelManager;
 
   const a = new McpGateway(mgr, log, file);
   a.start("127.0.0.1", 0);

@@ -7,6 +7,7 @@ import type { Origin } from "./origin.ts";
 import type { GroupMode } from "./config.ts";
 import { ChannelRuntime, type RuntimeHost } from "./runtime.ts";
 import { PairingService } from "./pairing.ts";
+import { resolveToolPolicy, type ToolPolicy } from "./channel-policy.ts";
 import { formatTimestamp, renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
@@ -15,7 +16,7 @@ import { expandHome } from "./credentials.ts";
 import { basename, extname, isAbsolute, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
-export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "onUsageLimit" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget"> {
+export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "onUsageLimit" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget" | "toolPolicyFor"> {
   providers: Map<string, AgentProvider>;
   platforms: Map<string, PlatformAdapter>;
   profiles: Map<string, Profile>;
@@ -64,6 +65,8 @@ export interface TakeoverInfo { key: string; argv: string[]; cwd: string; live: 
   /** Non-secret env the command needs (e.g. CLAUDE_CONFIG_DIR for an alternate login). */
   env?: Record<string, string> }
 
+export type GroupSettings = { mode: GroupMode; ignoreOtherMentions: boolean; historyLimit: number; allowFrom: string[]; others: "context" | "ignore" };
+
 type TaskWaiter = { resolve: (r: { ok: boolean; text: string }) => void };
 
 export class ChannelManager {
@@ -91,6 +94,7 @@ export class ChannelManager {
       emit: (ev: RuntimeEvent) => { this.events.emit("event", ev); },
       isInternal: (k) => this.kindOf(k) === "internal",
       cwdFor: (k) => deps.store.get(`session-cwd:${k}`),
+      toolPolicyFor: (k) => this.toolPolicy(k),
       workerOf: (k) => { const m = this.workerMeta(k); return m ? { owner: m.owner } : undefined; },
       backgroundTarget: (k) => {
         if (!k.startsWith(WORKER_PREFIX)) return undefined;
@@ -126,6 +130,12 @@ export class ChannelManager {
     if (channelKey.startsWith("a2a:")) return "a2a";
     if (channelKey.startsWith(WORKER_PREFIX)) return "worker";
     return this.targetForChannel(channelKey) ? "chat" : "internal";
+  }
+
+  /** Channel capabilities (settings.channels) of a session. Only chats have one: internal sessions (cron jobs,
+   *  heartbeat), workers and A2A sessions keep their own settings, also when they post into a chat. */
+  toolPolicy(channelKey: string): ToolPolicy | undefined {
+    return this.kindOf(channelKey) === "chat" ? resolveToolPolicy(this.deps.settings.channels, channelKey) : undefined;
   }
 
   profileFor(channelKey: string): Profile {
@@ -194,11 +204,13 @@ export class ChannelManager {
     if (pair && msg.trusted) { await reply(await this.pairing.command(pair[1])); return; }
     const act = msg.text.trim().match(/^\/activation(?:@\S+)?(?:\s+(\S+))?\s*$/i);
     if (act && msg.trusted && msg.multiparty) { await reply(this.activationCommand(msg.channelKey, act[1]?.toLowerCase())); return; }
-    if (msg.multiparty && !this.shouldStartTurn(msg)) {
+    const wake = msg.multiparty ? this.wakeCheck(msg) : "wake";
+    if (wake !== "wake") {
       const g = this.groupSettings(msg.channelKey, msg.groupPolicy);
-      if (g.historyLimit > 0) {
+      if (g.others === "context" && g.historyLimit > 0) {
         const extra = msg.attachments.length ? ` [+${msg.attachments.length} attachment(s), not shown]` : "";
-        this.deps.store.pushPending(sessionKey, "group-context", { label: `${msg.sender.name} (not addressed to you)`, text: msg.text + extra });
+        const label = wake === "not-allowed" ? `${msg.sender.name} [id ${msg.sender.id}] (not allowed to wake you; background only)` : `${msg.sender.name} (not addressed to you)`;
+        this.deps.store.pushPending(sessionKey, "group-context", { label, text: msg.text + extra });
         this.deps.store.trimPending(sessionKey, "group-context", g.historyLimit);
       }
       return;
@@ -376,22 +388,28 @@ export class ChannelManager {
 
   /** Group settings for a channel: `/activation` override, then `groups.channels` (a Slack thread key falls back
    *  to its channel), then `groups` defaults. */
-  groupSettings(channelKey: string, platformPolicy?: InboundMessage["groupPolicy"]): { mode: GroupMode; ignoreOtherMentions: boolean; historyLimit: number } {
+  groupSettings(channelKey: string, platformPolicy?: InboundMessage["groupPolicy"]): GroupSettings {
     const { channels, ...defaults } = this.deps.settings.groups;
     const parts = channelKey.split(":");
     let entry: Partial<typeof defaults> | undefined;
     for (let n = parts.length; n >= 2 && !entry; n--) entry = channels[parts.slice(0, n).join(":")];
     const override = this.deps.store.get(`group-mode:${channelKey}`) as GroupMode | undefined;
-    return { ...defaults, ...platformPolicy, ...entry, ...(override ? { mode: override } : {}) };
+    // allowFrom entries are "<platform>:<id>". In a per-channel entry a bare id means that channel's platform; in the
+    // global list a bare id matches no one (it would mean different people on different platforms), so a list of
+    // only bare ids fails closed. channelPolicyWarnings reports them at startup.
+    const allowFrom = entry?.allowFrom ? entry.allowFrom.map((a) => (a.includes(":") ? a : `${parts[0]}:${a}`)) : defaults.allowFrom;
+    return { ...defaults, ...platformPolicy, ...entry, allowFrom, ...(override ? { mode: override } : {}) };
   }
 
-  /** Multiparty gate: does this message start a turn, or only become context? */
-  private shouldStartTurn(msg: InboundMessage): boolean {
-    const addressed = msg.addressed ?? true; // an adapter that can't tell must not produce a bot that never answers
-    if (addressed) return true;
+  /** Multiparty gate: does this message start a turn, or only become context? The sender check uses the
+   *  platform's user id from the payload (never a name, never the message text). */
+  private wakeCheck(msg: InboundMessage): "wake" | "not-addressed" | "not-allowed" {
     const g = this.groupSettings(msg.channelKey, msg.groupPolicy);
-    if (g.mode === "mention") return false;
-    return !(g.ignoreOtherMentions && msg.mentionsOthers);
+    if (g.allowFrom.length && !g.allowFrom.includes(`${msg.platform}:${msg.sender.id}`)) return "not-allowed";
+    const addressed = msg.addressed ?? true; // an adapter that can't tell must not produce a bot that never answers
+    if (addressed) return "wake";
+    if (g.mode === "mention") return "not-addressed";
+    return g.ignoreOtherMentions && msg.mentionsOthers ? "not-addressed" : "wake";
   }
 
   private activationCommand(channelKey: string, arg?: string): string {
@@ -835,6 +853,12 @@ export class ChannelManager {
   parseTargetString(s: string): Target | undefined {
     const [p] = s.split(":");
     return p ? this.deps.platforms.get(p)?.parseTarget(s) : undefined;
+  }
+
+  /** Session (channel key) that owns a target string like "telegram:<chatId>"; undefined if unresolvable. */
+  channelKeyForTarget(s: string): string | undefined {
+    const t = this.parseTargetString(s);
+    return t ? this.deps.platforms.get(t.platform)?.channelKeyForTarget(t) : undefined;
   }
 
   private targetForChannel(key: string): Target | undefined {

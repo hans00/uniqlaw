@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
 import {
   baseChildEnv, buildPermissionArgs, nativeMemoryArgs, claudeEnvForCredential, composeAppendSystemPrompt, locateJsonl,
-  MCP_SERVER_NAME, writeMcpConfig,
+  MCP_SERVER_NAME, mcpToolId, writeMcpConfig,
 } from "@uniqlaw/claude-common";
 import { Tmux } from "./tmux.ts";
 import { ClaudeTmuxSession, CLAUDE_TMUX_CAPABILITIES, newProviderSessionId, type Timings } from "./session.ts";
@@ -73,7 +73,10 @@ export class ClaudeTmuxProvider implements AgentProvider {
       if (spec.profile.model) argv.push("--model", spec.profile.model);
       argv.push(...buildPermissionArgs(spec.profile.permissions, {
         modeOverride: opts.permissionMode,
-        extraAllowed: spec.mcp ? [`mcp__${MCP_SERVER_NAME}`] : [],
+        // With a channel policy the granted UniQlaw tools are named one by one, so a policy change also changes
+        // the launch flags (fingerprint below) and a reattached claude is respawned with the new tool list.
+        extraAllowed: !spec.mcp ? [] : spec.toolPolicy ? spec.mcp.toolNames.map(mcpToolId) : [`mcp__${MCP_SERVER_NAME}`],
+        ...(spec.toolPolicy ? { toolPolicy: spec.toolPolicy } : {}),
       }));
       const append = composeAppendSystemPrompt({
         parts: spec.systemPrompt, permissions: spec.profile.permissions, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames,

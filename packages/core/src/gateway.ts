@@ -6,6 +6,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import type { ChannelManager } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
+import { groupAllowed, mcpToolAllowed } from "./channel-policy.ts";
 
 export const GATEWAY_TOOL_NAMES = ["agents_list", "agent_ask", "agent_trigger", "notify", "send_file", "task_status", "worker_start", "worker_stop"];
 
@@ -53,7 +54,13 @@ export class McpGateway {
   /** Plugin-contributed tools (registered before sessions open, so prompts list them). */
   addTools(tools: GatewayTool[]) { this.extra.push(...tools); }
 
-  toolNames() { return [...GATEWAY_TOOL_NAMES, ...this.extra.map((t) => t.name)]; }
+  /** Tools a session may see and call: all of them, minus what its channel policy (settings.channels) leaves out. */
+  toolNames(channelKey?: string) {
+    const all = [...GATEWAY_TOOL_NAMES, ...this.extra.map((t) => t.name)];
+    if (channelKey === undefined) return all;
+    const policy = this.manager().toolPolicy(channelKey);
+    return all.filter((n) => mcpToolAllowed(policy, n));
+  }
 
   get port() { return this.server?.port; }
 
@@ -67,7 +74,7 @@ export class McpGateway {
       this.tokens.set(token, channelKey);
       this.save();
     }
-    return { url: `http://${this.server.hostname}:${this.server.port}/mcp/${token}`, token, toolNames: this.toolNames() };
+    return { url: `http://${this.server.hostname}:${this.server.port}/mcp/${token}`, token, toolNames: this.toolNames(channelKey) };
   }
 
   private async handle(req: Request): Promise<Response> {
@@ -80,8 +87,14 @@ export class McpGateway {
   }
 
   private build(caller: string): McpServer {
-    const s = new McpServer({ name: "uniqlaw", version: "0.1.0" });
+    const real = new McpServer({ name: "uniqlaw", version: "0.1.0" });
     const mgr = this.manager();
+    // Channel capabilities: a tool the caller's channel was not given is never registered, so it is neither
+    // listed nor callable (checked per request, so a settings change applies at once).
+    const policy = mgr.toolPolicy(caller);
+    const s = { registerTool: ((name: string, ...rest: unknown[]) => {
+      if (mcpToolAllowed(policy, name)) (real.registerTool as (...a: unknown[]) => unknown)(name, ...rest);
+    }) as McpServer["registerTool"] };
     const ok = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v, null, 2) }] });
     const fail = (e: unknown) => ({ content: [{ type: "text" as const, text: `error: ${e instanceof Error ? e.message : String(e)}` }], isError: true });
     const wrap = <A>(fn: (a: A) => Promise<unknown>) => async (a: A) => {
@@ -120,7 +133,13 @@ export class McpGateway {
         kind: z.enum(["image", "audio", "voice", "video", "file"]).optional().describe("how to show it; default from the extension (.ogg/.opus = voice note)"),
         name: z.string().optional().describe("file name shown in the chat"),
       } },
-      wrap(async (a) => mgr.sendFile(caller, a)));
+      wrap(async (a) => {
+        // Posting into another chat is what the notify group grants.
+        if (a.target && !groupAllowed(policy, "notify") && mgr.parseTargetString(a.target) && mgr.channelKeyForTarget(a.target) !== caller) {
+          throw new Error("this chat may only send files to itself (its channel lacks the notify tool group)");
+        }
+        return mgr.sendFile(caller, a);
+      }));
 
     s.registerTool("task_status", { description: "Status/result of an agent_ask or agent_trigger task.", inputSchema: { taskId: z.string() } },
       wrap(async ({ taskId }) => {
@@ -155,6 +174,6 @@ export class McpGateway {
       s.registerTool(t.name, { description: t.description, inputSchema: t.inputSchema },
         wrap(async (a: Record<string, unknown>) => t.handler(a, caller)));
     }
-    return s;
+    return real;
   }
 }

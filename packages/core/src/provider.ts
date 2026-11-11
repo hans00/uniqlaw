@@ -2,6 +2,7 @@
 // claude-sdk, codex, opencode, acp, agy, pi — implements AgentProvider.
 import type { Credential } from "./credentials.ts";
 import type { PermissionPolicy } from "./permissions.ts";
+import type { ToolPolicy } from "./channel-policy.ts";
 
 export interface ProviderCapabilities {
   /** Output granularity. */
@@ -22,6 +23,9 @@ export interface ProviderCapabilities {
   nativeTools: boolean;
   attachments: ("image" | "file" | "audio")[];
   slashCommands: boolean;
+  /** Enforces SessionSpec.toolPolicy on its own (native) tools. Without it, core refuses to open a session whose
+   *  channel policy restricts native tools (fail closed); MCP tools are filtered by the gateway either way. */
+  toolPolicy?: boolean;
 }
 
 /** Named agent configuration (provider + model + prompt + permissions). */
@@ -76,6 +80,10 @@ export interface SessionSpec {
   cwd: string;
   profile: Profile;
   systemPrompt: SystemPromptParts;
+  /** Channel capabilities (settings.channels). Absent = unrestricted. `mcp.toolNames` is already filtered; the
+   *  provider removes the native tools of the policy (see claudeToolLists) and, in allow mode, any MCP server
+   *  other than UniQlaw's. */
+  toolPolicy?: ToolPolicy;
   /** MCP Gateway endpoint for this session (identity = token). */
   mcp?: { url: string; token: string; toolNames: string[] };
   nativeTools?: ToolDef[];

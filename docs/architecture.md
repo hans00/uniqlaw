@@ -476,6 +476,76 @@ interface PermissionPolicy {
 The Approval Broker receives every `permission_request`, finds the operator per §8.4, sends inline buttons,
 and denies on timeout.
 
+### 10.3 Channel capabilities and group wake rules
+
+The unit of control is the channel (chat), not the user. `settings.channels` gives each chat a set of **tool groups**;
+core resolves it into `SessionSpec.toolPolicy` when the chat's session opens. One table (`TOOL_GROUPS` in
+`core/src/channel-policy.ts`) maps each group to concrete tools:
+
+| group | UniQlaw MCP tools | Claude Code built-ins (names as of claude 2.1.322) |
+|---|---|---|
+| `chat` | `send_file` (own chat only unless `notify` is granted) | `TaskCreate/Get/List/Update`, `ToolSearch`¹, `AskUserQuestion`, plan mode, `ReportFindings` |
+| `memory` | `memory_write`, `memory_search`, `memory_get` | — |
+| `web` | — | `WebSearch`, `WebFetch` |
+| `files.read` | — | `Read`, `Grep`, `Glob`, `LSP` |
+| `files.write` ⚠ | — | `Write`, `Edit`, `NotebookEdit`, worktrees |
+| `bash` ⚠ | — | `Bash`, `Monitor`, `PowerShell`, `TaskStop` (anything that runs code) |
+| `agents` | — | `Task`/`Agent`, `Workflow`, `Skill` (sub-agents get the session's own tool set) |
+| `cron` ⚠ | `cron_list`, `cron_save`, `cron_delete` | `CronCreate/Delete/List`, `ScheduleWakeup`, `RemoteTrigger` |
+| `worker` ⚠ | `worker_start`, `worker_stop` | — |
+| `xsession` ⚠ | `agents_list`, `agent_ask`, `agent_trigger`, `task_status` | `SendToProject` (`ListAgents` / `SendMessage` are always off) |
+| `notify` | `notify` (and `send_file` to other chats) | `PushNotification`, `Artifact*`, `DesignSync` |
+| `config` | reserved (no tools yet) | — |
+
+¹ `ToolSearch` loads deferred MCP tools, so it is not tied to `chat`. Deny mode never removes it: UniQlaw plugin tools
+that no group names stay callable there. Allow mode keeps it while any group with UniQlaw MCP tools is granted.
+`--strict-mcp-config` (any policy) leaves the UniQlaw gateway as the only MCP server: on claude 2.1.322 it also drops
+Claude Code plugin servers and claude.ai connectors, not just the user's `mcpServers`.
+
+**⚠ Admin-level groups (v1).** `bash`, `files.write`, `cron`, `worker` and `xsession` grant effectively full access,
+because each one lets a restricted chat reach something unrestricted:
+- a cron job runs in its own `cron:<job>` session, and a worker runs under its own profile;
+- `agent_ask` / `agent_trigger` reach other chats' sessions;
+- writes to `.uniqlaw/jobs/*.md`, `.uniqlaw/settings.json` or `.claude/settings.json` hooks change what runs next;
+- a shell can do all of the above.
+
+There is no policy inheritance across these hops yet. The daemon logs a warning at startup for every restricted channel
+(or `defaults`) that grants one of them. Give them only to chats whose members you would trust with the machine.
+
+**Sensitive reads.** `.uniqlaw/` holds other chats' transcripts (`state.db`), settings, logs and the per-session MCP
+gateway tokens (`claude-tmux/*/mcp.json`). Every restricted chat on a Claude provider gets
+`Read(./.uniqlaw/**)` / `Grep(…)` / `Glob(…)` deny rules (relative to the session's cwd, the project directory), but
+Claude Code matches `Grep(…)` rules on the `path` argument only, but it also leaves denied paths out of Grep results,
+so `path: "."` with `glob: ".uniqlaw/**"` finds nothing there (checked on claude 2.1.322; pinned by
+`claude-common/test/tool-policy.e2e.test.ts`). `files.read` still reaches the rest of the project (including `memory/`) and anything else the OS user can read. A shell
+(`bash`) bypasses these rules entirely.
+
+- `tools: [...]` is an allow list: only those tools exist. Claude gets `--tools <built-ins>` and `--strict-mcp-config`
+  (no MCP servers from the user's own config), plus the granted UniQlaw tools named one by one in `--allowedTools`.
+  Built-ins no group names (`Task`, `Skill`, …) are off.
+- `tools: "*"` keeps everything; `deny` subtracts groups (`--disallowedTools` for built-ins, gateway filtering for MCP).
+  Any policy, allow or deny, also gets `--strict-mcp-config`: the user's own MCP servers (browser automation, mail, …)
+  belong to no group, so no restricted chat gets them. A chat with no policy keeps its exact old launch flags.
+- The MCP gateway never registers a tool the caller's channel lacks (not listed, not callable), checked per request.
+- Enforcement of built-in tools is the provider's job (`ProviderCapabilities.toolPolicy`, implemented by claude-tmux and
+  claude-sdk). If a channel restricts built-in tools and its provider can't, the session refuses to open (fail closed).
+- Only chat sessions take a policy. Internal sessions (heartbeat, `cron:<job>`), workers and A2A sessions keep their own
+  settings, also when they post into a chat. A job whose target *is* a chat session runs inside that session, with its tools.
+- A policy change is a launch-flag change, so a claude-tmux process reattached after a reload is respawned (`--resume`)
+  with the new tool set (same fingerprint mechanism as a permission-mode change). Until then it keeps its old built-in
+  tools: a turn that was running across the reload finishes with them, and the respawn happens once the pane is idle.
+  UniQlaw MCP tools change at once (the gateway checks every request).
+- Migration: no `channels` section, or no entry and no `defaults` for a chat, means unrestricted (the behavior before `channels` existed).
+  Only an explicit `defaults` entry narrows chats without their own entry.
+
+Group chats (`groups`, per channel in `groups.channels`) add wake rules on top of `mode`: `allowFrom` lists the platform
+user ids allowed to wake the agent (`"telegram:<from.id>"`, `"discord:<author.id>"`; in a per-channel entry a bare id
+means that channel's platform, in the global list it matches no one and is warned about; empty = anyone the platform
+allowlist lets through). The check runs in core on `InboundMessage.sender.id` from the platform payload, before
+the agent sees anything; names and message text never count. `others` decides what happens to messages that don't wake
+the agent: `context` keeps them (up to `historyLimit`) as background for the next woken turn, labelled with the sender's
+id; `ignore` drops them. DMs are never gated.
+
 ### 10.2 Settings layering: inherit + override (§13 #9)
 
 ```

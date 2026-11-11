@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  BRAND_PROMPT, ChannelManager, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
+  BRAND_PROMPT, ChannelManager, channelPolicyWarnings, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
   createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, type MemoryOriginKind,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
   type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transcriber, type Transport,
@@ -67,6 +67,7 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
   const cleanups: (() => void | Promise<void>)[] = [releaseLock];
   const log: Logger = createLogger({ file: join(stateDir, "logs", "daemon.log"), stderr: opts.logToStderr });
   log.info("starting", { projectDir, instanceId, version: VERSION });
+  for (const w of channelPolicyWarnings(settings)) log.warn(w);
 
   try {
     registerInstance(instanceId, projectDir);
