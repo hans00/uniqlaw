@@ -587,6 +587,25 @@ export class ChannelManager {
 
   taskStatus(taskId: string) { return this.deps.store.getTask(taskId); }
 
+  /** task_status view: state and result, elapsed time, and while it is open, the answering session's progress. */
+  taskReport(taskId: string, now = Date.now()) {
+    const t = this.deps.store.getTask(taskId);
+    if (!t) return undefined;
+    const open = t.state === "submitted" || t.state === "working";
+    const progress = open ? this.runtimes.get(t.toSession)?.progressOf(taskId) : undefined;
+    return {
+      state: t.state, result: t.result,
+      elapsedSec: Math.round(((open ? now : t.updatedAt) - t.createdAt) / 1000),
+      ...(progress ? { progress: {
+        phase: progress.phase,
+        ...(progress.queuePosition ? { queuePosition: progress.queuePosition } : {}),
+        ...(progress.turnStartedAt ? { turnElapsedSec: Math.round((now - progress.turnStartedAt) / 1000) } : {}),
+        ...(progress.latestText ? { latestText: progress.latestText } : {}),
+        ...(progress.recent.length ? { recent: progress.recent } : {}),
+      } } : {}),
+    };
+  }
+
   get transcript(): TranscriptStore | undefined { return this.deps.transcript; }
 
   /** Scheduled turn (cron / heartbeat). deliverTo is a target string like "telegram:<chatId>", or "none". */

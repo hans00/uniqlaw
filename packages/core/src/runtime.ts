@@ -83,7 +83,29 @@ interface TurnState {
   toolLines: string[];
   denied: boolean;
   unsolicited: boolean;
+  /** For task_status while the turn runs: recent activity (texts, tools) and the text being streamed now. */
+  progress?: { lines: string[]; partial: string };
 }
+
+/** What task_status shows about a task its session is still working on. */
+export interface TaskProgress {
+  /** running: the session's current turn is answering it; queued: it waits for the current turn to end. */
+  phase: "running" | "queued";
+  /** queued: 1 = next. */
+  queuePosition?: number;
+  /** running: when the turn started (ms). */
+  turnStartedAt?: number;
+  /** running: the latest assistant text of the turn (the one being streamed, else the last finished one), tail-bounded. */
+  latestText?: string;
+  /** running: the last few activity lines ("text: …", "tool: …"), oldest first. */
+  recent: string[];
+}
+
+const PROGRESS_LINES = 10;
+const PROGRESS_LINE_CHARS = 200;
+const PROGRESS_TEXT_CHARS = 1500;
+const oneLine = (s: string, max: number) => { const t = s.replace(/\s+/g, " ").trim(); return t.length > max ? t.slice(0, max - 1) + "…" : t; };
+const tailOf = (s: string, max: number) => (s.length > max ? "…" + s.slice(-(max - 1)) : s);
 
 const TYPING_PULSE_MS = 4000;
 const STEER_RACE_MS = 3000;
@@ -156,6 +178,28 @@ export class ChannelRuntime {
     let h = 0;
     for (const o of this.currentOrigins) if (o.kind === "peer" || o.kind === "a2a") h = Math.max(h, o.hop);
     return h;
+  }
+
+  /** Progress of a task this session is answering or has queued (task_status), else undefined. */
+  progressOf(taskId: string): TaskProgress | undefined {
+    const has = (o: Origin) => "taskId" in o && o.taskId === taskId;
+    const t = this.turn;
+    if (t && this.state !== "idle" && t.origins.some(has)) {
+      const latest = t.progress?.partial.trim() || t.texts.at(-1)?.trim();
+      return { phase: "running", turnStartedAt: t.startedAt, ...(latest ? { latestText: tailOf(latest, PROGRESS_TEXT_CHARS) } : {}),
+        recent: [...(t.progress?.lines ?? [])] };
+    }
+    const i = this.queue.findIndex((q) => has(q.origin));
+    return i >= 0 ? { phase: "queued", queuePosition: i + 1, recent: [] } : undefined;
+  }
+
+  private noteProgress(line?: string, partial?: { reset?: boolean; delta?: string }) {
+    const t = this.turn;
+    if (!t) return;
+    const p = (t.progress ??= { lines: [], partial: "" });
+    if (line) { p.lines.push(oneLine(line, PROGRESS_LINE_CHARS)); if (p.lines.length > PROGRESS_LINES) p.lines.splice(0, p.lines.length - PROGRESS_LINES); }
+    if (partial?.reset) p.partial = "";
+    if (partial?.delta) p.partial = tailOf(p.partial + partial.delta, PROGRESS_TEXT_CHARS);
   }
 
   /** Human target at the root of whatever the current turn is serving. */
@@ -511,7 +555,7 @@ export class ChannelRuntime {
         this.state = "running";
         return;
       case "text":
-        if (ev.delta !== undefined && ev.final === undefined) { this.onDelta(ev.segmentId, ev.delta); return; }
+        if (ev.delta !== undefined && ev.final === undefined) { this.noteProgress(undefined, { delta: ev.delta }); this.onDelta(ev.segmentId, ev.delta); return; }
         if (ev.final !== undefined) await this.onFinalText(ev.final, ev.segmentId);
         return;
       case "thinking":
@@ -519,6 +563,7 @@ export class ChannelRuntime {
         return;
       case "tool_start":
         this.record("tool", formatToolStatus(ev.name, ev.input));
+        this.noteProgress(`tool: ${formatToolStatus(ev.name, ev.input)}`, { reset: true });
         if (this.host.settings.output.toolStatus) await this.postToolStatus(formatToolStatus(ev.name, ev.input));
         return;
       case "tool_end":
@@ -620,6 +665,7 @@ export class ChannelRuntime {
     if (!this.turn) this.turn = { origins: [{ kind: "system", reason: "background" }], startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: true };
     if (!raw.trim()) return;
     this.turn.texts.push(raw);
+    this.noteProgress(`text: ${raw}`, { reset: true });
     this.record("assistant", raw);
     if (isSilentReplyText(raw)) { await this.finishLive(segmentId, undefined); return; }
     const { cleanText, reactions } = extractReactions(stripSilentToken(raw));

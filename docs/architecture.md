@@ -345,13 +345,32 @@ interface Envelope {
 | `agent_ask(to, message, wait?)` | The target runs a turn and **the reply comes back to you**; the target's output does not go to a platform | Native `SendMessage` |
 | `agent_trigger(to, prompt)` | The target runs a turn and **replies to its own human** | `/api/trigger` |
 | `notify(target, text)` | Sends text you wrote directly to a human via the platform API, and writes it to the pending-input queue (state.db) of the session that owns that target, so it knows on its next run | `/api/send` |
-| `task_status(taskId)` / `task_cancel(taskId)` | Query or cancel work sent out with `agent_ask` | — |
+| `task_status(taskId)` / `task_cancel(taskId)` | Query or cancel work sent out with `agent_ask` (status includes elapsed time and live progress; see below) | — |
 
 How `agent_ask` replies:
 - `wait=true`: the tool blocks until the target's turn ends, then returns the result. Suitable for short tasks; has a timeout.
 - `wait=false`: returns a `taskId` immediately. When the target finishes, core opens an
   `origin=peer` turn in your session and delivers the result; if you are currently running, it is handled per the steer capability.
   This does not depend on any provider's "background notification" feature.
+
+`task_status(taskId)` (only the asker and the answering session can see a task) returns `state`, `result` and
+`elapsedSec` (until now while open, until it finished otherwise). While the task is still open and its session is local,
+it also returns `progress`:
+- `phase: "running"`: the session's current turn is answering it. `turnElapsedSec`, `latestText` (the assistant text
+  being streamed right now, else the last finished one; at most 1500 chars, tail kept) and `recent` (the last 10
+  activity lines, `text: …` / `tool: …`, one line each, at most 200 chars) come with it.
+- `phase: "queued"`, `queuePosition`: it waits for the session's current turn to end.
+
+Progress lives in memory with the turn: it is not persisted, and a reload loses it until the next turn starts.
+
+**An `agent_ask` (or `worker_start` with a task) that reaches a session mid-turn** follows `queue.mode`, like a human
+message would. It never interrupts unless `queue.mode` is `interrupt`:
+- `queue` (default): it waits in the queue (`task_status` → `queued`) and runs as its own turn once the current one ends.
+  Several inputs that piled up meanwhile are merged into that one turn, and each ask gets the turn's whole answer.
+- `steer` (when the provider can steer; claude-tmux types it into the pane, held while a permission dialog is open): it
+  joins the running turn. That turn's final answer completes both tasks, so each asker gets the same combined reply.
+- `interrupt`: the current turn is stopped (a task it was answering fails with `(interrupted) …` plus any text it had), then the queue runs.
+- A worker a human holds (`/attach`, terminal takeover) refuses the ask instead.
 
 **Identity binding:** the MCP Gateway URL carries a per-session token (`/mcp/<token>`). Tools do not accept
 "who am I" style parameters; the caller's identity is determined by the token, so an agent cannot impersonate another session.

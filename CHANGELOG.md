@@ -17,6 +17,7 @@ First public version.
 - DM pairing (after OpenClaw): a stranger who DMs the bot gets a one-time code; an operator approves it with `/pair approve <code>` or `uniqlaw pairing approve <code>`. Paired users live in `state.db`, are accepted like `allowedUserIds` but are never operators, and can be removed with `uniqlaw pairing revoke`. Open requests are capped (`pairing.maxPending`) and expire (`pairing.ttlMinutes`); `pairing.enabled: false` turns it off.
 - `send_file` bus tool: agents post local files (image, audio, voice note, video, document) to their own or another chat without calling platform APIs. Telegram, Discord and Slack (needs the `files:write` scope); limited to the project, the session's directory, the temp dir, `workers.roots` and `files.roots`, up to `files.maxMB`.
 - Group modes: `mention` (default; unaddressed messages are kept as context for the next turn) or `always`, with `ignoreOtherMentions`, per-channel settings (`groups.channels`) and `/activation`. Discord's v2 per-channel `requireMention` / `ignoreOtherMentions` map onto them; unaddressed messages are no longer dropped.
+- `task_status` reports `elapsedSec` and, while the task is open, `progress`: whether the answering session is running it or has it queued, the latest assistant text (also mid-stream) and its last activity lines.
 - Agent-guided migration from ClaudeClaw v2 (`docs/MIGRATE.md`), including importing Claude auto-memory.
 
 ### Fixes
