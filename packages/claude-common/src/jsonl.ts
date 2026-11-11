@@ -140,6 +140,15 @@ export class JsonlTailer {
 
   get file(): string | undefined { return this.path; }
 
+  /** Bytes fully consumed so far (a buffered partial line is not), for resuming after a restart. */
+  position(): { path: string; pos: number } | undefined {
+    return this.path ? { path: this.path, pos: this.pos - Buffer.byteLength(this.buf) } : undefined;
+  }
+
+  /** Before start(): continue from a saved position instead of startAt, if it is the same file and still valid. */
+  resumeFrom(at: { path: string; pos: number }) { this.resume = at; }
+  private resume?: { path: string; pos: number };
+
   start() {
     if (this.timer) return;
     this.tick();
@@ -162,7 +171,9 @@ export class JsonlTailer {
         const p = this.opts.locate();
         if (!p) return;
         this.path = p;
-        this.pos = this.opts.startAt === "end" ? statSync(p).size : 0;
+        const size0 = statSync(p).size;
+        this.pos = this.resume && this.resume.path === p && this.resume.pos <= size0 ? this.resume.pos : this.opts.startAt === "end" ? size0 : 0;
+        this.resume = undefined;
       }
       const size = statSync(this.path).size;
       if (size < this.pos) { this.pos = 0; this.buf = ""; }

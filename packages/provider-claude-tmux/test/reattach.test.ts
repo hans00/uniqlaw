@@ -74,3 +74,34 @@ test("fresh launch flags: no respawn", async () => {
   await Bun.sleep(50);
   expect(respawns).toBe(0);
 });
+
+test("a reply written while the daemon was down is emitted after reattach (jsonl position kept across detach)", async () => {
+  const tmux = new FakeTmux();
+  const { s: first } = make(tmux, {});
+  const d = dir!;
+  const { mkdirSync, appendFileSync, writeFileSync, existsSync } = await import("node:fs");
+  const { expectedJsonlPath } = await import("@uniqlaw/claude-common");
+  const jsonl = expectedJsonlPath("00000000-0000-0000-0000-000000000001", d, { CLAUDE_CONFIG_DIR: d });
+  mkdirSync(join(jsonl, ".."), { recursive: true });
+  writeFileSync(jsonl, JSON.stringify({ type: "user", message: { content: "long task" } }) + "\n");
+  const tail = join(d, "tail.json");
+  (first as unknown as { init: { tailStateFile?: string } }).init.tailStateFile = tail;
+  await first.start({ reattach: true });
+  await Bun.sleep(30);
+  first.detach();
+  expect(existsSync(tail)).toBe(true);
+  // While the daemon is down, claude finishes the turn.
+  appendFileSync(jsonl, JSON.stringify({ type: "assistant", message: { id: "m1", stop_reason: "end_turn", content: [{ type: "text", text: "done while you were away" }] } }) + "\n");
+
+  const second = new ClaudeTmuxSession({ tmux: tmux as unknown as Tmux, name: "t", providerSessionId: "00000000-0000-0000-0000-000000000001",
+    cwd: d, env: { CLAUDE_CONFIG_DIR: d }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10 }, readyTimeoutMs: 2000, tailStateFile: tail }, "end");
+  sessions.push(second);
+  const events: AgentEvent[] = [];
+  void (async () => { for await (const ev of second.events) events.push(ev); })();
+  await second.start({ reattach: true });
+  await until(() => events.some((e) => e.type === "turn_end"), 8000);
+  const types = events.map((e) => e.type).filter((t) => t === "unsolicited_turn" || t === "text" || t === "turn_end");
+  expect(types).toEqual(["unsolicited_turn", "text", "turn_end"]); // a turn of its own: core routes it to the resumed origins
+  expect(events.find((e) => e.type === "text")).toMatchObject({ final: "done while you were away" });
+  expect(existsSync(tail)).toBe(false);
+}, 15_000);
