@@ -445,6 +445,14 @@ export class ChannelManager {
     return hop;
   }
 
+  /** Rounds of the result an ask from `from` would bring back (see Origin.rounds). */
+  private checkRounds(from: string): number {
+    const rounds = (this.runtimes.get(from)?.currentRounds() ?? 0) + 1;
+    const max = this.deps.settings.bus.maxRounds;
+    if (rounds > max) throw new Error(`too many agent_ask rounds without a human message (${rounds} > ${max}); report back instead`);
+    return rounds;
+  }
+
   private resolveAgent(to: string): string {
     // Existing sessions: chats, internal sessions (heartbeat, cron:<job>, …), A2A contexts, workers.
     if (this.runtimes.has(to) || this.deps.store.getSession(to) || this.workerMeta(to)) return to;
@@ -468,10 +476,11 @@ export class ChannelManager {
     if (target === from) throw new Error("cannot ask yourself");
     this.checkNotHeld(target);
     const hop = this.checkHop(from);
+    const rounds = wait ? 0 : this.checkRounds(from);
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: target, mode: "ask", request: message });
     const done = wait ? this.waitTask(taskId) : undefined;
-    if (!wait) this.waiters.set(taskId, { resolve: (r) => this.deliverAsyncResult(from, target, taskId, hop, r) });
+    if (!wait) this.waiters.set(taskId, { resolve: (r) => this.deliverAsyncResult(from, target, taskId, { hop: hop - 1, rounds }, r) });
     await this.runtime(target).enqueue({
       origin: { kind: "peer", fromSession: from, hop, mode: "ask", taskId, rootTarget: this.runtimes.get(from)?.rootTarget() },
       item: { text: message, receivedAt: Date.now(), sourceLine: `[Agent message from session ${from} — reply here; your reply is returned to that agent, no human sees it]`, raw: true },
@@ -486,13 +495,14 @@ export class ChannelManager {
 
   private async askRemote(from: string, remote: RemoteAgent, message: string, wait: boolean) {
     const hop = this.checkHop(from);
+    const rounds = wait ? 0 : this.checkRounds(from);
     const taskId = crypto.randomUUID();
     this.deps.store.createTask({ taskId, fromSession: from, toSession: remote.name, mode: "ask", request: message });
     this.deps.store.updateTask(taskId, "working");
     const run = remote.ask({ from, message, hop }).catch((e) => ({ ok: false, text: e instanceof Error ? e.message : String(e) }))
       .then((r) => { this.deps.store.updateTask(taskId, r.ok ? "completed" : "failed", r.text); return r; });
     if (wait) return { taskId, result: await run };
-    void run.then((r) => this.deliverAsyncResult(from, remote.name, taskId, hop, r));
+    void run.then((r) => this.deliverAsyncResult(from, remote.name, taskId, { hop: hop - 1, rounds }, r));
     return { taskId };
   }
 
@@ -853,7 +863,9 @@ export class ChannelManager {
     w?.resolve({ ok, text: text || "(empty reply)" });
   }
 
-  private deliverAsyncResult(asker: string, answerer: string, taskId: string, hop: number, r: { ok: boolean; text: string }) {
+  /** `at.hop` is the asker's own hop when it asked (not the callee's): a result is the answer to the asker's chain,
+   *  not a step deeper, so a chat can keep working with its worker. `at.rounds` bounds result → ask → result … */
+  private deliverAsyncResult(asker: string, answerer: string, taskId: string, at: { hop: number; rounds: number }, r: { ok: boolean; text: string }) {
     // CLI / API callers ("cli", "api") are not sessions: the result stays in the task (task_status).
     if (!this.runtimes.has(asker) && !this.deps.store.getSession(asker)) return;
     if (this.workerMeta(asker) && this.heldBy(asker)) {
@@ -861,9 +873,8 @@ export class ChannelManager {
       this.deps.store.pushPending(asker, "peer-result", { label: `result of your agent_ask ${taskId} to ${answerer}${r.ok ? "" : " (failed)"}`, text: r.text });
       return;
     }
-    // The result turn keeps the ask's hop, so ask → result → ask ping-pong still hits maxHops.
     void this.runtime(asker).enqueue({
-      origin: { kind: "peer", fromSession: answerer, hop, mode: "result", taskId },
+      origin: { kind: "peer", fromSession: answerer, hop: at.hop, rounds: at.rounds, mode: "result", taskId },
       item: { text: r.text, receivedAt: Date.now(), sourceLine: `[Result of your agent_ask ${taskId} to ${answerer}${r.ok ? "" : " (failed)"}]`, raw: true },
       attachments: [],
     }).catch((e) => this.deps.log.error("async result delivery failed", { e: String(e) }));

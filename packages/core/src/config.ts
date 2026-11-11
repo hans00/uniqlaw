@@ -104,6 +104,9 @@ export const settingsSchema = z.object({
   }).prefault({}),
   bus: z.object({
     maxHops: z.number().int().positive().default(4),
+    /** Async agent_ask results that may drive a session in a row (result → ask → result …) before a human
+     *  message resets the count. Results don't deepen the hop, so this is what bounds such rounds. */
+    maxRounds: z.number().int().positive().default(20),
     askTimeoutSec: z.number().int().positive().default(600),
   }).prefault({}),
   /** Worker sessions: other coding agents a session can start in a chosen directory (worker_start). */

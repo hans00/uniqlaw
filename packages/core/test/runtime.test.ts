@@ -170,18 +170,64 @@ describe("ChannelRuntime", () => {
       const next = me === "a" ? "b" : me === "b" ? "c" : "d";
       try { await ctx.mgr!.ask(me, next, "deeper", false); } catch (e) { errors.push(String(e)); }
       s.emit({ type: "turn_end", turnId: s.turnId(), reason: "done" });
-    }, { settings: { bus: { maxHops: 2 } } });
+    }, { settings: { bus: { maxHops: 2, maxRounds: 2 } } });
     ctx.mgr = mgr; ctx.provider = provider;
     for (const k of ["a", "b", "c", "d"]) store.upsertSession({ channelKey: k, profile: "main", provider: "fake", providerSessionId: null, multiparty: false, createdAt: 0, lastActivityAt: 0, lastTarget: null, adapterState: null });
     await mgr.ask("global", "a", "start", false); // hop 1 → a asks b (hop 2) → b asks c (hop 3: rejected)
     await until(() => errors.length >= 1);
     expect(errors[0]).toContain("delegation chain too deep");
-    // a → b (hop 2) is allowed, b → c (hop 3) is not; the async results flowing back
-    // (a gets b's result at hop 2 and asks again → hop 3) must not open a loop either.
-    await Bun.sleep(200);
+    // a → b (hop 2) is allowed, b → c (hop 3) is not. b's results flow back to a at a's own hop (1), and a asks
+    // again on each one: that ping-pong is bounded by maxRounds instead.
+    await until(() => errors.some((e) => e.includes("rounds")));
+    await Bun.sleep(100);
     expect(provider.sessions.has("c")).toBe(false);
     const asks = store.db.query("SELECT COUNT(*) AS n FROM tasks").get() as { n: number };
-    expect(asks.n).toBeLessThanOrEqual(3);
+    expect(asks.n).toBe(3); // start, a → b, a → b after the first result
+  });
+
+  test("async results back at the asking chat keep its hop; a human message resets the round count", async () => {
+    const errors: string[] = [];
+    let asks = 0;
+    const ctx: { mgr?: ChannelManager; provider?: FakeProvider } = {};
+    const { mgr, provider } = setup(async (_i, s) => {
+      const me = [...ctx.provider!.sessions].find(([, v]) => v === s)![0];
+      if (me === "global") {
+        // The chat works with its worker: every turn (human message or a worker result) asks it for the next step.
+        try { await ctx.mgr!.ask("global", "w", "next step", false); asks++; } catch (e) { errors.push(String(e)); }
+      }
+      s.emit({ type: "text", segmentId: "a", final: "ok" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
+    }, { settings: { bus: { maxHops: 2, maxRounds: 3 } } });
+    ctx.mgr = mgr; ctx.provider = provider;
+    store.upsertSession({ channelKey: "w", profile: "main", provider: "fake", providerSessionId: null, multiparty: false, createdAt: 0, lastActivityAt: 0, lastTarget: null, adapterState: null });
+    await mgr.handleInbound(inbound("work with your worker"));
+    await until(() => errors.length === 1);
+    // Three rounds with maxHops 2: before the fix the second result (hop 2) already failed with "too deep".
+    expect(asks).toBe(3);
+    expect(errors[0]).toContain("too many agent_ask rounds without a human message (4 > 3)");
+    await mgr.handleInbound(inbound("keep going"));
+    await until(() => errors.length === 2);
+    expect(asks).toBe(6);
+    expect(errors.some((e) => e.includes("too deep"))).toBe(false);
+  });
+
+  test("real ask loops stay bounded by the hop: a asks b asks a …", async () => {
+    const errors: string[] = [];
+    const ctx: { mgr?: ChannelManager; provider?: FakeProvider } = {};
+    const { mgr, provider } = setup(async (i, s) => {
+      const me = [...ctx.provider!.sessions].find(([, v]) => v === s)![0];
+      if (i.text.includes("[Agent message from session")) {
+        try { await ctx.mgr!.ask(me, me === "a" ? "b" : "a", "ping", false); } catch (e) { errors.push(String(e)); }
+      }
+      s.emit({ type: "text", segmentId: "a", final: "pong" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
+    }, { settings: { bus: { maxHops: 4 } } });
+    ctx.mgr = mgr; ctx.provider = provider;
+    for (const k of ["a", "b"]) store.upsertSession({ channelKey: k, profile: "main", provider: "fake", providerSessionId: null, multiparty: false, createdAt: 0, lastActivityAt: 0, lastTarget: null, adapterState: null });
+    await mgr.ask("global", "a", "ping", false); // hop 1: a → b (2) → a (3) → b (4) → a (5: rejected)
+    await until(() => errors.length >= 1);
+    await Bun.sleep(150);
+    expect(errors).toEqual([expect.stringContaining("delegation chain too deep (hop 5 > 4)")]);
+    const n = store.db.query("SELECT COUNT(*) AS n FROM tasks").get() as { n: number };
+    expect(n.n).toBe(4);
   });
 
   test("notify posts and echoes into the owning session's pending input", async () => {
