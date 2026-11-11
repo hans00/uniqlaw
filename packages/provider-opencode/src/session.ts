@@ -1,11 +1,13 @@
 // One UniQlaw session = one `opencode serve` + one opencode session. Maps raw SSE
 // events onto AgentEvent and tracks turns (busy → first idle; stale idles dropped).
-import type { AgentEvent, AgentSession, Logger, PermissionDecision, ProviderCapabilities, TurnInput, Usage } from "@uniqlaw/core";
+import { dialectOfShell, type AgentEvent, type AgentSession, type Logger, type PermissionDecision, type ProviderCapabilities, type TurnInput, type Usage } from "@uniqlaw/core";
 import { AsyncQueue } from "./queue.ts";
 import type { OpencodeServer, RawEvent } from "./server.ts";
 import { errorCode, parseModel } from "./mapping.ts";
 
 export const OPENCODE_CAPABILITIES: ProviderCapabilities = {
+  // The bash tool runs in $SHELL (opencode's `shell` config can override it), falling back to /bin/bash.
+  shellDialects: { bash: dialectOfShell(process.env.SHELL) === "unknown" ? "bash" : dialectOfShell(process.env.SHELL) },
   streaming: "token",
   interrupt: true,
   steer: true,            // prompt_async while busy → admitted at the next step boundary (M0 S4)

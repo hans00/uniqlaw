@@ -47,6 +47,8 @@ export const profileOptionsSchema = z.object({
 }).passthrough();
 
 export const PI_CAPABILITIES: ProviderCapabilities = {
+  // pi's bash tool: /bin/bash, else bash on PATH, else sh (a custom shellPath is not read here).
+  shellDialects: { bash: "bash" },
   streaming: "token",
   interrupt: true,
   steer: true,

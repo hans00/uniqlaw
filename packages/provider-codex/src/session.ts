@@ -9,6 +9,8 @@ import type { UserInput } from "./protocol/v2/UserInput";
 import type { ReasoningEffort } from "./protocol/ReasoningEffort";
 
 export const CODEX_CAPABILITIES: ProviderCapabilities = {
+  // Commands are argv vectors (often ["bash", "-lc", script]): no outer shell.
+  shellDialects: { bash: "argv" },
   streaming: "token",
   interrupt: true,
   steer: true,

@@ -1,3 +1,4 @@
+import { claudeShellDialects } from "../src/index.ts";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -171,4 +172,13 @@ describe("classify + prompt + mcp + credentials", () => {
     expect(await claudeEnvForCredential({ kind: "provider-login", provider: "claude", home: "/tmp/cc" })).toEqual({ CLAUDE_CONFIG_DIR: "/tmp/cc" });
     await expect(claudeEnvForCredential({ kind: "openai-api-key", key: { env: "X" } })).rejects.toThrow();
   });
+});
+
+test("Claude Code's Bash tool shell: CLAUDE_CODE_SHELL (bash/zsh), else $SHELL (bash/zsh), else zsh if present, else bash; PowerShell tool: pwsh", () => {
+  const has = (b: string) => (b === "zsh" ? "/usr/bin/zsh" : null);
+  expect(claudeShellDialects({ CLAUDE_CODE_SHELL: "/opt/homebrew/bin/bash", SHELL: "/bin/zsh" }, has)).toEqual({ bash: "bash", powershell: "powershell" });
+  expect(claudeShellDialects({ CLAUDE_CODE_SHELL: "/usr/bin/fish", SHELL: "/bin/bash" }, has).bash).toBe("bash");
+  expect(claudeShellDialects({ SHELL: "/usr/bin/fish" }, has).bash).toBe("zsh");
+  expect(claudeShellDialects({ SHELL: "/usr/bin/fish" }, () => null).bash).toBe("bash");
+  expect(claudeShellDialects({ SHELL: "/bin/zsh" }, () => null).bash).toBe("zsh");
 });
