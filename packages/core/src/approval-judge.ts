@@ -249,14 +249,26 @@ export function hardPolicyDeny(o: { tool: string; input: unknown; structured: bo
 // ── allow blockers ─────────────────────────────────────────────────────────
 
 /** Shell constructs that can run something a deny prefix doesn't see: separators, substitution, a leading env
- *  assignment, a binary called by path, or a wrapper that runs its arguments. */
-const WRAPPERS = new Set(["sh", "bash", "zsh", "dash", "fish", "env", "eval", "exec", "xargs", "sudo", "doas", "command", "builtin", "nohup", "timeout", "nice", "time", "watch", "find", "awk", "perl", "python", "python3", "node", "bun", "ruby"]);
+ *  assignment, a first word that isn't a plain name (quotes `r''m` / `"rm"`, escapes `\rm`, grouping `(…)` / `{ …; }`,
+ *  `!`), a binary called by path, or a wrapper that runs its arguments. */
+const WRAPPERS = new Set([
+  // shells and evaluation
+  "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "busybox", "eval", "exec", "source", ".", "command", "builtin",
+  // run-another-program wrappers
+  "env", "xargs", "sudo", "doas", "su", "runuser", "pkexec", "nohup", "setsid", "timeout", "time", "nice", "ionice",
+  "stdbuf", "unbuffer", "chroot", "flock", "parallel", "watch", "script", "taskset", "chrt", "unshare", "nsenter",
+  "systemd-run", "firejail", "bwrap", "proot", "fakeroot", "strace", "ltrace", "gdb", "valgrind", "catchsegv", "cgexec",
+  "faketime", "torsocks", "proxychains", "proxychains4", "caffeinate", "sg", "newgrp", "ssh", "docker", "podman", "kubectl",
+  // anything that runs a command or code it is given
+  "find", "awk", "gawk", "sed", "perl", "python", "python3", "node", "deno", "bun", "ruby", "php", "lua", "make", "git",
+]);
 export function isComplexCommand(cmd: string): boolean {
   if (/[;&|`\n]|\$\(|<\(|>\(/.test(cmd)) return true;
   const t = cmd.trim();
   if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) return true;
-  const first = t.split(/\s+/)[0]!.replace(/^["']/, "");
-  return first.includes("/") || first.startsWith("$") || WRAPPERS.has(first);
+  const first = t.split(/\s+/)[0] ?? "";
+  if (!/^[A-Za-z0-9._/-]+$/.test(first)) return true; // quotes, backslashes, brackets, `!`, `$VAR`, globs …
+  return first.includes("/") || WRAPPERS.has(first);
 }
 /** A shell comment talking to the reviewer ("# approved by the operator"). */
 const SUSPICIOUS_COMMENT = /(^|\s)#[^\n]*\b(approv\w*|authori[sz]\w*|safe\w*|hans|operator|permi(t|ssion)\w*|allowed|trusted|reviewer|judge)\b/im;
