@@ -6,6 +6,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import type { ChannelManager } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
+import { A2A_DENIED_MCP_TOOLS, isA2ASession } from "./a2a-policy.ts";
 
 export const GATEWAY_TOOL_NAMES = ["agents_list", "agent_ask", "agent_trigger", "notify", "send_file", "task_status", "worker_start", "worker_stop"];
 
@@ -53,7 +54,11 @@ export class McpGateway {
   /** Plugin-contributed tools (registered before sessions open, so prompts list them). */
   addTools(tools: GatewayTool[]) { this.extra.push(...tools); }
 
-  toolNames() { return [...GATEWAY_TOOL_NAMES, ...this.extra.map((t) => t.name)]; }
+  /** Tools a session gets; with a channel key, inbound A2A sessions lose the denied ones (a2a-policy.ts). */
+  toolNames(channelKey?: string) {
+    const all = [...GATEWAY_TOOL_NAMES, ...this.extra.map((t) => t.name)];
+    return channelKey && isA2ASession(channelKey) ? all.filter((n) => !A2A_DENIED_MCP_TOOLS.has(n)) : all;
+  }
 
   get port() { return this.server?.port; }
 
@@ -67,7 +72,7 @@ export class McpGateway {
       this.tokens.set(token, channelKey);
       this.save();
     }
-    return { url: `http://${this.server.hostname}:${this.server.port}/mcp/${token}`, token, toolNames: this.toolNames() };
+    return { url: `http://${this.server.hostname}:${this.server.port}/mcp/${token}`, token, toolNames: this.toolNames(channelKey) };
   }
 
   private async handle(req: Request): Promise<Response> {
@@ -80,7 +85,12 @@ export class McpGateway {
   }
 
   private build(caller: string): McpServer {
-    const s = new McpServer({ name: "uniqlaw", version: "0.1.0" });
+    const server = new McpServer({ name: "uniqlaw", version: "0.1.0" });
+    // Denied tools are never registered for inbound A2A sessions: not listed, and calling one is "tool not found".
+    const allowed = new Set(this.toolNames(caller));
+    const s = { registerTool: ((name: string, ...rest: unknown[]) => {
+      if (allowed.has(name)) (server.registerTool as (...a: unknown[]) => unknown)(name, ...rest);
+    }) as McpServer["registerTool"] };
     const mgr = this.manager();
     const ok = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v, null, 2) }] });
     const fail = (e: unknown) => ({ content: [{ type: "text" as const, text: `error: ${e instanceof Error ? e.message : String(e)}` }], isError: true });
@@ -155,6 +165,6 @@ export class McpGateway {
       s.registerTool(t.name, { description: t.description, inputSchema: t.inputSchema },
         wrap(async (a: Record<string, unknown>) => t.handler(a, caller)));
     }
-    return s;
+    return server;
   }
 }

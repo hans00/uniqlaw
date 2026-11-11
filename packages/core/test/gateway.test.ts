@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ChannelManager, McpGateway, StateStore, parseSettings, silentLogger, type Profile } from "../src/index.ts";
+import { A2A_DENIED_MCP_TOOLS, ChannelManager, McpGateway, StateStore, parseSettings, silentLogger, type Profile } from "../src/index.ts";
 import { FakePlatform, FakeProvider } from "./fakes.ts";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -69,3 +69,24 @@ test("task_status is only visible to the two sessions involved", async () => {
   const r = await outsider.callTool({ name: "task_status", arguments: { taskId } });
   expect(text(r)).toContain("unknown task");
 });
+
+test("inbound A2A sessions don't get bash/cron/worker/xsession/notify/memory tools from the gateway", async () => {
+  const { gw } = setup();
+  gw.addTools([{ name: "memory_search", description: "m", inputSchema: {}, handler: async () => "MEMORY" },
+    { name: "cron_save", description: "c", inputSchema: {}, handler: async () => "saved" },
+    { name: "harmless", description: "h", inputSchema: {}, handler: async () => "fine" }]);
+  const ep = gw.endpointFor("a2a:main:alice:ctx")!;
+  expect(ep.toolNames).toEqual(["harmless"]);
+  const a = await client(ep.url);
+  expect((await a.listTools()).tools.map((t) => t.name)).toEqual(["harmless"]);
+  for (const name of ["notify", "send_file", "agent_ask", "agent_trigger", "agents_list", "task_status", "worker_start", "cron_save", "memory_search"]) {
+    const r = await a.callTool({ name, arguments: {} }) as { isError?: boolean; content: { text: string }[] };
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toContain("not found");
+  }
+  expect(text(await a.callTool({ name: "harmless", arguments: {} }))).toBe("fine");
+  // Chats still get everything.
+  expect(gw.endpointFor("tg:-1")!.toolNames).toContain("cron_save");
+  for (const n of core_denied) expect(A2A_DENIED_MCP_TOOLS.has(n)).toBe(true);
+});
+const core_denied = ["notify", "send_file", "agent_ask", "agent_trigger", "agents_list", "task_status", "worker_start", "worker_stop", "cron_list", "cron_save", "cron_delete", "memory_write", "memory_search", "memory_get"];

@@ -72,8 +72,9 @@ export interface RemoteAgent {
 }
 
 export interface TransportApi {
-  /** Run an inbound request from a remote agent against a local profile. Resolves with the answer. */
-  runInbound(o: { profile: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }>;
+  /** Run an inbound request from a remote agent against a local profile. Resolves with the answer.
+   *  `caller` is the authenticated identity (token name, or "anonymous"); `remote` is a display label. */
+  runInbound(o: { profile: string; caller: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }>;
   /** Profiles that may be exposed (name + provider). */
   profiles(): { name: string; provider: string }[];
   maxHops: number;

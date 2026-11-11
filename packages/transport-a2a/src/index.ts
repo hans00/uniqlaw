@@ -28,8 +28,9 @@ export const a2aConfigSchema = z.object({
   /** Profiles exposed as A2A agents (only these get an Agent Card). */
   expose: z.record(z.string(), z.object({ description: z.string().default(""), name: z.string().optional(), skills: z.array(skill).default([]) })).prefault({}),
   auth: z.object({
-    /** Accepted bearer tokens; the caller is identified as `token#<index>` (or the entry's name). */
-    bearerTokens: z.array(z.union([secretRef, z.object({ name: z.string(), token: secretRef })])).default([]),
+    /** Accepted bearer tokens; the caller is identified as `token#<index>` (or the entry's name). A named entry
+     *  may list the exposed profiles it can use (`profiles`, default all); any other profile answers 403. */
+    bearerTokens: z.array(z.union([secretRef, z.object({ name: z.string(), token: secretRef, profiles: z.array(z.string()).optional() })])).default([]),
   }).prefault({}),
   remotes: z.record(z.string(), z.object({
     url: z.string().url(), bearer: secretRef.optional(), description: z.string().optional(),
@@ -67,11 +68,12 @@ class UniqlawExecutor implements AgentExecutor {
 
     const meta = { ...(ctx.request.metadata ?? {}), ...(ctx.userMessage.metadata ?? {}) } as Record<string, unknown>;
     const hop = Number(meta["uniqlaw.hop"] ?? 1) || 1;
-    const user = ctx.context.user;
-    const remote = user?.isAuthenticated ? user.userName : `anonymous${meta["uniqlaw.from"] ? `(${String(meta["uniqlaw.from"])})` : ""}`;
+    // The session key uses `caller` (authenticated identity only); `uniqlaw.from` is caller-claimed, so it is a label.
+    const caller = callerOf(ctx.context);
+    const remote = caller !== ANONYMOUS ? caller : `anonymous${meta["uniqlaw.from"] ? `(${String(meta["uniqlaw.from"])})` : ""}`;
     let r: { ok: boolean; text: string };
     try {
-      r = await this.api().runInbound({ profile: this.profile, remote, contextId, taskId, text: partsText(ctx.userMessage.parts as AnyPart[]), hop });
+      r = await this.api().runInbound({ profile: this.profile, caller, remote, contextId, taskId, text: partsText(ctx.userMessage.parts as AnyPart[]), hop });
     } catch (e) {
       r = { ok: false, text: e instanceof Error ? e.message : String(e) };
     }
@@ -98,6 +100,11 @@ class UniqlawExecutor implements AgentExecutor {
 function agentMessage(text: string, contextId: string, taskId: string) {
   return { messageId: crypto.randomUUID(), contextId, taskId, role: ROLE_AGENT, parts: [textPart(text)], metadata: undefined, extensions: [], referenceTaskIds: [] };
 }
+
+const ANONYMOUS = "anonymous";
+/** Authenticated caller of a request: the token's name, or "anonymous" when the server runs without tokens. */
+const callerOf = (context: { user?: { isAuthenticated?: boolean; userName?: string } }) =>
+  context.user?.isAuthenticated && context.user.userName ? context.user.userName : ANONYMOUS;
 
 interface Exposed { profile: string; card: Record<string, unknown>; rpc: JsonRpcTransportHandler; handler: DefaultRequestHandler }
 type Binding = "JSONRPC" | "HTTP+JSON" | "GRPC";
@@ -191,7 +198,7 @@ export class A2ATransport implements Transport {
   private grpc?: { port: number; stop: () => void };
   private api?: TransportApi;
   private exposed = new Map<string, Exposed>();
-  private tokens: { name: string; token: string }[] = [];
+  private tokens: { name: string; token: string; profiles?: string[] }[] = [];
   private remotes: A2ARemote[];
   constructor(private cfg: A2AConfig, private log: Logger) {
     this.remotes = Object.entries(cfg.remotes).map(([n, r]) => new A2ARemote(n, r, log.child(`remote:${n}`)));
@@ -212,18 +219,22 @@ export class A2ATransport implements Transport {
   async start(api: TransportApi) {
     this.api = api;
     this.tokens = await Promise.all(this.cfg.auth.bearerTokens.map(async (t, i) =>
-      "token" in t ? { name: t.name, token: await resolveSecret(t.token as SecretRef) } : { name: `token#${i}`, token: await resolveSecret(t as SecretRef) }));
+      "token" in t ? { name: t.name, token: await resolveSecret(t.token as SecretRef), ...(t.profiles ? { profiles: t.profiles } : {}) }
+        : { name: `token#${i}`, token: await resolveSecret(t as SecretRef) }));
     if (!this.tokens.length && !isLoopback(this.cfg.host) && Object.keys(this.cfg.expose).length) {
       throw new Error("a2a: auth.bearerTokens is required when exposing profiles on a non-loopback host");
     }
     const known = new Set(api.profiles().map((p) => p.name));
     for (const name of Object.keys(this.cfg.expose)) if (!known.has(name)) throw new Error(`a2a.expose: unknown profile "${name}"`);
+    for (const t of this.tokens) for (const p of t.profiles ?? []) {
+      if (!this.cfg.expose[p]) throw new Error(`a2a.auth.bearerTokens "${t.name}": profile "${p}" is not exposed`);
+    }
 
     this.server = Bun.serve({ hostname: this.cfg.host, port: this.cfg.port, idleTimeout: 255, fetch: (req) => this.handle(req) });
     const grpcProfiles = new Map<string, { handler: DefaultRequestHandler; card: unknown }>();
     if (this.cfg.transports.includes("GRPC") && Object.keys(this.cfg.expose).length) {
       this.grpc = await startGrpcServer({ host: this.cfg.host, port: this.cfg.grpcPort, profiles: grpcProfiles,
-        auth: { check: (a) => this.checkBearer(a) } });
+        auth: { check: (a) => this.checkBearer(a), mayUse: (name, profile) => this.mayUse(name, profile) } });
     }
     for (const [profile, e] of Object.entries(this.cfg.expose)) {
       const card = {
@@ -236,7 +247,9 @@ export class A2ATransport implements Transport {
         skills: e.skills.map((s) => ({ ...s, inputModes: ["text/plain"], outputModes: ["text/plain"], securityRequirements: [] })),
         signatures: [],
       };
-      const handler = new DefaultRequestHandler(card as never, new InMemoryTaskStore(), new UniqlawExecutor(profile, () => this.api!, this.log.child(profile)));
+      // Tasks are stored per caller: GetTask / CancelTask / SubscribeToTask (and continuing a task by id) from another
+      // caller find nothing, so they answer "task not found" and task ids don't leak.
+      const handler = new DefaultRequestHandler(card as never, new InMemoryTaskStore(callerOf), new UniqlawExecutor(profile, () => this.api!, this.log.child(profile)));
       this.exposed.set(profile, { profile, card, handler, rpc: new JsonRpcTransportHandler(handler) });
       grpcProfiles.set(profile, { handler, card });
     }
@@ -262,6 +275,19 @@ export class A2ATransport implements Transport {
 
   private auth(req: Request): { ok: boolean; name?: string } { return this.checkBearer(req.headers.get("authorization")); }
 
+  /** Whether an authenticated token may use an exposed profile (named tokens can be limited with `profiles`). */
+  private mayUse(name: string | undefined, profile: string): boolean {
+    const t = name ? this.tokens.find((x) => x.name === name) : undefined;
+    return !t?.profiles || t.profiles.includes(profile);
+  }
+
+  /** 401 for missing/invalid credentials, 403 for a valid token that may not use this profile; undefined = allowed. */
+  private deny(who: { ok: boolean; name?: string }, profile: string): Response | undefined {
+    if (!who.ok) return new Response("unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+    if (!this.mayUse(who.name, profile)) return new Response("forbidden", { status: 403 });
+    return undefined;
+  }
+
   private context(req: Request, who: { name?: string }) {
     return defaultServerCallContextBuilder({
       extensions: undefined,
@@ -285,14 +311,16 @@ export class A2ATransport implements Transport {
       const ex = this.exposed.get(parts[0]!);
       if (!ex) return new Response("not found", { status: 404 });
       const who = this.auth(req);
-      if (!who.ok) return new Response("unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+      const denied = this.deny(who, ex.profile);
+      if (denied) return denied;
       const sub = url.pathname.slice(url.pathname.indexOf("/rest") + "/rest".length) || "/";
       return handleRest(ex.handler, ex.card, sub, req, this.context(req, who));
     }
     const e = parts.length === 1 && req.method === "POST" && this.cfg.transports.includes("JSONRPC") ? this.exposed.get(parts[0]!) : undefined;
     if (!e) return new Response("not found", { status: 404 });
     const who = this.auth(req);
-    if (!who.ok) return new Response("unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+    const denied = this.deny(who, e.profile);
+    if (denied) return denied;
 
     let body: Record<string, unknown>;
     try { body = (await req.json()) as Record<string, unknown>; }

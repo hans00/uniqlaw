@@ -8,22 +8,27 @@ import type { A2ARequestHandler } from "@a2a-js/sdk/server";
 export interface GrpcAuth {
   /** Returns the caller name for a valid bearer token, undefined if invalid; tokens empty = open. */
   check(authorization: string | undefined): { ok: boolean; name?: string };
+  /** Whether the authenticated caller may use a profile; false → PERMISSION_DENIED. */
+  mayUse(name: string | undefined, profile: string): boolean;
 }
 
 type Handlers = Map<string, { handler: DefaultRequestHandler; card: unknown }>;
 
+type CallContext = { user?: { isAuthenticated?: boolean; userName?: string } };
+
 /** Routes every A2A call to the profile named by `params.tenant`. */
-function routingHandler(profiles: Handlers): A2ARequestHandler {
-  const pick = (tenant: string | undefined) => {
+function routingHandler(profiles: Handlers, auth: GrpcAuth, forbidden: () => Error): A2ARequestHandler {
+  const pick = (tenant: string | undefined, ctx: CallContext | undefined) => {
     const name = tenant || (profiles.size === 1 ? [...profiles.keys()][0] : undefined);
     const p = name ? profiles.get(name) : undefined;
     if (!p) throw new Error(`unknown A2A tenant "${tenant ?? ""}" (expected one of: ${[...profiles.keys()].join(", ")})`);
+    if (!auth.mayUse(ctx?.user?.isAuthenticated ? ctx.user.userName : undefined, name!)) throw forbidden();
     return p.handler;
   };
   const first = () => [...profiles.values()][0]!;
   // Every request message carries `tenant`; route on it.
   const route = <K extends keyof A2ARequestHandler>(k: K) =>
-    ((params: { tenant?: string }, ctx: unknown) => (pick(params?.tenant)[k] as (...a: unknown[]) => unknown)(params, ctx)) as unknown as A2ARequestHandler[K];
+    ((params: { tenant?: string }, ctx: CallContext) => (pick(params?.tenant, ctx)[k] as (...a: unknown[]) => unknown)(params, ctx)) as unknown as A2ARequestHandler[K];
   return {
     getAgentCard: () => first().handler.getAgentCard(),
     getAuthenticatedExtendedAgentCard: route("getAuthenticatedExtendedAgentCard"),
@@ -43,9 +48,11 @@ function routingHandler(profiles: Handlers): A2ARequestHandler {
 export async function startGrpcServer(o: { host: string; port: number; profiles: Handlers; auth: GrpcAuth }): Promise<{ port: number; stop: () => void }> {
   const grpc = await import("@grpc/grpc-js");
   const { grpcService, A2AService } = await import("@a2a-js/sdk/server/grpc");
+  const { GrpcUnsupportedOperationError, GRPC_STATUS_CODE } = await import("@a2a-js/sdk/errors/grpc");
+  const forbidden = () => new GrpcUnsupportedOperationError({ message: "forbidden: this token may not use that profile", status: GRPC_STATUS_CODE.PERMISSION_DENIED });
   const server = new grpc.Server();
   server.addService(A2AService, grpcService({
-    requestHandler: routingHandler(o.profiles),
+    requestHandler: routingHandler(o.profiles, o.auth, forbidden),
     userBuilder: async (call) => {
       const raw = call.metadata.get("authorization")[0];
       const r = o.auth.check(raw === undefined ? undefined : String(raw));

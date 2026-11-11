@@ -7,6 +7,7 @@ import type { Origin } from "./origin.ts";
 import type { GroupMode } from "./config.ts";
 import { ChannelRuntime, type RuntimeHost } from "./runtime.ts";
 import { PairingService } from "./pairing.ts";
+import { a2aPermissions, a2aSessionKey, isA2ASession } from "./a2a-policy.ts";
 import { formatTimestamp, renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
@@ -133,7 +134,8 @@ export class ChannelManager {
       ?? this.deps.settings.bindings.channels[channelKey] ?? this.deps.settings.bindings.default;
     const p = this.deps.profiles.get(name);
     if (!p) throw new Error(`channel ${channelKey} is bound to unknown profile "${name}"`);
-    return p;
+    // A remote caller drives inbound A2A sessions: deny-by-default whatever the profile allows (a2a-policy.ts).
+    return isA2ASession(channelKey) ? { ...p, permissions: a2aPermissions(p.permissions) } : p;
   }
 
   runtime(channelKey: string, multiparty = false): ChannelRuntime {
@@ -496,11 +498,13 @@ export class ChannelManager {
     return { taskId };
   }
 
-  /** Inbound request from a remote agent (A2A) against a local profile. */
-  async runInbound(o: { profile: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }> {
+  /** Inbound request from a remote agent (A2A) against a local profile. The session is keyed by the
+   *  authenticated caller as well as the contextId: the caller chooses the contextId, so a contextId alone
+   *  would let one peer join another peer's conversation. */
+  async runInbound(o: { profile: string; caller: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }> {
     if (!this.deps.profiles.has(o.profile)) return { ok: false, text: `unknown profile "${o.profile}"` };
     if (o.hop > this.deps.settings.bus.maxHops) return { ok: false, text: "delegation chain too deep" };
-    const key = `a2a:${o.profile}:${o.contextId}`;
+    const key = a2aSessionKey(o.profile, o.caller, o.contextId);
     this.profileOverride.set(key, o.profile);
     this.deps.store.createTask({ taskId: o.taskId, fromSession: `a2a:${o.remote}`, toSession: key, mode: "ask", request: o.text });
     const done = this.waitTask(o.taskId);
