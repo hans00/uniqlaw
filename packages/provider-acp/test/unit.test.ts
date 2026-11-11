@@ -35,6 +35,9 @@ describe("mapping", () => {
     expect(pickOption(opts, { behavior: "allow", scope: "session" })).toBe("a2");
     expect(pickOption(opts, { behavior: "deny" })).toBe("r1");
     expect(pickOption([{ optionId: "x", name: "Nope", kind: "reject_always" }], { behavior: "deny" })).toBe("x");
+    // scope "once" (approval-judge allow): only allow_once, never a fallback to allow_always.
+    expect(pickOption(opts, { behavior: "allow", scope: "once" })).toBe("a1");
+    expect(pickOption([{ optionId: "aa", name: "Always", kind: "allow_always" }], { behavior: "allow", scope: "once" })).toBeUndefined();
   });
   test("stop reasons, error codes, elicitation content", () => {
     expect(stopReasonToEnd("cancelled")).toEqual({ reason: "interrupted" });
