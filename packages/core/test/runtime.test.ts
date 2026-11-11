@@ -210,6 +210,50 @@ describe("ChannelRuntime", () => {
     expect(errors.some((e) => e.includes("too deep"))).toBe(false);
   });
 
+  test("fan-out on every result is bounded by the chain budget; a human message starts a new chain", async () => {
+    const errors: string[] = [];
+    const ctx: { mgr?: ChannelManager; provider?: FakeProvider } = {};
+    const { mgr, provider } = setup(async (_i, s) => {
+      const me = [...ctx.provider!.sessions].find(([, v]) => v === s)![0];
+      if (me === "global") {
+        // A runaway agent: every turn (human message or result) fans out to two workers.
+        for (const w of ["w1", "w2"]) {
+          try { await ctx.mgr!.ask("global", w, "more", false); } catch (e) { errors.push(String(e)); }
+        }
+      }
+      s.emit({ type: "text", segmentId: "a", final: "ok" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
+    }, { settings: { bus: { maxChainTasks: 10 } } });
+    ctx.mgr = mgr; ctx.provider = provider;
+    for (const k of ["w1", "w2"]) store.upsertSession({ channelKey: k, profile: "main", provider: "fake", providerSessionId: null, multiparty: false, createdAt: 0, lastActivityAt: 0, lastTarget: null, adapterState: null });
+    const tasks = () => (store.db.query("SELECT COUNT(*) AS n FROM tasks").get() as { n: number }).n;
+    await mgr.handleInbound(inbound("go"));
+    await until(() => errors.some((e) => e.includes("delegation budget used up")));
+    await Bun.sleep(150);
+    expect(tasks()).toBe(10); // 2^rounds without the budget (maxRounds alone allows 2^20)
+    expect(errors.every((e) => e.includes("delegation budget used up"))).toBe(true);
+    await mgr.handleInbound(inbound("go again", "100", "global", { ref: { platform: "tg", chatId: "100", messageId: "m2" } }));
+    await until(() => tasks() === 20);
+    await Bun.sleep(150);
+    expect(tasks()).toBe(20);
+  });
+
+  test("bus.maxPending caps outstanding async asks per session", async () => {
+    const gate: { release: (() => void)[] } = { release: [] };
+    const { mgr } = setup(async (_i, s) => {
+      await new Promise<void>((r) => gate.release.push(r));
+      s.emit({ type: "text", segmentId: "a", final: "done" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
+    }, { settings: { bus: { maxPending: 2 } } });
+    store.upsertSession({ channelKey: "w", profile: "main", provider: "fake", providerSessionId: null, multiparty: false, createdAt: 0, lastActivityAt: 0, lastTarget: null, adapterState: null });
+    const a = await mgr.ask("cli", "w", "one", false);
+    await mgr.ask("cli", "w", "two", false);
+    await expect(mgr.ask("cli", "w", "three", false)).rejects.toThrow("too many outstanding async tasks (2, max 2)");
+    await expect(mgr.trigger("cli", "w", "four", { platform: "tg", chatId: "1" })).rejects.toThrow("too many outstanding");
+    await until(() => gate.release.length === 1);
+    gate.release.shift()!();
+    await until(() => mgr.taskStatus(a.taskId)?.state === "completed");
+    await mgr.ask("cli", "w", "three again", false); // a slot is free again
+  });
+
   test("real ask loops stay bounded by the hop: a asks b asks a …", async () => {
     const errors: string[] = [];
     const ctx: { mgr?: ChannelManager; provider?: FakeProvider } = {};

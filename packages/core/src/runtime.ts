@@ -160,6 +160,15 @@ export class ChannelRuntime {
     return h;
   }
 
+  /** Delegation chain the current turn works for (bus.maxChainTasks budget): the latest human message in the turn
+   *  starts its own; otherwise the chain a peer input carried; otherwise one for this turn. */
+  currentChain(): string {
+    const os = this.currentOrigins;
+    for (const o of [...os].reverse()) if (o.kind === "human") return `human:${this.channelKey}:${o.ref.messageId}:${o.ref.chatId}`;
+    for (const o of os) if (o.kind === "peer" && o.chain) return o.chain;
+    return `turn:${this.channelKey}:${this.turn?.startedAt ?? Date.now()}`;
+  }
+
   /** Async results in a row that drove this session since the last human message (0 with a human in the turn). */
   currentRounds(): number {
     if (this.currentOrigins.some((o) => o.kind === "human")) return 0;

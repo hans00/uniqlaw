@@ -107,6 +107,11 @@ export const settingsSchema = z.object({
     /** Async agent_ask results that may drive a session in a row (result → ask → result …) before a human
      *  message resets the count. Results don't deepen the hop, so this is what bounds such rounds. */
     maxRounds: z.number().int().positive().default(20),
+    /** Async agent_ask / agent_trigger / worker_start tasks one session may have outstanding at once (bounds fan-out). */
+    maxPending: z.number().int().positive().default(8),
+    /** agent_ask / agent_trigger / worker_start calls (waiting or not) one delegation chain may make in total, across
+     *  every session it reaches. A chain starts with a human message (or a turn no human started). */
+    maxChainTasks: z.number().int().positive().default(50),
     askTimeoutSec: z.number().int().positive().default(600),
   }).prefault({}),
   /** Worker sessions: other coding agents a session can start in a chosen directory (worker_start). */

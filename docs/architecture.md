@@ -366,6 +366,14 @@ The contract tests must include "two sessions with MCP attached at the same time
   with its worker for many rounds. Nested asks (A asks B asks A …) still deepen the hop and stop at `maxHops`.
 - Result → ask → result rounds are bounded separately: each result carries `rounds` (results in a row since the last
   human message), and an async ask that would bring back more than `bus.maxRounds` (default 20) is refused.
+- Fan-out is bounded too, since rounds and hops only bound depth (a turn that fires two asks on every result would
+  otherwise reach 2^maxRounds turns):
+  - `bus.maxPending` (default 8): async `agent_ask` / `agent_trigger` / `worker_start` tasks one session may have
+    outstanding; the next one is refused until a result comes back. Waiting asks don't count.
+  - `bus.maxChainTasks` (default 50): every delegation call (waiting or not) is charged to a chain, across all the
+    sessions it reaches. A human message starts a chain; peer inputs and results carry it; a turn with neither (cron,
+    heartbeat, A2A) starts its own. Once used up, further calls in that chain are refused.
+  - The counters live in memory: a daemon restart resets them.
 The system prompt of an `origin=peer` turn injects "reply once and stop".
 
 ### 8.4 Output routing (decided by core based on origin)
