@@ -9,6 +9,11 @@ import type { StateStore } from "./state.ts";
 import type { RuntimeEvent, TranscriptKind, TranscriptStore } from "./transcript.ts";
 import { ModelRouter, agenticSchema } from "./model-router.ts";
 import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
+import { isA2ASession } from "./a2a-policy.ts";
+import {
+  buildJudgeInput, decideOutcome, hardPolicyDeny, inputHash, judgeNote, runJudge, thresholdFor,
+  type ApprovalAuditRecord, type ApprovalDecisionRecord, type ApprovalJudge, type JudgeResult, type SessionKind,
+} from "./approval-judge.ts";
 import {
   extractReactions, formatPendingForPrompt, formatToolStatus, isPassthroughSlashCommand, isSilentReplyText,
   mergeQueued, stripSilentToken, type PendingNote, type PromptItem,
@@ -74,6 +79,11 @@ export interface RuntimeHost {
   deferInput?(channelKey: string, input: QueuedInput): boolean;
   /** Replayed inputs left the queue for good (a turn started with them, or they were dropped). */
   releaseDeferred?(ids: number[]): void;
+  /** The approval judge of a profile with `permissions.approval.judge` (docs §10.4); undefined = it could not be
+   *  built (unknown provider…): requests then go to the operator. */
+  approvalJudge?(profile: Profile): ApprovalJudge | undefined;
+  /** Approval audit log (`<stateDir>/approvals/YYYY-MM.jsonl`). */
+  approvalAudit?: { append(rec: ApprovalAuditRecord | ApprovalDecisionRecord): void };
   /** Optional: bounded transcript for UIs. */
   transcript?: TranscriptStore;
   /** Optional: live runtime events (dashboard SSE). */
@@ -1041,10 +1051,25 @@ export class ChannelRuntime {
     const mode = this.profile.permissions.approval.mode;
     if (mode === "auto-allow") return s.respondPermission(ev.id, { behavior: "allow" }, 1);
     if (mode === "auto-deny") return this.deny(s, ev, "auto-deny policy");
+    const judged = await this.judgeStage(ev);
+    if (judged?.outcome.action === "allow") {
+      this.record("permission", `${ev.tool}: allow (${judged.note})`, { decision: "allow", by: "judge", pSafe: judged.pSafe });
+      // Provider-native options: the plain "Yes"/"Allow", never an "always"/"don't ask again" one.
+      const once = ev.options?.findIndex((o) => /^(yes|allow)\b/i.test(o.trim()) && !/always|don't ask|do not ask|allow all|session/i.test(o));
+      return s.respondPermission(ev.id, { behavior: "allow", scope: "once" }, once !== undefined && once >= 0 ? once + 1 : undefined);
+    }
+    if (judged?.outcome.action === "deny") {
+      this.record("permission", `${ev.tool}: deny (${judged.outcome.rule})`, { decision: "deny", by: "policy" });
+      return this.deny(s, ev, `blocked by policy: ${judged.outcome.rule}`);
+    }
+    const decided = (humanDecision: ApprovalDecisionRecord["humanDecision"]) => {
+      if (judged?.audit) this.audit({ id: judged.id, humanDecision, decidedAt: new Date().toISOString() });
+    };
     const target = this.approvalTarget();
     const platform = target && this.host.platform(target.platform);
     if (!target || !platform?.askChoice) {
       this.log.warn("no approval route; denying", { tool: ev.tool });
+      decided("no-route");
       return this.deny(s, ev, "no approver available");
     }
     const options = ev.options?.length ? ev.options : ["Allow", "Deny"];
@@ -1052,22 +1077,90 @@ export class ChannelRuntime {
     // strip rule lines / tips and show it once.
     const detail = cleanDialogText(typeof ev.input === "string" ? ev.input : JSON.stringify(ev.input, null, 2));
     const title = cleanDialogText(ev.title || "Permission request").split("\n")[0]!.slice(0, 120);
-    const body = [`**${this.channelKey}** wants to run **${ev.tool}**`, "```", truncate(detail, 1200), "```"].join("\n");
+    const body = [...(judged?.note ? [`🤖 ${judged.note}`] : []), `**${this.channelKey}** wants to run **${ev.tool}**`, "```", truncate(detail, 1200), "```"].join("\n");
     const choice = await platform.askChoice({ platform: target.platform, chatId: target.chatId, threadId: target.threadId }, {
       title, body, options, approverIds: [],
       timeoutMs: this.profile.permissions.approval.timeoutSec * 1000,
     }).catch(() => null);
-    if (choice === null) return this.deny(s, ev, "approval timed out");
+    if (choice === null) { decided("timeout"); return this.deny(s, ev, "approval timed out"); }
+    const judgeMeta = judged ? { by: "operator", ...(judged.pSafe !== undefined ? { pSafe: judged.pSafe } : {}) } : {};
     if (ev.options?.length) {
       // Provider-native option list: deny iff the chosen label reads like a refusal.
       const label = options[choice] ?? "";
       const isDeny = /^(no|deny|cancel|reject)/i.test(label.trim());
       if (isDeny && this.turn) this.turn.denied = true;
-      this.record("permission", `${ev.tool}: ${label}`, { decision: isDeny ? "deny" : "allow" });
+      decided(isDeny ? "deny" : "allow");
+      this.record("permission", `${ev.tool}: ${label}`, { decision: isDeny ? "deny" : "allow", ...judgeMeta });
       return s.respondPermission(ev.id, isDeny ? { behavior: "deny" } : { behavior: "allow" }, choice + 1);
     }
-    this.record("permission", `${ev.tool}: ${choice === 0 ? "allow" : "deny"}`, { decision: choice === 0 ? "allow" : "deny" });
+    decided(choice === 0 ? "allow" : "deny");
+    this.record("permission", `${ev.tool}: ${choice === 0 ? "allow" : "deny"}`, { decision: choice === 0 ? "allow" : "deny", ...judgeMeta });
     return choice === 0 ? s.respondPermission(ev.id, { behavior: "allow" }, 1) : this.deny(s, ev, "denied by operator");
+  }
+
+  /** Who drives this request: decides the judge's allow threshold. Strictest kind wins (a2a > worker > chat with a
+   *  trusted human > cron > peer, untrusted humans and anything else). */
+  sessionKind(): SessionKind {
+    const origins = this.turn?.origins ?? [];
+    if (isA2ASession(this.channelKey) || origins.some((o) => o.kind === "a2a")) return "a2a";
+    if (this.channelKey.startsWith("worker:")) return "worker";
+    if (this.lastHumanOrigin()?.trusted) return "chat";
+    if (origins.some((o) => o.kind === "scheduler") || (!origins.length && this.host.isInternal?.(this.channelKey))) return "cron";
+    return "peer";
+  }
+
+  /** The newest message of a trusted human this turn carries, as they wrote it (never peer, cron or A2A text). */
+  private trustedHumanText(): string | undefined {
+    for (const q of [...(this.turn?.inputs ?? [])].reverse()) {
+      if (q.origin.kind === "human" && q.origin.trusted && !q.item.raw) return q.item.text;
+    }
+    return undefined;
+  }
+
+  /** Judge stage (docs §10.4): hard policy, then the judge. undefined = no judge configured (mode off). */
+  private async judgeStage(ev: Extract<AgentEvent, { type: "permission_request" }>): Promise<{
+    id: string; outcome: ReturnType<typeof decideOutcome>["outcome"]; pSafe?: number; note?: string; audit: boolean;
+  } | undefined> {
+    const policy = this.profile.permissions;
+    const cfg = policy.approval.judge;
+    if (!cfg || cfg.mode === "off") return undefined;
+    const id = crypto.randomUUID();
+    const kind = this.sessionKind();
+    const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
+    const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
+    const structured = typeof ev.input !== "string";
+    const hardDeny = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured, policy, toolPolicy, cwd });
+    const human = this.trustedHumanText();
+    const input = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind, ...(human ? { humanRequest: human } : {}) });
+    const threshold = thresholdFor(cfg, kind);
+    let judge: ApprovalJudge | undefined;
+    try { judge = this.host.approvalJudge?.(this.profile); } catch (e) { this.log.warn("approval judge unavailable", { e: String(e) }); }
+    // A hard deny in enforce mode needs no score; shadow still scores it (calibration data).
+    let judged: JudgeResult | undefined;
+    if (!(hardDeny && cfg.mode === "enforce")) {
+      judged = judge ? await runJudge(judge, input, cfg.timeoutMs) : { ok: false, error: `judge provider "${cfg.provider}" is not available`, latencyMs: 0 };
+    }
+    const { outcome, would } = decideOutcome({ mode: cfg.mode, ...(hardDeny ? { hardDeny } : {}), ...(judged ? { judged } : {}), ...(threshold !== undefined ? { threshold } : {}), structured });
+    if (judged && !judged.ok) this.log.warn("approval judge failed; asking the operator", { tool: ev.tool, error: judged.error });
+    const name = judge?.name ?? cfg.provider;
+    const pSafe = judged?.ok ? judged.pSafe : undefined;
+    if (cfg.audit) {
+      this.audit({
+        id, ts: new Date().toISOString(), channelKey: this.channelKey, sessionKind: kind, provider: this.profile.provider,
+        tool: ev.tool, structured, inputHash: inputHash(ev.input), input: input.input, judge: name,
+        ...(judged?.ok && judged.model ? { model: judged.model } : {}), ...(pSafe !== undefined ? { pSafe } : {}),
+        threshold: threshold ?? null, mode: cfg.mode, outcome: outcome.action,
+        ...(outcome.action === "escalate" ? { reason: outcome.reason } : outcome.action === "deny" ? { reason: outcome.rule } : {}),
+        ...(cfg.mode === "shadow" ? { wouldOutcome: would.action } : {}),
+        ...(judged ? { latencyMs: judged.latencyMs } : {}), ...(judged && !judged.ok ? { error: judged.error } : {}),
+      });
+    }
+    const note = judgeNote(name, judged, threshold);
+    return { id, outcome, ...(pSafe !== undefined ? { pSafe } : {}), ...(note ? { note } : {}), audit: cfg.audit };
+  }
+
+  private audit(rec: ApprovalAuditRecord | ApprovalDecisionRecord) {
+    try { this.host.approvalAudit?.append(rec); } catch (e) { this.log.warn("approval audit append failed", { e: String(e) }); }
   }
 
   private async deny(s: AgentSession, ev: { id: string; options?: string[] }, message: string) {

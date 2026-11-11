@@ -22,6 +22,26 @@ export const credentialSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("provider-login"), provider: z.string(), home: z.string().optional() }),
 ]);
 
+const judgeThreshold = z.union([z.number().min(0).max(1), z.literal("off")]);
+/** permissions.approval.judge (docs §10.4). Absent or mode "off" = no judge. */
+export const approvalJudgeSchema = z.object({
+  provider: z.string(),
+  mode: z.enum(["off", "shadow", "enforce"]).default("off"),
+  credential: secretRef.optional(),
+  model: z.string().optional(),
+  allowAbove: z.number().min(0).max(1).default(0.9),
+  byKind: z.object({
+    chat: judgeThreshold.default(0.9),
+    worker: judgeThreshold.default(0.93),
+    cron: judgeThreshold.default(0.97),
+    peer: judgeThreshold.default(0.97),
+    /** Accepted for symmetry, ignored: inbound A2A sessions are never auto-allowed. */
+    a2a: judgeThreshold.optional(),
+  }).prefault({}),
+  timeoutMs: z.number().int().positive().default(5000),
+  audit: z.boolean().default(true),
+});
+
 export const permissionSchema = z.object({
   level: z.enum(["locked", "strict", "moderate", "unrestricted"]).default("moderate"),
   allowTools: z.array(z.string()).default([]),
@@ -30,6 +50,7 @@ export const permissionSchema = z.object({
     mode: z.enum(["ask-operator", "auto-deny", "auto-allow"]).default("ask-operator"),
     /** Seconds to wait for the operator before denying; 0 = wait indefinitely. */
     timeoutSec: z.number().int().nonnegative().default(300),
+    judge: approvalJudgeSchema.optional(),
   }).prefault({}),
   dirScope: z.array(z.string()).optional(),
 });
