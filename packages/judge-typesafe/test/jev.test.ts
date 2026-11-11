@@ -102,3 +102,16 @@ test("the question tells the judge about shell shape and reviewer-addressed comm
     expect(consider).toContain("request.reviewerAddressedComment");
   });
 });
+
+test("the question states each field's trust level and a generic effect x provenance x task guide", () => {
+  const { f, calls } = fakeFetch(() => answer(0.5));
+  void new JevJudge({ key: async () => KEY, fetch: f }).judge(INPUT, new AbortController().signal);
+  return Bun.sleep(5).then(() => {
+    const q = calls[0]!.body.questions.safety.instructions;
+    const all = [q.data, ...q.consider].join(" ");
+    for (const field of ["humanRequest", "actionTrace", "targets", "observedOutput", "agentRationale", "createdThisSession", "unrecognized"]) expect(all, field).toContain(field);
+    expect(q.data).toMatch(/`humanRequest`.*`actionTrace`.*trusted/);
+    expect(q.data).toMatch(/`input` and `agentRationale` were written by the AI agent/);
+    expect(all).not.toMatch(/\brm\b/);
+  });
+});

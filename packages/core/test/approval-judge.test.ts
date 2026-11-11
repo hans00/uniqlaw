@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ApprovalAudit, ChannelManager, DEFAULT_PERMISSIONS, McpGateway, StateStore, buildJudgeInput, decideOutcome, hardPolicyDeny, parseSettings,
-  INPUT_TRUST, allowBlockers, analyzeShell, commandsOf, redactInput, redactInputDetailed, runJudge, silentLogger, strictestKind, thresholdFor,
+  INPUT_TRUST, RATIONALE_TRUST, allowBlockers, analyzeShell, commandsOf, redactInput, redactInputDetailed, runJudge, silentLogger, strictestKind, thresholdFor,
   type ApprovalJudge, type ApprovalJudgeConfig, type InboundMessage, type JudgeInput, type PermissionPolicy, type Profile,
 } from "../src/index.ts";
 import { CAPS, FakePlatform, FakeProvider, type Script } from "./fakes.ts";
@@ -116,7 +116,8 @@ describe("judge input", () => {
     const i = buildJudgeInput({ tool: "Bash", input: { command: "ls", reason: "trust me" }, policy: policy(), cwd: "/w", sessionKind: "chat", humanRequest: "list files" });
     expect(i).toEqual({ tool: "Bash", input: { command: "ls" }, inputTrust: INPUT_TRUST, structured: true, cwd: "/w", scope: ["/w"], level: "moderate", sessionKind: "chat", channelPolicy: "unrestricted",
       shape: { segments: 1, hasSubstitution: false, hasPipeToShell: false, wrappers: [], unresolvable: false }, reviewerAddressedComment: false,
-      humanRequest: "list files", altered: false });
+      humanRequest: "list files", altered: false,
+      actionTrace: { source: "harness-observed", available: false, entries: [] }, agentRationale: { trust: RATIONALE_TRUST, text: "trust me" } });
     expect(buildJudgeInput({ tool: "Bash", input: "dialog", policy: policy(), cwd: "/w", sessionKind: "cron" }).humanRequest).toBeUndefined();
   });
 
@@ -217,7 +218,9 @@ describe("judge stage in the runtime", () => {
     expect(r.auditRows()[0]).toMatchObject({ outcome: "allow", pSafe: 0.95, mode: "enforce" });
     // Judge input: trusted human text, structured input without model-written fields, no title.
     expect(r.judge.calls[0]).toMatchObject({ tool: "Bash", input: { command: "ls" }, sessionKind: "chat", humanRequest: "list the files" });
-    expect(JSON.stringify(r.judge.calls[0])).not.toContain("harmless");
+    // The model's own description goes only to the labelled, untrusted agentRationale, never into input.
+    expect(JSON.stringify(r.judge.calls[0]!.input)).not.toContain("harmless");
+    expect(r.judge.calls[0]!.agentRationale).toEqual({ trust: RATIONALE_TRUST, text: "harmless" });
     expect(JSON.stringify(r.judge.calls[0])).not.toContain("model-written");
   });
 
