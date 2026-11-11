@@ -8,6 +8,9 @@ const secretRef = z.union([
   z.object({ command: z.string() }),
 ]);
 
+/** A secret reference ({env} | {file} | {command}); backends validate their own credential option with it. */
+export const secretRefSchema = secretRef;
+
 export const credentialSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("anthropic-api-key"), key: secretRef }),
   z.object({ kind: z.literal("openai-api-key"), key: secretRef, baseUrl: z.string().optional(), org: z.string().optional() }),
@@ -27,6 +30,9 @@ const judgeThreshold = z.union([z.number().min(0).max(1), z.literal("off")]);
 export const approvalJudgeSchema = z.object({
   provider: z.string(),
   mode: z.enum(["off", "shadow", "enforce"]).default("off"),
+  /** Backend settings (baseUrl, model, credential, authHeader, headers, …), validated by the backend. */
+  options: z.record(z.string(), z.unknown()).prefault({}),
+  /** Shorthands for options.credential / options.model. */
   credential: secretRef.optional(),
   model: z.string().optional(),
   allowAbove: z.number().min(0).max(1).default(0.9),

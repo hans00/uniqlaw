@@ -551,10 +551,12 @@ that emits `permission_request` gets it (claude-sdk, codex, opencode, acp, pi, c
 ```jsonc
 "permissions": { "approval": { "mode": "ask-operator", "timeoutSec": 0,
   "judge": {
-    "provider": "typesafe-jev",            // a judge provider (ApprovalJudge); the daemon's JUDGE_PROVIDERS
+    "provider": "typesafe-jev",            // the backend: typesafe-jev | typesafe-compatible | openai-decision
     "mode": "shadow",                      // off (default) | shadow | enforce
-    "credential": { "command": "nibwarden read 'nw://TypeSafe API/password'" },   // any SecretRef (§10.1)
-    "model": "jev-latest",
+    "options": {                           // backend settings, validated by the backend
+      "credential": { "command": "nibwarden read -n 'nw://TypeSafe API/password'" },   // any SecretRef (§10.1)
+      "model": "jev-latest"
+    },
     "allowAbove": 0.9,                     // floor for every kind
     "byKind": { "chat": 0.9, "worker": 0.93, "cron": 0.97, "peer": 0.97 },     // a number or "off"
     "timeoutMs": 5000,
@@ -562,37 +564,48 @@ that emits `permission_request` gets it (claude-sdk, codex, opencode, acp, pi, c
   } } }
 ```
 
-Guiding rule: **when in doubt, escalate**. The judge may only auto-allow input it fully and faithfully saw.
+**Philosophy.** The judge is the **primary filter**: its job is to cut how often the human is asked, so ordinary
+agent work (compound, wrapped, quoted commands, git, make, …) goes to it like anything else. **Hard deny** is for
+what policy forbids (deterministic, in code). **Escalation** is for what the judge could not see or cannot grant, and
+for what it scores below the threshold. Guiding rule for the blockers: the judge may only auto-allow input it fully
+and faithfully saw.
 
 Outcomes, in order:
 
 1. **deny**: only deterministic rules in code:
-   - the profile's `denyTools`: tool names (case-insensitive), `Bash(prefix:*)` (matched against every simple command
-     of the line, after leading `VAR=…` assignments and with `/bin/rm` read as `rm`, whitespace normalized; Claude,
-     pi `bash`, opencode `{patterns, metadata}` and codex string or argv `command`), and path globs;
+   - the profile's `denyTools`: tool names (case-insensitive), path globs, and `Bash(prefix:*)` matched against every
+     simple command the line would run after **shell normalization** (`core/src/shell.ts`): words unquoted and
+     unescaped (`r''m`, `"rm"`, `\rm` → `rm`), grouping stripped (`( )`, `{ }`, `!`), leading `VAR=…` dropped,
+     `/bin/rm` read as `rm`, known wrappers unwrapped (`sudo`, `doas`, `env` incl. `-S`, `timeout`, `nice`, `ionice`,
+     `stdbuf`, `setsid`, `nohup`, `time`, `command`, `builtin`, `exec`, `xargs`, `chroot`, `flock` incl. `-c`,
+     `busybox`, `unbuffer`, `parallel`, `watch`, `strace`, …), and the strings of `sh -c` / `bash -lc` / `eval`,
+     `$( … )` / backtick / `<( … )` substitutions and `find -exec` analysed as commands too. A command that normalizes
+     to a denied one is denied outright. Inputs: Claude `command`, pi `bash`, opencode `{patterns, metadata}`, codex
+     string or argv `command`;
    - the channel tool policy (case-insensitive tool names) and the `locked` level (anything not read-only);
    - writes (Write/Edit/MultiEdit/NotebookEdit, pi/opencode `write`/`edit`) outside the scope (`dirScope`, else the
      session's cwd; not at `unrestricted`), and a codex `grantRoot` outside it. Paths are checked as written **and**
      after `realpath` (the nearest existing parent for new files). **Writes made through a shell command are not
      path-checked.**
 2. **allow**: only in `enforce`, when P(safe) ≥ the strictest threshold of the request's session kinds, no *allow
-   blocker* applies, and only for this request (`scope: "once"`: never `always`/session rules; ACP never falls back to
-   `allow_always`; a provider option list without a plain one-time "Yes"/"Allow" escalates).
+   blocker* applies, and only for this request (`scope: "once"`).
 3. **escalate** (the operator flow) in every other case: low score, judge error or timeout, a kind set to `"off"`,
    **any inbound A2A session or turn with an A2A origin (hard-coded: config cannot enable it)**, raw TUI dialog text,
-   and the allow blockers:
+   and the allow blockers, which are kept only where the judge did not see the request or cannot grant it:
    - `input-altered`: redaction or a size cap (4000 chars a string, 8000 in all, 50 items, depth 6) changed what the
      judge saw;
    - `empty-input`: nothing to judge once model-written fields are dropped (codex `fileChange` `{grantRoot}`, legacy
      `applyPatch` `{}`);
    - `interactive-tool`: `AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode` (allowing answers for the human) and codex
      `SandboxPermissions` (granted for the turn);
-   - `complex-command`: when any `Bash(…)` deny rule exists, a command with `;` `&&` `||` `|` `` ` `` `$(` `<(`, a
-     newline, a leading env assignment, a first word that isn't a plain name (`r''m`, `"rm"`, `\rm`, `(rm …)`,
-     `{ rm …; }`, `! rm`, `$RM`), a binary called by path, or a wrapper that runs its arguments (`sh`, `eval`, `exec`,
-     `command`, `env`, `xargs`, `sudo`, `timeout`, `ionice`, `stdbuf`, `setsid`, `chroot`, `flock`, `parallel`,
-     `busybox`, interpreters, `find`, `git`, `make`, …);
-   - `suspicious-comment`: a shell `#` comment that talks to the reviewer (approved, authorized, safe, Hans, operator, …).
+   - `no-once-option`: the provider offers no plain one-time allow (any allow would be wider than once; ACP never
+     falls back to `allow_always`);
+   - `unresolvable-command`, only when a `Bash(…)` deny rule exists: what runs is decided by text code can't see (a
+     command word from a variable or substitution such as `$RM` or `$(which rm)`, `eval` of non-literal text,
+     unbalanced quotes), so the deny rule can't be checked.
+
+   Compound, wrapped, quoted, piped commands and reviewer-addressed comments are **not** blockers: they reach the
+   judge as typed features (below).
 
 `off` changes nothing in what is asked (no judge call, no audit, identical prompts and launch flags). `shadow` scores
 and logs every request (hard-policy rules and blockers included, as `wouldOutcome`/`wouldReason`/`blockers`) and
@@ -606,7 +619,10 @@ human's turn makes the whole request peer- or cron-strict.
 **Judge input** is minimal and trusted only, passed as typed fields: tool name, the structured input (secrets
 redacted; Bash `description` and codex `reason` dropped; size-capped), `inputTrust` (a fixed note that the input is
 the agent's own untrusted writing), cwd, write scope, level, session kind, a one-line channel-policy summary, and the
-latest human message **only when every origin of the turn is a trusted human** (as they wrote it, capped). Never tool
+latest human message **only when every origin of the turn is a trusted human** (as they wrote it, capped). Shell
+tools also get `shape: {segments, hasSubstitution, hasPipeToShell, wrappers[], unresolvable}` and
+`reviewerAddressedComment` (a `#` comment, outside quotes, that claims approval or safety), both computed by code so
+the judge can weigh them. Never tool
 outputs, fetched or file content, assistant text, the provider's title, or peer, cron or A2A message text.
 *Residual risk*: the input itself is model-written (shell comments, heredoc bodies, Write `content`, WebFetch/Task
 `prompt`); the judge is told so and reviewer-addressed shell comments escalate, but persuasive text elsewhere in the
@@ -647,11 +663,20 @@ unreachable daemon fall through to the dialog; an allow is not remembered; `--se
 before). Under the `auto` permission mode the classifier decides first and the hook sees only what it escalates:
 the full benefit needs `default` mode (`profile.options.permissionMode`), a later, separate step.
 
-**typesafe-jev** (`packages/judge-typesafe`): `POST https://api.typesafe.ai/v1/systemone` with one Choice question
-(`safe | unsafe`); P(safe) is `answers.safety.probabilities.safe` (the probability of the option acted on, not
-`confidence`). The key is resolved from the SecretRef on the first request and kept in memory only. A `command`
-ref works with any secret CLI, e.g. `nibwarden read nw://<item>/<field>`, or start the daemon under
-`nibwarden run --` with an `{ "env": … }` ref.
+**Backends** (`judge.provider`; settings in `judge.options`, `credential` / `model` at the top level are shorthands).
+Every backend asks the same question (`JUDGE_QUESTION` in core: a `safe | unsafe` choice over the typed request) and
+returns P(safe):
+
+| provider | protocol | options |
+|---|---|---|
+| `typesafe-jev` | TypeSafe System One, hosted: `POST https://api.typesafe.ai/v1/systemone`, one Choice question; P(safe) = `answers.safety.probabilities.safe` (calibrated per TypeSafe's docs) | `credential` (required), `model` (`jev-latest`), and the `typesafe-compatible` options |
+| `typesafe-compatible` | the same protocol on a self-hosted server | `baseUrl` (required), `credential` (optional), `model`, `authHeader` (`authorization`), `authScheme` (`Bearer`; `""` = bare key), `headers`, `name` |
+| `openai-decision` | OpenAI Decisions API: `POST https://api.openai.com/v1/decisions`, model `gpt-6-luna` (the only one supported), the request as an `input_json` part, one `choice` question; P(safe) = the `safe` entry of `probabilities`; a `refusal` answer is an error (→ escalate) | `credential` (required), `baseUrl` (`https://api.openai.com/v1`), `model`, `organization`, `project`, `headers`, `name` (`Luna`) |
+
+OpenAI's Decisions docs return probabilities but make no calibration claim; they say to set thresholds from labelled
+examples, which is what `shadow` and the audit pairs provide. Keys are resolved from the SecretRef on the first
+request and kept in memory only. A `command` ref works with any secret CLI, e.g. `nibwarden read -n nw://<item>/<field>`,
+or start the daemon under `nibwarden run --` with an `{ "env": … }` ref.
 
 ### 10.3 Channel capabilities and group wake rules
 
