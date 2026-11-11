@@ -1,6 +1,8 @@
 // A2A v1.0 transport (docs §9): exposes selected profiles as A2A agents (one Agent Card
 // per profile) and makes configured remote A2A agents reachable as `a2a:<name>`.
 import { z } from "zod";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   DefaultRequestHandler, InMemoryTaskStore, JsonRpcTransportHandler, defaultServerCallContextBuilder, validateVersion,
   type AgentExecutor, type ExecutionEventBus, type RequestContext,
@@ -26,7 +28,16 @@ export const a2aConfigSchema = z.object({
   /** Externally reachable base URL (behind a proxy); default http://host:port. */
   publicUrl: z.string().url().optional(),
   /** Profiles exposed as A2A agents (only these get an Agent Card). */
-  expose: z.record(z.string(), z.object({ description: z.string().default(""), name: z.string().optional(), skills: z.array(skill).default([]) })).prefault({}),
+  expose: z.record(z.string(), z.object({
+    description: z.string().default(""), name: z.string().optional(), skills: z.array(skill).default([]),
+    /** System prompt for remote callers of this profile. The operator's own prompt files (settings.prompts.files:
+     *  IDENTITY/USER/SOUL…) are never used for them. `promptFiles` are relative to the project and appended. */
+    prompt: z.string().optional(),
+    promptFiles: z.array(z.string()).default([]),
+    /** Allow this profile although its provider can't isolate remote-driven sessions (only claude-tmux and
+     *  claude-sdk can): remote callers then run with the operator's settings, MCP servers and file access. */
+    unsafeProvider: z.boolean().default(false),
+  })).prefault({}),
   auth: z.object({
     /** Accepted bearer tokens; the caller is identified as `token#<index>` (or the entry's name). A named entry
      *  may list the exposed profiles it can use (`profiles`, default all); any other profile answers 403. */
@@ -56,7 +67,8 @@ const partsText = (parts: AnyPart[] | undefined) => (parts ?? []).filter((p) => 
 class UniqlawExecutor implements AgentExecutor {
   private contexts = new Map<string, string>(); // taskId → contextId
   private canceled = new Set<string>();
-  constructor(private profile: string, private api: () => TransportApi, private log: Logger) {}
+  constructor(private profile: string, private api: () => TransportApi, private log: Logger,
+    private opts: { prompt?: string; unsafeProvider?: boolean } = {}) {}
 
   async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {
     const { taskId, contextId } = ctx;
@@ -73,7 +85,8 @@ class UniqlawExecutor implements AgentExecutor {
     const remote = caller !== ANONYMOUS ? caller : `anonymous${meta["uniqlaw.from"] ? `(${String(meta["uniqlaw.from"])})` : ""}`;
     let r: { ok: boolean; text: string };
     try {
-      r = await this.api().runInbound({ profile: this.profile, caller, remote, contextId, taskId, text: partsText(ctx.userMessage.parts as AnyPart[]), hop });
+      r = await this.api().runInbound({ profile: this.profile, caller, remote, contextId, taskId, text: partsText(ctx.userMessage.parts as AnyPart[]), hop,
+        ...(this.opts.prompt ? { prompt: this.opts.prompt } : {}), ...(this.opts.unsafeProvider ? { unsafeProvider: true } : {}) });
     } catch (e) {
       r = { ok: false, text: e instanceof Error ? e.message : String(e) };
     }
@@ -200,7 +213,7 @@ export class A2ATransport implements Transport {
   private exposed = new Map<string, Exposed>();
   private tokens: { name: string; token: string; profiles?: string[] }[] = [];
   private remotes: A2ARemote[];
-  constructor(private cfg: A2AConfig, private log: Logger) {
+  constructor(private cfg: A2AConfig, private log: Logger, private projectDir = process.cwd()) {
     this.remotes = Object.entries(cfg.remotes).map(([n, r]) => new A2ARemote(n, r, log.child(`remote:${n}`)));
   }
 
@@ -224,8 +237,16 @@ export class A2ATransport implements Transport {
     if (!this.tokens.length && !isLoopback(this.cfg.host) && Object.keys(this.cfg.expose).length) {
       throw new Error("a2a: auth.bearerTokens is required when exposing profiles on a non-loopback host");
     }
-    const known = new Set(api.profiles().map((p) => p.name));
-    for (const name of Object.keys(this.cfg.expose)) if (!known.has(name)) throw new Error(`a2a.expose: unknown profile "${name}"`);
+    const known = new Map(api.profiles().map((p) => [p.name, p]));
+    for (const [name, e] of Object.entries(this.cfg.expose)) {
+      const p = known.get(name);
+      if (!p) throw new Error(`a2a.expose: unknown profile "${name}"`);
+      // Fail closed: remote callers must not run with the operator's settings, MCP servers and files.
+      if (!p.isolation) {
+        if (!e.unsafeProvider) throw new Error(`a2a.expose.${name}: provider "${p.provider}" cannot isolate remote callers (no separate working directory, settings or MCP servers); use a claude-tmux / claude-sdk profile, or set "unsafeProvider": true to accept the risk`);
+        this.log.warn("UNSAFE: exposing a profile whose provider cannot isolate remote callers — they run with the operator's settings, MCP servers and file access", { profile: name, provider: p.provider });
+      }
+    }
     for (const t of this.tokens) for (const p of t.profiles ?? []) {
       if (!this.cfg.expose[p]) throw new Error(`a2a.auth.bearerTokens "${t.name}": profile "${p}" is not exposed`);
     }
@@ -249,7 +270,9 @@ export class A2ATransport implements Transport {
       };
       // Tasks are stored per caller: GetTask / CancelTask / SubscribeToTask (and continuing a task by id) from another
       // caller find nothing, so they answer "task not found" and task ids don't leak.
-      const handler = new DefaultRequestHandler(card as never, new InMemoryTaskStore(callerOf), new UniqlawExecutor(profile, () => this.api!, this.log.child(profile)));
+      const prompt = [e.prompt ?? "", ...e.promptFiles.map((f) => readFileSync(resolve(this.projectDir, f), "utf8"))].map((t) => t.trim()).filter(Boolean).join("\n\n");
+      const handler = new DefaultRequestHandler(card as never, new InMemoryTaskStore(callerOf), new UniqlawExecutor(profile, () => this.api!, this.log.child(profile),
+        { ...(prompt ? { prompt } : {}), unsafeProvider: e.unsafeProvider }));
       this.exposed.set(profile, { profile, card, handler, rpc: new JsonRpcTransportHandler(handler) });
       grpcProfiles.set(profile, { handler, card });
     }
@@ -363,5 +386,5 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 export default definePlugin({
   kind: "transport", name: "a2a", configSchema: a2aConfigSchema,
-  create: (ctx, cfg) => new A2ATransport(cfg, ctx.log),
+  create: (ctx, cfg) => new A2ATransport(cfg, ctx.log, ctx.projectDir),
 });

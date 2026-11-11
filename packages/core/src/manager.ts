@@ -1,13 +1,13 @@
 // Owns all ChannelRuntimes: inbound routing, core slash commands, the message
 // bus (agents_list / agent_ask / agent_trigger / notify) and idle cleanup.
 import type { AgentProvider, Profile, TurnInput } from "./provider.ts";
-import type { RemoteAgent, ScheduledFire, Transcriber } from "./plugin.ts";
+import type { InboundRequest, RemoteAgent, ScheduledFire, Transcriber } from "./plugin.ts";
 import type { InboundMessage, OutboundFile, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
 import type { GroupMode } from "./config.ts";
 import { ChannelRuntime, type RuntimeHost } from "./runtime.ts";
 import { PairingService } from "./pairing.ts";
-import { a2aPermissions, a2aSessionKey, isA2ASession } from "./a2a-policy.ts";
+import { a2aPermissions, a2aSessionDir, a2aSessionKey, isA2ASession } from "./a2a-policy.ts";
 import { formatTimestamp, renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
@@ -16,12 +16,14 @@ import { expandHome } from "./credentials.ts";
 import { basename, extname, isAbsolute, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
-export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "onUsageLimit" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget"> {
+export interface ManagerDeps extends Omit<RuntimeHost, "onTaskResult" | "onUsageLimit" | "platform" | "operatorTargets" | "emit" | "isInternal" | "cwdFor" | "workerOf" | "backgroundTarget" | "isolation"> {
   providers: Map<string, AgentProvider>;
   platforms: Map<string, PlatformAdapter>;
   profiles: Map<string, Profile>;
   /** Transcriber named by settings.transcription.engine (absent = agents get the audio file only). */
   transcriber?: Transcriber;
+  /** Parent of the inbound A2A session directories (default: the system temp dir). Tests point it elsewhere. */
+  a2aSessionsBase?: string;
 }
 
 export interface AgentInfo {
@@ -74,6 +76,10 @@ export class ChannelManager {
   private remotes = new Map<string, RemoteAgent>();
   /** channelKey → profile override (A2A sessions run on the profile they were addressed to). */
   private profileOverride = new Map<string, string>();
+  /** Inbound A2A sessions (by key): the exposed profile's prompt, and whether the operator allowed a non-isolating
+   *  provider. In memory only: after a restart a session stays fail-closed until its caller's next request. */
+  private a2aPrompt = new Map<string, string>();
+  private a2aUnsafe = new Set<string>();
   private waiters = new Map<string, TaskWaiter>();
   /** Usage-limit fallback offers waiting for the owner, per chat: the failed turns to re-send after a switch. */
   private pendingSwitch = new Map<string, { failed: FailedTurn[]; until: number }>();
@@ -91,7 +97,9 @@ export class ChannelManager {
       onUsageLimit: (key, failed) => this.onUsageLimit(key, failed),
       emit: (ev: RuntimeEvent) => { this.events.emit("event", ev); },
       isInternal: (k) => this.kindOf(k) === "internal",
-      cwdFor: (k) => deps.store.get(`session-cwd:${k}`),
+      // Inbound A2A sessions run in an empty directory of their own, never in the project.
+      cwdFor: (k) => isA2ASession(k) ? a2aSessionDir(deps.instanceId, k, deps.a2aSessionsBase) : deps.store.get(`session-cwd:${k}`),
+      isolation: (k) => isA2ASession(k) ? { unsafeProvider: this.a2aUnsafe.has(k), ...(this.a2aPrompt.has(k) ? { prompt: this.a2aPrompt.get(k)! } : {}) } : undefined,
       workerOf: (k) => { const m = this.workerMeta(k); return m ? { owner: m.owner } : undefined; },
       backgroundTarget: (k) => {
         if (!k.startsWith(WORKER_PREFIX)) return undefined;
@@ -130,7 +138,9 @@ export class ChannelManager {
   }
 
   profileFor(channelKey: string): Profile {
-    const name = this.profileOverride.get(channelKey) ?? this.pinnedProfile(channelKey)
+    // An A2A session's key names its profile (a2a:<profile>:…), which also holds for sessions restored after a restart.
+    const a2aProfile = isA2ASession(channelKey) ? channelKey.split(":")[1] : undefined;
+    const name = this.profileOverride.get(channelKey) ?? a2aProfile ?? this.pinnedProfile(channelKey)
       ?? this.deps.settings.bindings.channels[channelKey] ?? this.deps.settings.bindings.default;
     const p = this.deps.profiles.get(name);
     if (!p) throw new Error(`channel ${channelKey} is bound to unknown profile "${name}"`);
@@ -501,11 +511,18 @@ export class ChannelManager {
   /** Inbound request from a remote agent (A2A) against a local profile. The session is keyed by the
    *  authenticated caller as well as the contextId: the caller chooses the contextId, so a contextId alone
    *  would let one peer join another peer's conversation. */
-  async runInbound(o: { profile: string; caller: string; remote: string; contextId: string; taskId: string; text: string; hop: number }): Promise<{ ok: boolean; text: string }> {
-    if (!this.deps.profiles.has(o.profile)) return { ok: false, text: `unknown profile "${o.profile}"` };
+  async runInbound(o: InboundRequest): Promise<{ ok: boolean; text: string }> {
+    const profile = this.deps.profiles.get(o.profile);
+    if (!profile) return { ok: false, text: `unknown profile "${o.profile}"` };
     if (o.hop > this.deps.settings.bus.maxHops) return { ok: false, text: "delegation chain too deep" };
+    // Fail closed before anything is queued (the runtime checks again when it opens the session).
+    if (!o.unsafeProvider && !this.deps.providers.get(profile.provider)?.capabilities(profile).isolation) {
+      return { ok: false, text: `profile "${o.profile}" runs on a provider that cannot isolate remote requests` };
+    }
     const key = a2aSessionKey(o.profile, o.caller, o.contextId);
     this.profileOverride.set(key, o.profile);
+    if (o.prompt) this.a2aPrompt.set(key, o.prompt); else this.a2aPrompt.delete(key);
+    if (o.unsafeProvider) this.a2aUnsafe.add(key); else this.a2aUnsafe.delete(key);
     this.deps.store.createTask({ taskId: o.taskId, fromSession: `a2a:${o.remote}`, toSession: key, mode: "ask", request: o.text });
     const done = this.waitTask(o.taskId);
     await this.runtime(key).enqueue({

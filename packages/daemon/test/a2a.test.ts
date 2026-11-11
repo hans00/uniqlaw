@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readRuntime, startDaemon, type Daemon } from "../src/index.ts";
+import { lastSpecs } from "./fixtures/fake-provider.ts";
 
 const FIX = join(import.meta.dir, "fixtures");
 const cleanups: (() => unknown)[] = [];
@@ -53,4 +54,29 @@ test("daemon-to-daemon over gRPC (remote prefers GRPC); gRPC port published", as
   const b = await start(project("tok-gb", { remotes: { alpha: { url: `http://127.0.0.1:${ports.a2a}/main`, bearer: { env: "UQ_A2A_TOKEN" }, preferredTransports: ["GRPC"] } } }));
   const r = await b.manager.ask("global", "a2a:alpha", "ping over grpc", true);
   expect(r.result).toEqual({ ok: true, text: "echo: ping over grpc" });
+});
+
+test("the remote caller's session gets the exposed prompt only: no persona files, brand, memory or project path", async () => {
+  process.env.UQ_A2A_TOKEN = "tok-123";
+  lastSpecs.length = 0;
+  const dirA = project("tok-pa", { expose: { main: { prompt: "You are the public helper.", promptFiles: ["public.md"] } }, auth: { bearerTokens: [{ env: "UQ_A2A_TOKEN" }] } });
+  mkdirSync(join(dirA, "prompts"), { recursive: true });
+  writeFileSync(join(dirA, "prompts", "USER.md"), "OPERATOR-PRIVATE: lives in Taipei");
+  writeFileSync(join(dirA, "public.md"), "Answer briefly.");
+  const a = await start(dirA);
+  const port = readRuntime(dirA)!.transportPorts!.a2a!;
+  const b = await start(project("tok-pb", { remotes: { alpha: { url: `http://127.0.0.1:${port}/main`, bearer: { env: "UQ_A2A_TOKEN" } } } }));
+  expect((await b.manager.ask("global", "a2a:alpha", "hello", true)).result?.ok).toBe(true);
+  const spec = lastSpecs.find((s) => (s as { sessionId: string }).sessionId.startsWith("a2a:main:")) as
+    { cwd: string; isolated?: boolean; systemPrompt: { fragments: { id: string; text: string }[] } };
+  const text = spec.systemPrompt.fragments.map((f) => f.text).join("\n");
+  expect(spec.isolated).toBe(true);
+  expect(text).toContain("You are the public helper.");
+  expect(text).toContain("Answer briefly.");
+  expect(text).not.toContain("OPERATOR-PRIVATE");
+  expect(text).not.toContain("UniQlaw, a multi-channel agent daemon"); // brand prompt
+  expect(spec.systemPrompt.fragments.map((f) => f.id)).not.toContain("memory");
+  expect(text).not.toContain(dirA);
+  expect(spec.cwd.startsWith(dirA)).toBe(false);
+  void a;
 });

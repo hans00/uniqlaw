@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  BRAND_PROMPT, ChannelManager, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
+  BRAND_PROMPT, ChannelManager, ISOLATED_SCOPE_PROMPT, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
   createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, type MemoryOriginKind,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
   type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transcriber, type Transport,
@@ -197,7 +197,8 @@ export async function startDaemon(projectDirIn: string, opts: { logToStderr?: bo
     for (const [name, t] of transports) {
       await t.start({
         runInbound: (o) => manager.runInbound(o),
-        profiles: () => [...profiles.values()].map((p) => ({ name: p.name, provider: p.provider })),
+        profiles: () => [...profiles.values()].map((p) => ({ name: p.name, provider: p.provider,
+          isolation: !!providers.get(p.provider)?.capabilities(p).isolation })),
         maxHops: settings.bus.maxHops,
       });
       if (t.remoteAgents) manager.addRemoteAgents(t.remoteAgents());
@@ -258,6 +259,15 @@ export const DREAM_SESSION = "dream";
 
 export async function buildSystemPrompt(projectDir: string, settings: Settings, profile: Profile, multiparty: boolean, toolNames: string[],
   session?: SessionContext, memory?: MemoryStore): Promise<SystemPromptParts> {
+  // Inbound A2A: a remote caller drives the session. It gets the exposed profile's own prompt and nothing of the
+  // operator's (no brand, persona files, memory, workers, absolute paths).
+  if (session?.a2a) {
+    const fragments: { id: string; text: string }[] = [];
+    if (session.a2a.prompt?.trim()) fragments.push({ id: "a2a-prompt", text: session.a2a.prompt.trim() });
+    fragments.push({ id: "a2a-scope", text: ISOLATED_SCOPE_PROMPT });
+    if (toolNames.length) fragments.push({ id: "bus-tools", text: busToolsPrompt(toolNames) });
+    return { fragments };
+  }
   const fragments: { id: string; text: string }[] = [{ id: "brand", text: BRAND_PROMPT }];
   // Workers get the profile's own prompt files only: the assistant persona (IDENTITY/USER/SOUL) is for chats.
   const files = (profile.options.prompts as string[] | undefined) ?? (session?.worker ? [] : settings.prompts.files);

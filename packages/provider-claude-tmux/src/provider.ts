@@ -74,9 +74,10 @@ export class ClaudeTmuxProvider implements AgentProvider {
       argv.push(...buildPermissionArgs(spec.profile.permissions, {
         modeOverride: opts.permissionMode,
         extraAllowed: spec.mcp ? [`mcp__${MCP_SERVER_NAME}`] : [],
+        isolated: !!spec.isolated,
       }));
       const append = composeAppendSystemPrompt({
-        parts: spec.systemPrompt, permissions: spec.profile.permissions, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames,
+        parts: spec.systemPrompt, permissions: spec.profile.permissions, cwd: spec.cwd, mcpToolNames: spec.mcp?.toolNames, isolated: !!spec.isolated,
       });
       // Via a file: tmux rejects a new-session command over ~16 KB ("command too long"),
       // and MEMORY.md alone may be up to 24 KB.
@@ -86,8 +87,9 @@ export class ClaudeTmuxProvider implements AgentProvider {
         argv.push("--append-system-prompt-file", file);
       }
       if (spec.mcp) argv.push("--mcp-config", writeMcpConfig(join(dir, "mcp.json"), spec.mcp.url));
-      argv.push(...nativeMemoryArgs(spec.nativeMemory));
-      if (opts.extraArgs?.length) argv.push(...opts.extraArgs);
+      argv.push(...nativeMemoryArgs(spec.isolated ? false : spec.nativeMemory));
+      // Operator extras could re-add settings sources or MCP servers: not for remote-driven sessions.
+      if (opts.extraArgs?.length && !spec.isolated) argv.push(...opts.extraArgs);
       return argv;
     };
     const launchFile = join(dir, "launch.sha");

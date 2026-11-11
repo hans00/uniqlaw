@@ -15,7 +15,7 @@ type Inbound = Parameters<TransportApi["runInbound"]>[0];
 async function server(cfg: Record<string, unknown>) {
   const calls: Inbound[] = [];
   const api: TransportApi = { runInbound: async (o) => { calls.push(o); return { ok: true, text: `answer[${o.profile}]: ${o.text}` }; },
-    profiles: () => [{ name: "main", provider: "fake" }, { name: "other", provider: "fake" }], maxHops: 4 };
+    profiles: () => [{ name: "main", provider: "fake", isolation: true }, { name: "other", provider: "fake", isolation: true }], maxHops: 4 };
   const t = new A2ATransport(a2aConfigSchema.parse({ expose: { main: {}, other: {} }, ...cfg }), silentLogger);
   await t.start(api);
   stops.push(() => t.stop());
@@ -101,5 +101,44 @@ test("gRPC: a token limited to some profiles gets PERMISSION_DENIED on the other
 
 test("a token limited to a profile that is not exposed is a config error", async () => {
   const t = new A2ATransport(a2aConfigSchema.parse({ expose: { main: {} }, ...twoTokens({ profiles: ["ghost"] }) }), silentLogger);
-  await expect(t.start({ runInbound: async () => ({ ok: true, text: "" }), profiles: () => [{ name: "main", provider: "fake" }], maxHops: 4 })).rejects.toThrow(/"ghost" is not exposed/);
+  await expect(t.start({ runInbound: async () => ({ ok: true, text: "" }), profiles: () => [{ name: "main", provider: "fake", isolation: true }], maxHops: 4 })).rejects.toThrow(/"ghost" is not exposed/);
+});
+
+function capturingLogger() {
+  const warns: string[] = [];
+  const log = { debug() {}, info() {}, error() {}, warn(msg: string) { warns.push(msg); }, child() { return log; } };
+  return { log: log as unknown as typeof silentLogger, warns };
+}
+const api = (profiles: { name: string; provider: string; isolation?: boolean }[], calls: Inbound[] = []): TransportApi =>
+  ({ runInbound: async (o) => { calls.push(o); return { ok: true, text: "ok" }; }, profiles: () => profiles, maxHops: 4 });
+
+test("fail closed: exposing a profile whose provider can't isolate remote callers is a startup error", async () => {
+  const t = new A2ATransport(a2aConfigSchema.parse({ expose: { main: {} } }), silentLogger);
+  await expect(t.start(api([{ name: "main", provider: "codex", isolation: false }]))).rejects.toThrow(/provider "codex" cannot isolate remote callers/);
+  t.stop();
+});
+
+test("unsafeProvider: started with a loud warning, and the opt-in reaches runInbound", async () => {
+  const { log, warns } = capturingLogger();
+  const calls: Inbound[] = [];
+  const t = new A2ATransport(a2aConfigSchema.parse({ expose: { main: { unsafeProvider: true } } }), log);
+  await t.start(api([{ name: "main", provider: "codex", isolation: false }], calls));
+  stops.push(() => t.stop());
+  expect(warns.some((w) => w.startsWith("UNSAFE"))).toBe(true);
+  await rpc(t.baseUrl, "main", "SendMessage", msg("hi"));
+  expect(calls[0]!.unsafeProvider).toBe(true);
+});
+
+test("the exposed profile's own prompt (prompt + promptFiles) is what reaches runInbound", async () => {
+  const dir = (await import("node:fs")).mkdtempSync((await import("node:path")).join((await import("node:os")).tmpdir(), "uq-a2a-pf-"));
+  (await import("node:fs")).writeFileSync(`${dir}/public.md`, "Answer in one line.\n");
+  const calls: Inbound[] = [];
+  const t = new A2ATransport(a2aConfigSchema.parse({ expose: { main: { prompt: "You are the public helper.", promptFiles: ["public.md"] }, other: {} } }), silentLogger, dir);
+  await t.start(api([{ name: "main", provider: "fake", isolation: true }, { name: "other", provider: "fake", isolation: true }], calls));
+  stops.push(() => { t.stop(); (require("node:fs") as typeof import("node:fs")).rmSync(dir, { recursive: true, force: true }); });
+  await rpc(t.baseUrl, "main", "SendMessage", msg("hi"));
+  await rpc(t.baseUrl, "other", "SendMessage", msg("hi"));
+  expect(calls[0]!.prompt).toBe("You are the public helper.\n\nAnswer in one line.");
+  expect(calls[1]!.prompt).toBeUndefined();
+  expect(calls[0]!.unsafeProvider).toBeUndefined();
 });

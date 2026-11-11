@@ -14,12 +14,14 @@ export interface ComposeOptions {
   cwd: string;
   /** Gateway tool names; listed so deferred tool loading can't hide them. */
   mcpToolNames?: string[];
+  /** SessionSpec.isolated: no path-bearing dir-scope text (core already adds a path-free scope instruction). */
+  isolated?: boolean;
 }
 
 export function composeAppendSystemPrompt(o: ComposeOptions): string {
   const out: string[] = [];
   for (const f of o.parts.fragments) if (f.text.trim()) out.push(f.text.trim());
-  if (o.permissions && o.permissions.level !== "unrestricted") {
+  if (o.permissions && o.permissions.level !== "unrestricted" && !o.isolated) {
     out.push(dirScopePrompt(o.permissions.dirScope?.length ? o.permissions.dirScope : [o.cwd]));
   }
   if (o.mcpToolNames?.length) {

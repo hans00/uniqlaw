@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_PERMISSIONS } from "@uniqlaw/core";
 import {
-  buildPermissionArgs, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
+  buildPermissionArgs, ISOLATED_SDK_OPTIONS, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
   isInterruptMarker, isRejectionText, nativeMemoryArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
 } from "../src/index.ts";
 
@@ -24,6 +24,17 @@ describe("permissions", () => {
     expect(s[s.indexOf("--disallowedTools") + 1]).toContain("Bash");
     expect(s[s.indexOf("--allowedTools") + 1]).toBe("mcp__uniqlaw");
     expect(buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "locked" })).toContain("Read,Grep,Glob");
+  });
+  test("isolated (inbound A2A): no built-in tools, no settings files, only UniQlaw's MCP server", () => {
+    const a = buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "locked" }, { isolated: true, extraAllowed: ["mcp__uniqlaw"] });
+    const flag = (f: string) => a[a.indexOf(f) + 1];
+    expect(a.filter((x) => x === "--tools")).toHaveLength(1); // locked's Read,Grep,Glob is not added back
+    expect(flag("--tools")).toBe("");
+    expect(flag("--setting-sources")).toBe("");
+    expect(a).toContain("--strict-mcp-config");
+    expect(flag("--allowedTools")).toBe("mcp__uniqlaw");
+    for (const f of ["--tools", "--setting-sources", "--strict-mcp-config"]) expect(buildPermissionArgs(DEFAULT_PERMISSIONS)).not.toContain(f);
+    expect(ISOLATED_SDK_OPTIONS).toEqual({ tools: [], settingSources: [], strictMcpConfig: true });
   });
 });
 
@@ -72,6 +83,12 @@ describe("classify + prompt + mcp + credentials", () => {
     expect(s).toContain("mcp__uniqlaw__agent_ask");
     expect(s).toContain("/w");
     expect(mcpConfigObject("http://x").mcpServers.uniqlaw.alwaysLoad).toBe(true);
+  });
+  test("isolated prompt names no path (the remote caller must not learn the project location)", () => {
+    const s = composeAppendSystemPrompt({ parts: { fragments: [{ id: "a", text: "PUBLIC" }] }, permissions: { ...DEFAULT_PERMISSIONS, level: "strict" }, cwd: "/home/op/secret-project", isolated: true });
+    expect(s).toContain("PUBLIC");
+    expect(s).not.toContain("/home/op");
+    expect(composeAppendSystemPrompt({ parts: { fragments: [] }, permissions: { ...DEFAULT_PERMISSIONS, level: "strict" }, cwd: "/home/op/x" })).toContain("/home/op/x");
   });
   test("native memory off → Claude auto-memory and auto-dream disabled (CLI flag and SDK option)", () => {
     expect(nativeMemoryArgs(false)).toEqual(["--settings", '{"autoMemoryEnabled":false,"autoDreamEnabled":false}']);

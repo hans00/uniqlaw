@@ -9,7 +9,7 @@ afterEach(() => { for (const s of stops.splice(0)) s(); });
 type Inbound = Parameters<TransportApi["runInbound"]>[0];
 function fakeApi(answer: (o: Inbound) => { ok: boolean; text: string } | Promise<{ ok: boolean; text: string }>) {
   const calls: Inbound[] = [];
-  const api: TransportApi = { runInbound: async (o) => { calls.push(o); return answer(o); }, profiles: () => [{ name: "main", provider: "fake" }, { name: "other", provider: "fake" }], maxHops: 4 };
+  const api: TransportApi = { runInbound: async (o) => { calls.push(o); return answer(o); }, profiles: () => [{ name: "main", provider: "fake", isolation: true }, { name: "other", provider: "fake", isolation: true }], maxHops: 4 };
   return { api, calls };
 }
 

@@ -23,14 +23,26 @@ export interface PermissionArgsOptions {
   extraAllowed?: string[];
   /** profile.options.permissionMode override. */
   modeOverride?: string;
+  /** SessionSpec.isolated (see ISOLATED_CLI_ARGS). */
+  isolated?: boolean;
 }
+
+/** SessionSpec.isolated → claude CLI flags: no built-in tools at all, no settings files (so no CLAUDE.md, hooks,
+ *  skills, plugins or `permissions.allow` from the operator's user/project/local settings), and no MCP server but
+ *  the one given with --mcp-config (UniQlaw's). Native memory is turned off separately (nativeMemoryArgs(false)).
+ *  Checked against claude 2.1.322: `--setting-sources ""` loads no CLAUDE.md and no user plugins/MCP servers. */
+export const ISOLATED_CLI_ARGS = ["--tools", "", "--setting-sources", "", "--strict-mcp-config"];
+
+/** The same for the Agent SDK (claude-sdk) query options. */
+export const ISOLATED_SDK_OPTIONS = { tools: [] as string[], settingSources: [] as [], strictMcpConfig: true } as const;
 
 export function buildPermissionArgs(p: PermissionPolicy, o: PermissionArgsOptions = {}): string[] {
   const args: string[] = ["--permission-mode", permissionModeFor(p, o.modeOverride)];
   const deny = new Set<string>([...NATIVE_CROSS_SESSION_TOOLS, ...p.denyTools]);
   const allow = new Set<string>([...p.allowTools, ...(o.extraAllowed ?? [])]);
+  if (o.isolated) args.push(...ISOLATED_CLI_ARGS);
   switch (p.level) {
-    case "locked": args.push("--tools", "Read,Grep,Glob"); break;
+    case "locked": if (!o.isolated) args.push("--tools", "Read,Grep,Glob"); break;
     case "strict": for (const t of ["Bash", "WebSearch", "WebFetch"]) deny.add(t); break;
     case "moderate": case "unrestricted": break;
   }

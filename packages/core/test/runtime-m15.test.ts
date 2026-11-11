@@ -139,7 +139,7 @@ test("inbound A2A sessions run deny-by-default: at most strict, no shell/write t
   const perms = (provider.specs[0] as unknown as { profile: { permissions: import("../src/index.ts").PermissionPolicy } }).profile.permissions;
   expect(perms.level).toBe("strict");
   expect(perms.approval.mode).toBe("ask-operator");
-  expect(perms.allowTools).toEqual(["Read"]);
+  expect(perms.allowTools).toEqual([]); // Bash and Read are both denied groups
   for (const t of ["Bash", "Write", "Edit", "CronCreate", "SendMessage", "PushNotification", "Read(./.uniqlaw/**)"]) expect(perms.denyTools).toContain(t);
   // A chat on the same profile keeps the profile's own permissions.
   expect(mgr.profileFor("global").permissions.level).toBe("unrestricted");

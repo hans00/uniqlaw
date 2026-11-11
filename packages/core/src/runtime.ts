@@ -27,6 +27,9 @@ export interface SessionContext {
   internal: boolean;
   cwd?: string;
   worker?: { owner?: string };
+  /** Inbound A2A session: the prompt is built from the exposed profile's own `prompt` only (no persona files,
+   *  memory or brand prompt), and it names no path. */
+  a2a?: { prompt?: string };
 }
 
 /** Services the runtime needs from the daemon (kept narrow for testability). */
@@ -47,6 +50,9 @@ export interface RuntimeHost {
   cwdFor?(channelKey: string): string | undefined;
   /** Worker sessions: who started it. */
   workerOf?(channelKey: string): { owner?: string } | undefined;
+  /** Inbound A2A sessions: open isolated (SessionSpec.isolated); `unsafeProvider` = the operator allowed a provider
+   *  without the `isolation` capability; `prompt` = the exposed profile's own prompt. */
+  isolation?(channelKey: string): { unsafeProvider: boolean; prompt?: string } | undefined;
   /** Override where background output goes: a target, null = nowhere, undefined = backgroundNotify policy. */
   backgroundTarget?(channelKey: string): Target | null | undefined;
   /** Issue an MCP Gateway token for this channel. */
@@ -312,7 +318,13 @@ export class ChannelRuntime {
     const gw = this.host.gatewayFor(this.channelKey);
     const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
     const worker = this.host.workerOf?.(this.channelKey);
+    const iso = this.host.isolation?.(this.channelKey);
     try {
+      // Fail closed: a remote-driven session on a provider that can't isolate it would run with the operator's
+      // settings, MCP servers and files.
+      if (iso && !this.capabilities.isolation && !iso.unsafeProvider) {
+        throw new Error(`provider "${this.profile.provider}" cannot isolate inbound A2A sessions (set expose.${this.profile.name}.unsafeProvider to allow it anyway)`);
+      }
       const session = await this.provider.open({
         sessionId: this.channelKey,
         providerSessionId: cur.providerSessionId ?? undefined,
@@ -321,11 +333,13 @@ export class ChannelRuntime {
         systemPrompt: await this.host.systemPrompt(this.profile, this.multiparty, gw?.toolNames ?? [], {
           channelKey: this.channelKey, internal: this.host.isInternal?.(this.channelKey) ?? false, cwd,
           ...(worker ? { worker } : {}),
+          ...(iso ? { a2a: { ...(iso.prompt ? { prompt: iso.prompt } : {}) } } : {}),
         }),
+        ...(iso ? { isolated: true } : {}),
         mcp: gw,
         env: await this.host.providerEnv(this.profile),
         instanceId: this.host.instanceId,
-        nativeMemory: !this.host.settings.memory.enabled || this.host.settings.memory.nativeMemory,
+        nativeMemory: iso ? false : !this.host.settings.memory.enabled || this.host.settings.memory.nativeMemory,
       });
       const inflight = this.host.store.get(`inflight-turn:${this.channelKey}`);
       if (inflight) {

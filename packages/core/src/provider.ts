@@ -22,6 +22,10 @@ export interface ProviderCapabilities {
   nativeTools: boolean;
   attachments: ("image" | "file" | "audio")[];
   slashCommands: boolean;
+  /** Honors SessionSpec.isolated and enforces PermissionPolicy.denyTools exactly (tool names and path rules) on its
+   *  own tools. Without it, core refuses inbound A2A sessions on this provider (fail closed) unless the operator
+   *  opted in with `expose.<profile>.unsafeProvider`. */
+  isolation?: boolean;
 }
 
 /** Named agent configuration (provider + model + prompt + permissions). */
@@ -76,6 +80,10 @@ export interface SessionSpec {
   cwd: string;
   profile: Profile;
   systemPrompt: SystemPromptParts;
+  /** A remote party drives this session (inbound A2A). The provider loads nothing of the operator's own: no user /
+   *  project settings, CLAUDE.md, hooks, skills or plugins, no MCP server but UniQlaw's, no native memory. `cwd` is
+   *  an empty directory outside the project. Only honored by providers with the `isolation` capability. */
+  isolated?: boolean;
   /** MCP Gateway endpoint for this session (identity = token). */
   mcp?: { url: string; token: string; toolNames: string[] };
   nativeTools?: ToolDef[];
