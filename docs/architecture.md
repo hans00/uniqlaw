@@ -529,7 +529,7 @@ A unified permission model, translated by each adapter into the provider's setti
 interface PermissionPolicy {
   level: "locked" | "strict" | "moderate" | "unrestricted";  // carried over from v2
   allowTools: string[]; denyTools: string[];
-  approval: { mode: "auto-deny" | "ask-operator" | "auto-allow"; timeoutSec: number };
+  approval: { mode: "auto-deny" | "ask-operator" | "auto-allow"; timeoutSec: number /* 0 = wait indefinitely */; judge?: ApprovalJudgeConfig };
   dirScope?: string[];
 }
 ```
@@ -540,7 +540,64 @@ interface PermissionPolicy {
 - pi → `tool_call` hook (our own gate, fail-closed)
 
 The Approval Broker receives every `permission_request`, finds the operator per §8.4, sends inline buttons,
-and denies on timeout.
+and denies on timeout. `approval.timeoutSec: 0` waits for the human indefinitely (no timer in core, the chat adapters or pi).
+
+### 10.4 Approval judge
+
+An optional decision model scores each request before the operator is asked (`packages/core/src/approval-judge.ts`).
+It runs in `ChannelRuntime.onPermissionInner` after the `auto-allow` / `auto-deny` short-circuits, so every provider
+that emits `permission_request` gets it (claude-sdk, codex, opencode, acp, pi, claude-tmux); agy has no callback.
+
+```jsonc
+"permissions": { "approval": { "mode": "ask-operator", "timeoutSec": 0,
+  "judge": {
+    "provider": "typesafe-jev",            // a judge provider (ApprovalJudge); the daemon's JUDGE_PROVIDERS
+    "mode": "shadow",                      // off (default) | shadow | enforce
+    "credential": { "command": "nibwarden read 'nw://TypeSafe API/password'" },   // any SecretRef (§10.1)
+    "model": "jev-latest",
+    "allowAbove": 0.9,                     // floor for every kind
+    "byKind": { "chat": 0.9, "worker": 0.93, "cron": 0.97, "peer": 0.97 },     // a number or "off"
+    "timeoutMs": 5000,
+    "audit": true
+  } } }
+```
+
+Outcomes, in order:
+
+1. **deny**: only deterministic rules in code: the profile's `denyTools` (tool names, `Bash(prefix:*)`, path globs),
+   the channel tool policy, the `locked` level (anything not read-only), and writes (Write/Edit/MultiEdit/NotebookEdit)
+   outside the scope (`dirScope`, else the session's cwd; not at `unrestricted`). Path checks are lexical; symlinks are not followed.
+2. **allow**: only in `enforce`, when P(safe) ≥ `max(allowAbove, byKind[kind])`, and only for this request
+   (`scope: "once"`: never `always`/session rules, ACP never falls back to `allow_always`).
+3. **escalate** (the operator flow) in every other case: low score, judge error or timeout, a kind set to `"off"`,
+   **any inbound A2A session or turn with an A2A origin (hard-coded: config cannot enable it)**, and raw TUI dialog
+   text (claude-tmux scraping mixes the model's own description into it, so it is scored but never auto-allowed).
+
+`off` changes nothing (no judge call, no audit, identical prompts). `shadow` scores and logs every request
+(hard-policy rules included, as `wouldOutcome`) and still escalates all of them: deploy it first and calibrate.
+
+**Session kind** (strictest wins): `a2a` (A2A session or origin) → `worker` (worker session) → `chat` (a trusted human
+in the turn) → `cron` (scheduler origin, internal session) → `peer` (peer asks/triggers, untrusted humans, anything else).
+
+**Judge input** is minimal and trusted only, passed as typed fields: tool name, the structured input (secrets
+redacted, model-written fields such as `description`/`reason`/`title` dropped, size-capped), cwd, write scope, level,
+session kind, a one-line channel-policy summary, and the latest message of a **trusted human** in the turn (as they
+wrote it, capped). Never tool outputs, file or web content, assistant text, the provider's title, or peer, cron or
+A2A message text.
+
+**Audit**: `<stateDir>/approvals/YYYY-MM.jsonl` (UTC month), one line per request (`id, ts, channelKey, sessionKind,
+provider, tool, structured, inputHash, input` (redacted), `judge, model, pSafe, threshold, mode, outcome, reason,
+wouldOutcome, latencyMs, error`), then `{id, humanDecision, decidedAt}` when the human answers
+(`allow | deny | timeout | no-route`). These pairs are the calibration data. The transcript `permission` record gains
+`by` (`judge | policy | operator`) and `pSafe`.
+
+**Escalated prompts** start with the score, e.g. `🤖 Jev: 0.87 safe (needs 0.90)` or `🤖 Jev: no score (…)`.
+
+**typesafe-jev** (`packages/judge-typesafe`): `POST https://api.typesafe.ai/v1/systemone` with one Choice question
+(`safe | unsafe`); P(safe) is `answers.safety.probabilities.safe` (the probability of the option acted on, not
+`confidence`). The key is resolved from the SecretRef on the first request and kept in memory only. A `command`
+ref works with any secret CLI, e.g. `nibwarden read nw://<item>/<field>`, or start the daemon under
+`nibwarden run --` with an `{ "env": … }` ref.
 
 ### 10.3 Channel capabilities and group wake rules
 
