@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_PERMISSIONS } from "@uniqlaw/core";
+import { DEFAULT_PERMISSIONS, type ToolPolicy } from "@uniqlaw/core";
 import {
-  buildPermissionArgs, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
+  buildPermissionArgs, claudeToolSets, parseLine, locateJsonl, expectedJsonlPath, JsonlTailer, classifyInternalOutput,
   isInterruptMarker, isRejectionText, nativeMemoryArgs, nativeMemorySettings, composeAppendSystemPrompt, mcpConfigObject, claudeEnvForCredential, type JsonlEvent,
 } from "../src/index.ts";
 
@@ -36,13 +36,36 @@ describe("permissions", () => {
     expect(a[a.indexOf("--disallowedTools") + 1]).toContain("Read(./.uniqlaw/**)");
     expect(a).toContain("--strict-mcp-config");
     const empty = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "allow", groups: ["memory"] } });
-    expect(empty[empty.indexOf("--tools") + 1]).toBe(""); // no built-in tools at all
+    expect(empty[empty.indexOf("--tools") + 1]).toBe("ToolSearch"); // no built-in tools but the MCP tool loader
+    expect(buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "allow", groups: ["web"] } })).toContain("WebSearch,WebFetch");
     const locked = buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "locked" }, { toolPolicy: { mode: "allow", groups: ["files.read", "bash"] } });
     expect(locked[locked.indexOf("--tools") + 1]).toBe("Read,Grep,Glob"); // the profile level still caps it
     const d = buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy: { mode: "deny", groups: ["bash", "web", "cron"] } });
     expect(d).not.toContain("--tools");
-    expect(d).not.toContain("--strict-mcp-config");
+    expect(d).toContain("--strict-mcp-config"); // the user's own MCP servers belong to no group: deny mode drops them too
     expect(d[d.indexOf("--disallowedTools") + 1].split(" ")).toEqual(expect.arrayContaining(["Bash", "Monitor", "WebSearch", "WebFetch", "SendMessage", "Read(./.uniqlaw/**)"]));
+  });
+  test("channel tool policy: every policy is strict about MCP servers; no policy keeps the exact old args", () => {
+    for (const toolPolicy of [{ mode: "deny", groups: ["web", "notify"] }, { mode: "deny", groups: ["memory"] }, { mode: "allow", groups: ["memory"] }] as ToolPolicy[]) {
+      expect(buildPermissionArgs(DEFAULT_PERMISSIONS, { toolPolicy })).toContain("--strict-mcp-config");
+      expect(claudeToolSets(DEFAULT_PERMISSIONS, toolPolicy).strictMcp).toBe(true);
+    }
+    expect(claudeToolSets(DEFAULT_PERMISSIONS).strictMcp).toBe(false);
+    expect(buildPermissionArgs(DEFAULT_PERMISSIONS, { extraAllowed: ["mcp__uniqlaw"] }))
+      .toEqual(["--permission-mode", "auto", "--allowedTools", "mcp__uniqlaw", "--disallowedTools", "ListAgents SendMessage"]);
+    expect(buildPermissionArgs({ ...DEFAULT_PERMISSIONS, level: "strict" }))
+      .toEqual(["--permission-mode", "default", "--disallowedTools", "ListAgents SendMessage Bash WebSearch WebFetch"]);
+  });
+  test("channel tool policy: ToolSearch stays while any UniQlaw MCP group is granted, even without chat", () => {
+    const tools = (groups: string[]) => claudeToolSets(DEFAULT_PERMISSIONS, { mode: "allow", groups } as ToolPolicy).tools;
+    const denied = (groups: string[]) => claudeToolSets(DEFAULT_PERMISSIONS, { mode: "deny", groups } as ToolPolicy).deny;
+    expect(tools(["memory"])).toEqual(["ToolSearch"]);
+    expect(tools(["web", "files.read"])).not.toContain("ToolSearch"); // no MCP tool to load
+    expect(tools(["chat"])).toContain("ToolSearch");
+    expect(denied(["chat"])).not.toContain("ToolSearch");
+    expect(denied(["chat"])).toContain("TaskCreate");
+    const allMcp = ["chat", "memory", "cron", "worker", "xsession", "notify"];
+    expect(denied(allMcp)).toContain("ToolSearch"); // nothing left to load
   });
 });
 

@@ -484,7 +484,7 @@ core resolves it into `SessionSpec.toolPolicy` when the chat's session opens. On
 
 | group | UniQlaw MCP tools | Claude Code built-ins (names as of claude 2.1.322) |
 |---|---|---|
-| `chat` | `send_file` (own chat only unless `notify` is granted) | `TaskCreate/Get/List/Update`, `ToolSearch`, `AskUserQuestion`, plan mode, `ReportFindings` |
+| `chat` | `send_file` (own chat only unless `notify` is granted) | `TaskCreate/Get/List/Update`, `ToolSearch`¹, `AskUserQuestion`, plan mode, `ReportFindings` |
 | `memory` | `memory_write`, `memory_search`, `memory_get` | — |
 | `web` | — | `WebSearch`, `WebFetch` |
 | `files.read` | — | `Read`, `Grep`, `Glob`, `LSP` |
@@ -496,6 +496,8 @@ core resolves it into `SessionSpec.toolPolicy` when the chat's session opens. On
 | `xsession` ⚠ | `agents_list`, `agent_ask`, `agent_trigger`, `task_status` | `SendToProject` (`ListAgents` / `SendMessage` are always off) |
 | `notify` | `notify` (and `send_file` to other chats) | `PushNotification`, `Artifact*`, `DesignSync` |
 | `config` | reserved (no tools yet) | — |
+
+¹ `ToolSearch` loads deferred MCP tools, so it stays whenever any group with UniQlaw MCP tools is granted, even if `chat` is not.
 
 **⚠ Admin-level groups (v1).** `bash`, `files.write`, `cron`, `worker` and `xsession` grant effectively full access,
 because each one lets a restricted chat reach something unrestricted:
@@ -510,13 +512,17 @@ There is no policy inheritance across these hops yet. The daemon logs a warning 
 **Sensitive reads.** `.uniqlaw/` holds other chats' transcripts (`state.db`), settings, logs and the per-session MCP
 gateway tokens (`claude-tmux/*/mcp.json`). Every restricted chat on a Claude provider gets
 `Read(./.uniqlaw/**)` / `Grep(…)` / `Glob(…)` deny rules (relative to the session's cwd, the project directory), but
-`files.read` still reaches the rest of the project (including `memory/`) and anything else the OS user can read. A shell
+Claude Code matches `Grep(…)` rules on the `path` argument only, but it also leaves denied paths out of Grep results,
+so `path: "."` with `glob: ".uniqlaw/**"` finds nothing there (checked on claude 2.1.322; pinned by
+`claude-common/test/tool-policy.e2e.test.ts`). `files.read` still reaches the rest of the project (including `memory/`) and anything else the OS user can read. A shell
 (`bash`) bypasses these rules entirely.
 
 - `tools: [...]` is an allow list: only those tools exist. Claude gets `--tools <built-ins>` and `--strict-mcp-config`
   (no MCP servers from the user's own config), plus the granted UniQlaw tools named one by one in `--allowedTools`.
   Built-ins no group names (`Task`, `Skill`, …) are off.
 - `tools: "*"` keeps everything; `deny` subtracts groups (`--disallowedTools` for built-ins, gateway filtering for MCP).
+  Any policy, allow or deny, also gets `--strict-mcp-config`: the user's own MCP servers (browser automation, mail, …)
+  belong to no group, so no restricted chat gets them. A chat with no policy keeps its exact old launch flags.
 - The MCP gateway never registers a tool the caller's channel lacks (not listed, not callable), checked per request.
 - Enforcement of built-in tools is the provider's job (`ProviderCapabilities.toolPolicy`, implemented by claude-tmux and
   claude-sdk). If a channel restricts built-in tools and its provider can't, the session refuses to open (fail closed).

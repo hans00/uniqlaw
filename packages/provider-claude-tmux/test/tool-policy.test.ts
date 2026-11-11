@@ -88,3 +88,12 @@ test("no channel policy: launch flags are unchanged (whole uniqlaw server allowe
   expect(argv).not.toContain("--tools");
   expect(argv).not.toContain("--strict-mcp-config");
 });
+
+test("deny-mode channel policy: launched with --strict-mcp-config (the user's own MCP servers are off too)", async () => {
+  const { dir, tmux, p } = setup();
+  sessions.push(await p.open(spec(dir, { mode: "deny", groups: ["web", "notify"] }, ["send_file", "memory_write"])));
+  const argv = tmux.spawned[0]!;
+  expect(argv).toContain("--strict-mcp-config");
+  expect(argv).not.toContain("--tools");
+  expect(flag(argv, "--disallowedTools")!.split(" ")).toEqual(expect.arrayContaining(["WebSearch", "PushNotification"]));
+});

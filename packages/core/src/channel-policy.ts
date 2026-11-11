@@ -44,7 +44,9 @@ export const TOOL_GROUPS: Record<ToolGroup, ToolGroupDef> = {
 export const ADMIN_TOOL_GROUPS: readonly ToolGroup[] = ["bash", "files.write", "cron", "worker", "xsession"];
 
 /** Files a restricted chat may not read even with files.read (UniQlaw state: transcripts, state.db, gateway
- *  tokens in claude-tmux mcp.json files, settings). Paths are relative to the session's cwd (the project dir). */
+ *  tokens in claude-tmux mcp.json files, settings). Paths are relative to the session's cwd (the project dir).
+ *  Grep rules match its `path` only, but Claude Code also drops denied paths from Grep results, so
+ *  `path: "."` + `glob: ".uniqlaw/**"` finds nothing there (checked on 2.1.322; see tool-policy.e2e.test.ts). */
 export const PROTECTED_READ_RULES = ["Read(./.uniqlaw/**)", "Grep(./.uniqlaw/**)", "Glob(./.uniqlaw/**)"];
 
 /** Groups whose tools are the provider's own (enforced by the provider, not the gateway). */
@@ -105,8 +107,14 @@ export function restrictsNativeTools(policy: ToolPolicy | undefined): boolean {
 /** Claude Code flags for a policy: the built-in tools to keep (allow mode → `--tools`) and to disallow. Any
  *  restricted chat also loses read access to UniQlaw's state directory. */
 export function claudeToolLists(policy: ToolPolicy): { tools?: string[]; disallowed: string[] } {
-  const names = [...new Set(policy.groups.flatMap((g) => TOOL_GROUPS[g].claude))];
-  return policy.mode === "allow" ? { tools: names, disallowed: [...PROTECTED_READ_RULES] } : { disallowed: [...names, ...PROTECTED_READ_RULES] };
+  const names = new Set(policy.groups.flatMap((g) => TOOL_GROUPS[g].claude));
+  // ToolSearch loads deferred MCP tools: keep it while any UniQlaw MCP group is granted, even without `chat`.
+  const mcpGranted = (Object.keys(TOOL_GROUPS) as ToolGroup[]).some((g) => TOOL_GROUPS[g].mcp.length > 0 && groupAllowed(policy, g));
+  if (mcpGranted) {
+    if (policy.mode === "allow") names.add("ToolSearch");
+    else names.delete("ToolSearch");
+  }
+  return policy.mode === "allow" ? { tools: [...names], disallowed: [...PROTECTED_READ_RULES] } : { disallowed: [...names, ...PROTECTED_READ_RULES] };
 }
 
 /** Config-load warnings: restricted chats that are granted admin-level groups, and bare ids in the global

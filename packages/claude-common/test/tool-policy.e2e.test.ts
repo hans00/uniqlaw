@@ -1,5 +1,5 @@
 // Real claude CLI (UNIQLAW_E2E=1): the flags a restricted chat gets keep UniQlaw MCP tools callable while built-ins
-// are gone (`--tools ""` + `--strict-mcp-config`), and files.read can't reach .uniqlaw/. Uses haiku, an isolated temp
+// are gone (`--tools ToolSearch` + `--strict-mcp-config`), and files.read can't reach .uniqlaw/. Uses haiku, an isolated temp
 // project, `--setting-sources project` (no user hooks/plugins) and `--no-session-persistence`.
 import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -44,7 +44,7 @@ async function run(policy: ToolPolicy, prompt: string) {
 test.skipIf(!E2E)("memory-only chat: MCP memory tools work, no built-in tools exist", async () => {
   const r = await run({ mode: "allow", groups: ["memory"] },
     "Call the tool mcp__uniqlaw__memory_write with text \"e2e-probe-note\". Then try to run `echo hi` with Bash. Report in one line which worked.");
-  expect(r.tools.sort()).toEqual(["mcp__uniqlaw__memory_get", "mcp__uniqlaw__memory_search", "mcp__uniqlaw__memory_write"]);
+  expect(r.tools.sort()).toEqual(["ToolSearch", "mcp__uniqlaw__memory_get", "mcp__uniqlaw__memory_search", "mcp__uniqlaw__memory_write"]);
   expect(r.uses).toContain("mcp__uniqlaw__memory_write");
   const notes = readdirSync(join(r.proj, "memory")).map((f) => readFileSync(join(r.proj, "memory", f), "utf8")).join("");
   expect(notes).toContain("e2e-probe-note");
@@ -60,4 +60,17 @@ test.skipIf(!E2E)("files.read chat: Read works in the project but is denied unde
   expect(texts.some((t) => t.text.includes("TOPSECRET"))).toBe(false);
   expect(texts.some((t) => t.err && /denied/i.test(t.text))).toBe(true); // the read was tried and refused
   expect(texts.some((t) => !t.err && t.text.includes("PUBLIC-7"))).toBe(true);
+}, 180_000);
+
+// Claude Code matches Grep(...) rules on `path` only, but (checked on 2.1.322) it also drops files under a Read/Grep-
+// denied path from Grep results, so `path: "."` plus `glob: ".uniqlaw/**"` finds nothing there. This pins that down.
+test.skipIf(!E2E)("files.read chat: Grep from the project root can't see .uniqlaw/, with or without a glob", async () => {
+  const r = await run({ mode: "allow", groups: ["memory", "files.read"] },
+    "Use the Grep tool exactly once with pattern \"TOPSECRET\", path \".\", glob \".uniqlaw/**\" and output_mode \"content\". " +
+    "Then use Grep once with pattern \"TOPSECRET|PUBLIC\", path \".\", output_mode \"content\" and no glob. Report the raw results.");
+  const texts = r.results.map((b) => JSON.stringify(b.content));
+  if (!texts.some((t) => t.includes("PUBLIC-7"))) console.log("tool uses:", r.uses, texts);
+  expect(r.uses.filter((u) => u === "Grep").length).toBeGreaterThanOrEqual(2);
+  expect(texts.some((t) => t.includes("TOPSECRET"))).toBe(false);
+  expect(texts.some((t) => t.includes("PUBLIC-7"))).toBe(true); // the root search did run
 }, 180_000);

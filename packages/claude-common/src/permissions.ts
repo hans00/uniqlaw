@@ -30,7 +30,8 @@ export interface PermissionArgsOptions {
 const LOCKED_TOOLS = ["Read", "Grep", "Glob"];
 
 /** Built-in tools to keep (undefined = Claude Code's default set) and to deny, from the profile's permission level
- *  and the channel's tool policy. Allow-mode policies also cut every MCP server but UniQlaw's (strictMcp). */
+ *  and the channel's tool policy. Any channel policy also cuts every MCP server but UniQlaw's (strictMcp): the user's
+ *  own servers (browser automation, mail, …) belong to no tool group, so neither mode can grant them. */
 export function claudeToolSets(p: PermissionPolicy, policy?: ToolPolicy): { tools?: string[]; deny: string[]; strictMcp: boolean } {
   const deny = new Set<string>([...NATIVE_CROSS_SESSION_TOOLS, ...p.denyTools]);
   let tools: string[] | undefined = p.level === "locked" ? [...LOCKED_TOOLS] : undefined;
@@ -40,7 +41,7 @@ export function claudeToolSets(p: PermissionPolicy, policy?: ToolPolicy): { tool
     for (const t of l.disallowed) deny.add(t);
     if (l.tools) tools = tools ? tools.filter((t) => l.tools!.includes(t)) : l.tools;
   }
-  return { ...(tools ? { tools } : {}), deny: [...deny], strictMcp: policy?.mode === "allow" };
+  return { ...(tools ? { tools } : {}), deny: [...deny], strictMcp: !!policy };
 }
 
 export function buildPermissionArgs(p: PermissionPolicy, o: PermissionArgsOptions = {}): string[] {
