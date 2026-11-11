@@ -593,6 +593,23 @@ v1 → uniqlaw: not directly supported; first upgrade to v2 with v2's `/claudecl
 
 `uniqlaw ls` lists every instance on the machine (scanning the claims directory + each `runtime.json`): status, ports, profiles, session count.
 
+### 11.3 Graceful restart / reload
+
+A restart used to cut every running turn off, including the one that asked for it (an agent ran `uniqlaw reload` mid-turn and its reply was lost). Now both kinds go through one coordinator (`core/restart.ts`):
+
+| | what it restarts |
+|---|---|
+| **reload** (`uniqlaw reload`, `POST /api/reload`, `SIGHUP`) | in-process, with fresh settings; already-loaded code stays |
+| **restart** (`uniqlaw restart`, `POST /api/restart`, the `daemon_restart` tool) | a new process (new code and settings). The old process stops (lock, ports and bot claims released), starts `argv` again detached (`UNIQLAW_WAIT_PID` makes the new one wait for the old pid), and exits. `UNIQLAW_RESTART_MODE=exit`: exit `75` instead and let a supervisor (systemd `Restart=on-failure`, …) start it |
+
+1. **Request** returns at once (an agent's own turn must be able to finish). `--in 10m` / `--at 03:00|ISO` schedule it (kv `restart-pending`; re-armed by a reload in between, dropped if its time passed while the daemon was down); `--now` skips the wait; `--cancel` cancels and releases held input. Settings are validated at request time and again before stopping (invalid → the restart is aborted and the requester told). Concurrent requests merge (restart beats reload, earliest time wins). Who asked: the calling session for the tool; for the CLI `--from <session>`, else `$UNIQLAW_SESSION` (set in every provider child's env), else `cli`.
+2. **Drain.** No new turns: `ChannelRuntime.enqueue` and `drain()` hand inputs to `ChannelManager.deferInput`, which writes them to `state.db` `deferred_input` (write-through, so a crash mid-drain loses nothing) and tells a human once per chat that the message waits. No steer / interrupt into a running turn either. One exception: an `agent_ask` from a session whose turn is running (that turn waits for the answer). Blocking calls that could only be answered after the restart fail fast: `agent_ask` with `wait` from a non-running caller, `complete()` (dreaming), inbound A2A. Running turns get `restart.drainTimeoutSec` (default 120 s); "running" includes a rate-limit backoff and a turn still posting its end (`ChannelRuntime.busy`). Cron jobs due during the drain fire into `deferred_input` and run after the restart; jobs due in the stop → start gap (≤ 15 min since the previous process's last tick) are caught up once on start even with `catchUpHours: 0`.
+3. **Persist** (kv `restart-record`): kind, who, reasons, time, where each requesting session's reply goes, the turns still running at the timeout (session, whom they answered, whether the provider process survives), the number of deferred inputs (runtime queues are flushed into `deferred_input` too), and the open bus tasks. `SIGTERM` / `SIGINT` (`uniqlaw stop`) write a `stop` record without draining, so turns cut off by a stop are reported on the next start too.
+4. **Come back.** Before sessions are restored, every task still `submitted`/`working` is either re-armed (its request is in `deferred_input`, or the turn answering it kept running in a reattached session: `inflight-turn` now keeps peer ask/trigger origins) or failed with "the UniQlaw daemon restarted before it finished" — the asking session gets that as a failed `agent_ask` result (tasks not updated for over an hour are failed quietly). Once platforms are up: the record is deleted, deferred input is replayed, and a `[uniqlaw] daemon restarted at … (reason; requested by …). Interrupted: … . Queued messages replayed: N.` notice goes as a new turn to the requesting session and to every session that had a turn cut off (with what to do: "resume it" or, when its process survived, "it may have finished on its own"). The notice is a scheduler-origin turn (`job: uniqlaw-restart`) delivered to the chat the requester / interrupted turn was answering, so the agent's confirmation reaches its human whatever `backgroundNotify` says.
+5. **Reattach.** A claude-tmux session survives; if it is still in the interrupted turn, that turn claims its resumed origins first (queued input, including the notice, waits up to 3 s after reopening for that) and the notice follows as the next turn.
+
+Replay and notices are **at-most-once**: rows and record are deleted before anything is enqueued, so a crash right after the start never replays or notifies twice; a crash between persisting and exiting (or mid-drain) is covered because everything is in `state.db` before the process stops.
+
 ## 12. Repo structure (Bun workspaces)
 
 ```
@@ -610,7 +627,7 @@ packages/
   platform-telegram/  platform-discord/  platform-slack/  platform-line/  platform-web/
   scheduler-cron/     scheduler-heartbeat/
   transport-a2a/
-  cli/                uniqlaw init|doctor|start|stop|reload|status|ls|send|trigger|mcp-shim
+  cli/                uniqlaw init|doctor|start|stop|reload|restart|status|ls|send|trigger|mcp-shim
   credentials/        Credential resolution, SecretRef (env / file / command), conversion to per-provider env
   testkit/            provider-mock, platform-mock, capability contract tests
 ```
@@ -685,7 +702,7 @@ M0 results are in `docs/spikes/M0-results.md`. There are currently no open quest
 
 ### 15.4 Second-round additions
 - **Streaming output** (`output.stream: "replace"`): provider token deltas edit the same message live (first after 0.8 seconds, then at most once every 1.5 seconds); nothing is shown until there is enough text to rule out `NO_REPLY` / `HEARTBEAT_OK`, and `[react:…]` never appears in the live text; on interrupt, what has been shown is kept. Verified with real claude-sdk + the Telegram adapter.
-- **Settings hot reload**: `uniqlaw reload` / `POST /api/reload` / `SIGHUP`; settings are validated first, and on failure the old settings stay in effect; on success it restarts within the same process, with provider sessions kept via `detach()`.
+- **Settings hot reload**: `uniqlaw reload` / `POST /api/reload` / `SIGHUP`; settings are validated first, and on failure the old settings stay in effect; on success it restarts within the same process, with provider sessions kept via `detach()`. Since 2026-11-11 it is graceful (§11.3).
 - **Usability**: `uniqlaw init` (interactive wizard or `--yes`; stores only references to secrets; rejects empty allowlists), `uniqlaw doctor`, `uniqlaw logs`; README, `docs/INSTALL.md`; Claude Code plugin (`/uniqlaw:*` commands and the `uniqlaw-agents` skill).
 
 ### 15.5 API / SDK conformance checks (no real credentials needed)

@@ -18,6 +18,7 @@ First public version.
 - `send_file` bus tool: agents post local files (image, audio, voice note, video, document) to their own or another chat without calling platform APIs. Telegram, Discord and Slack (needs the `files:write` scope); limited to the project, the session's directory, the temp dir, `workers.roots` and `files.roots`, up to `files.maxMB`.
 - Group modes: `mention` (default; unaddressed messages are kept as context for the next turn) or `always`, with `ignoreOtherMentions`, per-channel settings (`groups.channels`) and `/activation`. Discord's v2 per-channel `requireMention` / `ignoreOtherMentions` map onto them; unaddressed messages are no longer dropped.
 - Agent-guided migration from ClaudeClaw v2 (`docs/MIGRATE.md`), including importing Claude auto-memory.
+- Graceful restart / reload (`uniqlaw restart [--in|--at] [--now] [--cancel]`, `uniqlaw reload`, `POST /api/restart`, the `daemon_restart` tool for the operator's chat): the request returns at once, running turns finish (`restart.drainTimeoutSec`), new messages, async results and due cron jobs are kept in `state.db` and replayed after it, open `agent_ask` tasks are re-armed or failed with a reason, and the requesting session plus every session whose turn was cut off get a `[uniqlaw]` notice as a new turn (claude-tmux sessions too, after their resumed turn). `restart` starts a new process (`UNIQLAW_RESTART_MODE=exit` for supervisors); `SIGTERM` records interrupted turns for the next start.
 
 ### Fixes
 

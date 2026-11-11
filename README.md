@@ -82,7 +82,8 @@ As a Claude Code plugin: `/plugin marketplace add hans00/uniqlaw`, then `/plugin
 | `uniqlaw doctor` | health check; exit code 1 on failures; never prints secrets |
 | `uniqlaw start` / `stop` | run the daemon in the background / stop it (agent tmux sessions stay alive and are reattached) |
 | `uniqlaw run` | foreground daemon (SIGHUP = reload, SIGTERM/SIGINT = stop) |
-| `uniqlaw reload` | re-read settings.json without restarting; invalid settings are refused and the running config stays |
+| `uniqlaw reload [--reason R] [--now]` | re-read settings.json in-process; invalid settings are refused and the running config stays |
+| `uniqlaw restart [--reason R] [--in 10m \| --at 03:00] [--now] [--cancel]` | restart the daemon process (new code + settings). Both are graceful: the command returns at once, running turns finish first (`restart.drainTimeoutSec`, default 120 s), new messages wait and are replayed, and the asking session and any session whose turn was cut off get a `[uniqlaw]` notice when it is back. Agents in the operator's chat can use the `daemon_restart` tool. Under a supervisor set `UNIQLAW_RESTART_MODE=exit` (exits 75) |
 | `uniqlaw status` / `logs [--lines N]` / `ls` | daemon + sessions / log tail / all instances on this machine |
 | `uniqlaw send <target> <text>` | post text to a chat, e.g. `telegram:<chatId>` |
 | `uniqlaw trigger <target> <prompt>` | make a session answer its own chat |
