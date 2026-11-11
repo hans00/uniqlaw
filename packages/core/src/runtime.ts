@@ -12,6 +12,7 @@ import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
 import { isA2ASession } from "./a2a-policy.ts";
 import { describeTargets, SessionLedger, type TargetReport } from "./targets.ts";
 import { requestDialect } from "./shell.ts";
+import { compileToolPatterns, detectTaint, type TaintSource } from "./taint.ts";
 import {
   allowBlockers, buildJudgeInput, decideOutcome, hardPolicyDeny, inputFingerprint, inputHash, judgeNote, redactInput, runJudge, strictestKind, writeScope,
   type ObservedAction,
@@ -174,6 +175,15 @@ const INTERRUPT_SETTLE_MS = 8000;
 const HOOK_ESCALATED_TTL_MS = 60_000;
 /** Time budget for computing a request's targets (git and filesystem checks). */
 const TARGETS_BUDGET_MS = 3000;
+const DEFAULT_HIGH_IMPACT = ["send", "publish", "delete", "install"];
+
+/** Under taint: does the request do something high-impact, or reach external / remote / global / protected targets?
+ *  Unknown (no targets, unrecognized commands) counts as yes. */
+function highImpact(report: TargetReport | undefined, effects: readonly string[]): boolean {
+  if (!report || report.unrecognized.length) return true;
+  return report.targets.some((t) => effects.includes(t.effect) || t.remote || t.details?.hostClass === "external"
+    || ["global", "system", "user-global"].includes(String(t.details?.scope)) || t.details?.isProtected === true);
+}
 
 type JudgeStageResult = { id: string; outcome: ReturnType<typeof decideOutcome>["outcome"]; pSafe?: number; note?: string; audit: boolean };
 
@@ -211,6 +221,8 @@ export class ChannelRuntime {
   private hookEscalated: { at: number; tool: string; input: unknown; fingerprint?: string; judged: JudgeStageResult }[] = [];
   /** The provider's permission hook has reached this session (its dialogs follow a hook verdict). */
   private hookActive = false;
+  /** Taint kept across turns (judge.taint.sticky). */
+  private stickyTaint: TaintSource[] = [];
   /** What this session created (files, dirs, branches, packages, processes, …), for the judge's target provenance. */
   private ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
   private readonly log: Logger;
@@ -431,6 +443,7 @@ export class ChannelRuntime {
   async reset(): Promise<void> {
     await this.close();
     this.ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
+    this.stickyTaint = [];
     this.host.store.patchSession(this.channelKey, { providerSessionId: null, adapterState: null });
   }
 
@@ -496,7 +509,7 @@ export class ChannelRuntime {
         this.ledger.observe(ev.name, ev.input, cwd);
         if (!this.turn) return;
         const trace = (this.turn.trace ??= []);
-        trace.push({ id: ev.id, tool: ev.name, input: ev.input });
+        trace.push({ id: ev.id, tool: ev.name, input: ev.input, ...this.taintOf(ev.name, ev.input, cwd) });
         if (trace.length > 60) trace.splice(0, trace.length - 60);
         return;
       }
@@ -520,6 +533,7 @@ export class ChannelRuntime {
       });
     }
     this.ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
+    this.stickyTaint = [];
     const cur = this.host.store.getSession(this.channelKey)!;
     const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const gw = this.host.gatewayFor(this.channelKey);
@@ -1258,7 +1272,8 @@ export class ChannelRuntime {
     const cfg = policy.approval.judge;
     if (!cfg || cfg.mode === "off") return undefined;
     const id = crypto.randomUUID();
-    const { kind, threshold } = strictestKind(cfg, this.sessionKinds());
+    const { kind, threshold: kindThreshold } = strictestKind(cfg, this.sessionKinds());
+    let threshold = kindThreshold;
     const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
     const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const structured = typeof ev.input !== "string";
@@ -1267,8 +1282,12 @@ export class ChannelRuntime {
     const human = this.trustedHumanText();
     const trace = this.capabilities.toolTrace === false ? undefined : this.traceBefore(ev);
     const targets = structured ? await this.targetsOf(ev, cwd) : undefined;
+    // Taint: untrusted content in the context makes high-impact or far-reaching requests need a stricter score.
+    const taint = await this.taintBefore(trace);
+    const taintStrict = !!taint?.length && threshold !== undefined && highImpact(targets, cfg.taint?.highImpactEffects ?? DEFAULT_HIGH_IMPACT);
+    if (taintStrict) threshold = Math.max(threshold!, cfg.taint?.taintedAbove ?? 0.97);
     const { altered, ...input } = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind, dialect,
-      ...(human ? { humanRequest: human } : {}), ...(trace ? { trace } : {}), ...(targets ? { targets } : {}) });
+      ...(human ? { humanRequest: human } : {}), ...(trace ? { trace } : {}), ...(targets ? { targets } : {}), ...(taint ? { taint } : {}) });
     const blockers = allowBlockers({ tool: ev.tool, input: ev.input, structured, altered, policy, dialect });
     if (ev.options?.length && onceOption(ev.options) === undefined) blockers.push("no-once-option");
     let judge: ApprovalJudge | undefined;
@@ -1278,7 +1297,8 @@ export class ChannelRuntime {
     if (!(hardDeny && cfg.mode === "enforce")) {
       judged = judge ? await runJudge(judge, input, cfg.timeoutMs) : { ok: false, error: `judge provider "${cfg.provider}" is not available`, latencyMs: 0 };
     }
-    const { outcome, would } = decideOutcome({ mode: cfg.mode, ...(hardDeny ? { hardDeny } : {}), ...(judged ? { judged } : {}), ...(threshold !== undefined ? { threshold } : {}), structured, blockers });
+    const { outcome, would } = decideOutcome({ mode: cfg.mode, ...(hardDeny ? { hardDeny } : {}), ...(judged ? { judged } : {}), ...(threshold !== undefined ? { threshold } : {}), structured, blockers,
+      inducedAbove: cfg.inducedAbove ?? 0.5 });
     if (judged && !judged.ok) this.log.warn("approval judge failed; asking the operator", { tool: ev.tool, error: judged.error });
     const name = judge?.name ?? cfg.provider;
     const pSafe = judged?.ok ? judged.pSafe : undefined;
@@ -1293,11 +1313,46 @@ export class ChannelRuntime {
         ...(blockers.length ? { blockers } : {}),
         actionTrace: input.actionTrace, ...(input.targets ? { targets: input.targets } : {}), ...(input.unrecognized ? { unrecognized: input.unrecognized } : {}),
         ...(input.agentRationale ? { agentRationale: input.agentRationale } : {}),
+        ...(input.taint ? { taint: input.taint, taintStrict } : {}),
+        ...(judged?.ok && judged.pInduced !== undefined ? { pInduced: judged.pInduced } : {}), ...(judged?.ok && judged.inducedLabel ? { inducedLabel: judged.inducedLabel } : {}),
         ...(judged ? { latencyMs: judged.latencyMs } : {}), ...(judged && !judged.ok ? { error: judged.error } : {}),
       });
     }
     const note = judgeNote(name, judged, threshold);
     return { id, outcome, ...(pSafe !== undefined ? { pSafe } : {}), ...(note ? { note } : {}), audit: cfg.audit };
+  }
+
+  /** Start detecting the untrusted sources an observed action brings in (only with a judge and taint on). */
+  private taintOf(tool: string, input: unknown, cwd: string): { taint?: Promise<TaintSource[]> } {
+    const cfg = this.profile.permissions.approval.judge;
+    if (!cfg || cfg.mode === "off" || cfg.taint?.enabled === false) return {};
+    const scope = writeScope(this.profile.permissions, cwd) ?? [cwd];
+    return { taint: detectTaint(tool, input, { cwd, scope, ledger: this.ledger, trustRepoFiles: cfg.taint?.trustRepoFiles ?? true,
+      thirdPartyTools: compileToolPatterns(cfg.taint?.thirdPartyTools), dialect: requestDialect(tool, input, this.capabilities.shellDialects), at: Date.now() })
+      .catch(() => [] as TaintSource[]) };
+  }
+
+  /** Untrusted sources in the context before this request: from the observed actions, the turn's message origins
+   *  (peer, cron, A2A, untrusted humans) and, when sticky, earlier turns. undefined = taint tracking off. */
+  private async taintBefore(trace: ObservedAction[] | undefined): Promise<TaintSource[] | undefined> {
+    const cfg = this.profile.permissions.approval.judge;
+    if (!cfg || cfg.taint?.enabled === false) return undefined;
+    const now = Date.now();
+    const fromOrigins: TaintSource[] = [];
+    for (const o of this.turn?.origins ?? []) {
+      if (o.kind === "peer") fromOrigins.push({ kind: "peer-message", id: o.fromSession, at: now });
+      else if (o.kind === "scheduler") fromOrigins.push({ kind: "cron-message", id: o.job, at: now });
+      else if (o.kind === "a2a") fromOrigins.push({ kind: "a2a-message", id: o.remote, at: now });
+      else if (o.kind === "human" && !o.trusted) fromOrigins.push({ kind: "untrusted-human", id: o.sender.name, at: now });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<TaintSource[][]>((res) => { timer = setTimeout(() => res([]), TARGETS_BUDGET_MS); });
+    const fromTrace = (await Promise.race([Promise.all((trace ?? []).map((e) => e.taint ?? Promise.resolve([] as TaintSource[]))), budget]).finally(() => clearTimeout(timer))).flat();
+    const all = [...(cfg.taint?.sticky ? this.stickyTaint : []), ...fromTrace, ...fromOrigins];
+    const seen = new Set<string>();
+    const out = all.filter((t) => { const k = `${t.kind}:${t.id}`; if (seen.has(k)) return false; seen.add(k); return true; });
+    if (cfg.taint?.sticky) this.stickyTaint = out;
+    return out;
   }
 
   /** This turn's observed actions before this request (the request's own tool_start, if already seen, left out). */
