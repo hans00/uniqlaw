@@ -15,6 +15,11 @@ export const cronConfigSchema = z.object({
   catchUpHours: z.number().nonnegative().default(0),
 });
 
+/** A gap this short since the previous process's last tick is a restart/reload: its missed occurrences fire once
+ *  even with catchUpHours 0 (a job due while the daemon restarted must not be dropped). */
+export const RESTART_GAP_MS = 15 * 60_000;
+const LAST_TICK_KEY = "cron:__lastTick";
+
 export class CronScheduler implements Scheduler {
   private timer?: ReturnType<typeof setTimeout>;
   private api?: SchedulerApi;
@@ -23,7 +28,9 @@ export class CronScheduler implements Scheduler {
 
   start(api: SchedulerApi) {
     this.api = api;
+    const lastTick = Number(api.kvGet(LAST_TICK_KEY) ?? 0) * 60_000;
     if (this.cfg.catchUpHours > 0) void this.catchUp();
+    else if (lastTick && this.now().getTime() - lastTick <= RESTART_GAP_MS) void this.catchUpGap(new Date(lastTick));
     const n = this.now();
     const ms = (60 - n.getSeconds()) * 1000 - n.getMilliseconds();
     this.timer = setTimeout(() => this.loop(), ms);
@@ -71,6 +78,7 @@ export class CronScheduler implements Scheduler {
   async tick(at = this.now()): Promise<string[]> {
     const fired: string[] = [];
     const minute = Math.floor(at.getTime() / 60_000);
+    this.api!.kvSet(LAST_TICK_KEY, String(minute));
     for (const job of this.jobs()) {
       if (!cronMatches(job.schedule, at, job.timezone ?? this.tz)) continue;
       if (Number(this.api!.kvGet(`cron:${job.name}:minute`)) === minute) continue; // already fired this minute
@@ -88,6 +96,21 @@ export class CronScheduler implements Scheduler {
       const last = Number(this.api!.kvGet(`cron:${job.name}:minute`) ?? 0) * 60_000;
       const from = new Date(Math.max(last, windowStart.getTime()));
       const missed = occurrencesBetween(job.schedule, from, new Date(at.getTime() - 60_000), job.timezone ?? this.tz);
+      if (!missed.length) continue;
+      this.api!.kvSet(`cron:${job.name}:minute`, String(Math.floor(missed.at(-1)!.getTime() / 60_000)));
+      await this.fire(job, true, missed.length);
+      fired.push(job.name);
+    }
+    return fired;
+  }
+
+  /** Occurrences in (lastTick, now] that didn't fire because the daemon was restarting (the current minute
+   *  included: the first tick only comes at the next minute boundary). */
+  async catchUpGap(lastTick: Date, at = this.now()): Promise<string[]> {
+    const fired: string[] = [];
+    for (const job of this.jobs()) {
+      const last = Number(this.api!.kvGet(`cron:${job.name}:minute`) ?? 0) * 60_000;
+      const missed = occurrencesBetween(job.schedule, new Date(Math.max(last, lastTick.getTime())), at, job.timezone ?? this.tz);
       if (!missed.length) continue;
       this.api!.kvSet(`cron:${job.name}:minute`, String(Math.floor(missed.at(-1)!.getTime() / 60_000)));
       await this.fire(job, true, missed.length);
