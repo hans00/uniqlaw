@@ -612,6 +612,28 @@ Outcomes, in order:
      a brace range in the command word; zsh-only syntax; and anything in fish or PowerShell
      (`shape.unresolvableReasons` says which).
 
+     A deny list can never be complete, so the reader **fails closed**: anything that runs a string or a file as
+     code, or changes what a command resolves to, is unresolvable rather than enumerated as safe. Since review 4 this
+     also covers: `.`/`source`, a command path outside the system bin directories (`./x.sh`, `bin/run`), any
+     interpreter given a script or `-m` (`python3 x.py`, consistent with `bash x.sh`); versioned interpreter and shell
+     names by pattern (`python3.12`, `node22`, `bash5.2`); zsh glob qualifiers (`*(e:'…':)`, also with spaces, in zsh
+     and in an unknown shell); `git -c` anywhere (past `-C`), `git config` of such keys, `--exec-path`, git aliases and
+     external `git-<name>` commands (anything not a git builtin), `filter-branch`, `hook`; hook variables as a prefix,
+     through `env` or `export` (`GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, `BASH_ENV`, `ENV`, `*PAGER`, `*EDITOR`,
+     `*_COMMAND`, `LD_PRELOAD`, `PATH`, `HOME`, …); `ssh -o ProxyCommand|LocalCommand|KnownHostsCommand|Match|Include`
+     and `ssh -F`, `scp -S`; `at`/`batch` reading stdin or a file, `crontab FILE`; sed's `e` command (`1e cmd`,
+     `s///e`) and `sed -f`; `tar --to-command|--use-compress-program|-I|-F|--checkpoint-action`, `rsync --rsync-path`,
+     `zip -TT`, `vim -c`/`+cmd`, `gdb -ex`, `man -P`, `emacs --eval`; a quoted command word with spaces. Strings that
+     are shell code are read like `sh -c` (so the deny rule matches what they run): `trap '…'`, `alias x='…'`, `at`
+     here-documents, `git submodule foreach`, `git rebase -x`, `git bisect run`, `rsync -e`, `parallel`, `script -c`,
+     `sg -c`. Wrappers unwrapped: zsh precommand modifiers (`noglob`, `nocorrect`, `-`, `builtin`, `command`,
+     `exec`), `repeat N`, `systemd-run`, `run0`, `pkexec`, `setpriv`, `ip netns exec`, `sched`, and more. Not
+     flagged: build and task runners (`make`, `npm run`, `cargo`, …) run project files by design; they reach the judge
+     with their targets (`npm run x` → process execute), and writing the file they run is itself a judged request.
+   - `deny-word-in-arguments`, only when a `Bash(…)` deny rule exists and nothing above applies: the rule's command
+     appears later in a simple command (`mywrapper rm -rf x`, `git rm f`). A wrapper the reader doesn't know may run
+     it, so the human decides; it is never a deny (`git rm` is not `rm`).
+
    Compound, wrapped, quoted, piped commands and reviewer-addressed comments are **not** blockers: they reach the
    judge as typed features (below).
 
@@ -641,29 +663,48 @@ pairs say the thresholds hold.
 1. **hard deny** for what policy forbids (deterministic code);
 2. **blockers** for what the judge could not see or cannot grant (escalate);
 3. **the judge**, which must reach a threshold: the session kind's, raised to `taint.taintedAbove` (default 0.97)
-   when the context is **tainted** and the request is high-impact (`send`, `publish`, `delete`, `install`; configurable
-   `highImpactEffects`) or reaches an external, remote, global/system or protected target (an unknown target or an
-   unrecognized command counts as high-impact);
-4. **the induced check**: the judge's second answer must not say the action is induced by content (P(induced) ≥
-   `inducedAbove`, default 0.5, or `unclear` escalates).
+   when the context is **tainted** and the request is high-impact: an effect in `highImpactEffects` (`send`,
+   `publish`, `delete`, `install`) or `execute`; an external, remote, global/system or protected target; a write
+   outside the scope (`>> ~/.bashrc`); a config or secret path (startup files, `.git/hooks`, CI workflows, `.env`,
+   keys), or reading a secret; making a file executable (`chmod +x`, `755`). An unknown target or an unrecognized
+   command counts as high-impact;
+4. **the induced check**, which fails closed: allowing needs P(task) ≥ `taskAbove` (default 0.5), so probability on
+   `induced` + `unclear` counts against it even when `task` is the top answer; P(induced) ≥ `inducedAbove` (0.5) or
+   the answer `unclear` escalates too, and so does an induced question that was asked but left unanswered, refused
+   or malformed (`inducedError`; a server that answers only the first question now always escalates).
 
 Taint is the **factual** signal: the harness saw untrusted content enter the context, whatever it said. The induced
 question is **auxiliary**: the judge sees the request and the context, not the content itself, and the content can
 argue with it; it can only add escalations, never allow.
 
-**Taint tracking** (`core/src/taint.ts`, `judge.taint`). Per turn (or for the whole session with `sticky: true`), the
-untrusted sources that entered the agent's context, from the observed actions and the turn's origins, through a
-registry of detectors (extensible like `targets`):
-- web tools (WebFetch, WebSearch, fetch);
-- network reads through the shell normalizer (`curl`, `wget`, `http`/`xh`, `nc`, `gh api|issue|pr|…`,
-  `git clone`), and output of remote commands (`ssh host cmd`, `docker|kubectl exec`, `scp`/`rsync` from a host);
-- MCP tools whose results come from third parties, by tool-name pattern (`thirdPartyTools`; defaults cover mail,
-  chat, issues, docs, drives, calendars, browsers, the web, search); UniQlaw's own `agent_ask` / `task_status` results
-  count as peer text;
+**Taint tracking** (`core/src/taint.ts`, `judge.taint`). The untrusted sources that entered the agent's context, from
+the observed actions and the turn's origins, through a registry of detectors (extensible like `targets`):
+- web tools (WebFetch, WebSearch, fetch) and subagent results (`Task`/`Agent`: whatever the subagent read);
+- network reads through the shell normalizer (`curl`, `wget`, `http`/`xh`, `nc`, `dig`, `whois`, `gh api|issue|pr|…`,
+  `git pull|fetch|clone|ls-remote|submodule`, `npm view|install|…`, `pip download|install`, `cargo`/`go`/`gem`/`brew`/
+  `apt` installs, `docker pull|build`, `npx`/`uvx`, cloud CLIs), inline interpreter code that reaches the network
+  (`python -c` with urllib/requests/httpx, `node -e` with fetch/http, a URL), and output of remote commands
+  (`ssh host cmd`, `docker|kubectl exec`, `scp`/`rsync` from a host);
+- MCP tools whose results come from third parties (`thirdPartyTools`): by the **server** part of the name (mail,
+  chat, issues, docs, drives, calendars, browsers, web, search services, …) or a web-fetching **tool** name
+  (`web_search`, `fetch_url`, `browse`, …), so a local tool called `search` is not one; local memory and notes
+  servers (`localTools`: claude-mem-lite, memory, notes, …) never are. UniQlaw's own `agent_ask` / `task_status`
+  results count as peer text;
 - reads of files outside the scope, and of files inside it that this session did not create and git does not track
   (downloaded files). Files git tracks, the session's own writes and (without a repository) project files are not
   taint, unless `trustRepoFiles: false` makes the own repo untrusted too;
+- reads of files this session **wrote while its context was tainted** (`curl -o`, `wget`, a redirect, `tee`, Write or
+  Edit after a web read): their content came from the taint, so the own-write exemption does not apply;
 - peer, cron and A2A messages in the turn, and messages from untrusted humans.
+
+**How long taint lasts.** A turn's taint is its own record, never derived from the bounded `actionTrace` window: a
+tainted turn stays tainted however many calls follow. At turn end (whether or not anything was asked) it is
+**carried** into the next `carryTurns` turns (default 3; `sticky: true` = the rest of the session; `0` = per turn
+only), persisted so a resumed session keeps it across a daemon restart, and cleared by `/new`, `/clear` and
+`/compact`. Why 3: the content stays in the model's context until compaction, so per-turn reset (the old default)
+let a page read in one turn steer the next; carrying it forever would make every long session permanently strict and
+bring back the prompts the judge exists to remove. Only high-impact requests are affected by taint at all, and a
+follow-up two or three turns later is where injected instructions are most likely to be acted on.
 
 The judge gets `taint: {tainted, sources: [{kind, id, at}]}` (ids are `{untrusted}` labels) and the audit line records
 it with `taintStrict`. There is **no ingress scanning**: nothing reads the content itself.
@@ -671,9 +712,10 @@ it with `taintStrict`. There is **no ingress scanning**: nothing reads the conte
 **The induced question.** Every backend asks a second choice question in the same request
 (`JUDGE_INDUCED_QUESTION`): does the action serve the human's request, or is it induced by content the agent read?
 (`task | induced | unclear`). TypeSafe System One answers several named questions per call and OpenAI Decisions up to
-400, so both backends send `safety` and `induced` together. P(induced) and the answer go to the audit line, and the
-escalation note shows both scores, e.g. `🤖 Jev: 0.93 safe · induced 0.61`. A backend that answers only the first
-question gets no induced check.
+400, so both backends send `safety` and `induced` together. P(task), P(induced), the answer or `inducedError` go to
+the audit line, and the escalation note shows both scores, e.g. `🤖 Jev: 0.93 safe · induced 0.61` (or
+`· induced: no answer`). A judge provider that does not ask the question at all (no induced fields) has no induced
+check; the built-in backends always ask it, so for them a missing answer escalates.
 
 **Shell dialects.** The normalizer is **best effort** and reads POSIX sh / bash / dash; zsh only where it is the
 same (zsh-only syntax: `=cmd`, glob qualifiers `*(.)`, `${~…}`, `=(…)` is unresolvable); fish and PowerShell not at
@@ -698,7 +740,9 @@ wrappers). `shape` reports `dialect` (outer), `parsed` and `dialectSwitches`. Ho
 an explicit trust level:
 
 - `actionTrace` (harness-observed): this turn's tool actions before the request, oldest first, at most 20. Trusted as
-  facts: the tool, the **normalized** command (the simple commands that ran) and `ok`. Write/Edit/NotebookEdit
+  facts: the tool, `programs` (the command names the code parsed out of the line) and `ok`. The **normalized**
+  `command` (the simple commands, unquoted, wrappers unwrapped) is the agent's own writing, so its arguments are
+  `{untrusted}`, never a fact about what they mean. Write/Edit/NotebookEdit
   entries carry only the path and the content size, never content; other tools their redacted input. Read-only
   diagnostic commands that print counts, sizes, names or states (a generic table: `df`, `du`, `free`, `ls`, `stat`,
   `wc`, `pgrep`, `lsblk`, `ip addr`, `nvidia-smi`/`rocm-smi`, `git status|branch|rev-parse`, `git diff --stat`,
@@ -731,8 +775,10 @@ an explicit trust level:
   - paths by their **resolved real path** (a link the agent made to elsewhere is not "its" target), counted when a
     create action targeted them (or a parent) and they were new then or their **birth time** is after the session
     started (never mtime: no birth time means not created, a false negative);
-  - git refs only if the ref **did not exist** before the command (`checkout -B` / `-C` / `branch -f` on an existing
-    branch is a reset, not a creation);
+  - git refs only if the ref **did not exist** before the command, locally or as a remote-tracking ref
+    (`refs/remotes/*/<name>`: a branch that exists on a remote is not this session's; `checkout -B` / `-C` /
+    `branch -f` on an existing branch is a reset, not a creation). The remote itself is not queried (network); the
+    git-ref target reports `onRemote`;
   - processes only by pid, and only after checking that the pid started after the session began (`/proc/<pid>/stat`
     start time; `ps -o lstart` on macOS) and descends from the session's process root (`AgentSession.processRoot`:
     claude-tmux's pane process; other providers report none, so no pid counts as theirs). Numbers in output are never
@@ -747,7 +793,10 @@ an explicit trust level:
   reason}` (they may carry pasted content).
 
 Secrets: besides the earlier patterns, `redactString` masks config-style keys (`"api_key": "…"`, YAML/INI
-`password:` / `secret =`, `token=`), with whole-word key names (`monkey:` / `tokenizer:` stay).
+`password:` / `secret =`, `token=`), with whole-word key names (`monkey:` / `tokenizer:` stay), and since review 4
+`PGPASSWORD=`-style names (`…PASSWORD`, `…TOKEN`, `…SECRET`, `…PWD` without a separator), `secret_key = …`
+mid-line, header values without a scheme (`Authorization: abc`, `X-Api-Key:`, `Cookie:`), `mysql -p<pw>` and
+`curl -u user:pass`. Detail values `currentBranch`, `user` and `tags` are wrapped `{untrusted}` when they are text.
 
 The judge's question states each field's trust level and a generic decision guide in terms of effect × provenance ×
 task: acting on resources this session created, inside scope, in service of the human's task is consistent;
