@@ -241,12 +241,19 @@ describe("2. taint is not lost", () => {
       expect(await kinds("Bash", { command: c }), c).toContain("network");
     }
     for (const c of ["python3 -c 'print(1)'", "git status", "git log", "npm run build", "pip list", "docker ps"]) expect(await kinds("Bash", { command: c }), c).toEqual([]);
+    // Inline code in the words is attributed to its interpreter; code fed through a here-document is caught on the line.
+    expect((await detectTaint("Bash", { command: "python3 -c 'import requests; requests.get(u)'" }, ctx(cwd)))[0]).toMatchObject({ kind: "network", id: "python3 inline code" });
+    expect((await detectTaint("Bash", { command: "python3 <<EOF\nimport httpx\nEOF" }, ctx(cwd)))[0]).toMatchObject({ kind: "network", id: "interpreter code" });
   });
 
   test("local memory MCP tools are not third-party; `search` only counts on a web/service server or a web tool name", async () => {
     const cwd = tmp("uq-r4-mcp-");
     const kinds = async (tool: string) => (await detectTaint(tool, {}, ctx(cwd))).map((t) => t.kind);
-    for (const t of ["mcp__mem-lite__mem_search", "mcp__claude_ai_cmem__search", "mcp__memory__search_nodes", "mcp__rea__search_strings", "mcp__mytools__search"]) expect(await kinds(t), t).toEqual([]);
+    for (const t of ["mcp__mem-lite__mem_search", "mcp__claude_ai_cmem__search", "mcp__memory__search_nodes", "mcp__rea__search_strings", "mcp__mytools__search",
+      "mcp__mem-search__query", "mcp__notes-web__web_search"]) expect(await kinds(t), t).toEqual([]);
+    // localTools wins over a third-party pattern; it is configurable.
+    expect((await detectTaint("mcp__vault-search__find", {}, ctx(cwd))).map((t) => t.kind)).toEqual(["third-party-tool"]);
+    expect(await detectTaint("mcp__vault-search__find", {}, ctx(cwd, { localTools: compileToolPatterns(["^mcp__vault-search__"], DEFAULT_LOCAL_TOOLS) }))).toEqual([]);
     for (const t of ["mcp__brave-search__brave_web_search", "mcp__gmail__search_messages", "mcp__mytools__web_search", "mcp__x__fetch_url", "mcp__claude_ai_Gmail__list"]) {
       expect(await kinds(t), t).toEqual(["third-party-tool"]);
     }
