@@ -73,11 +73,20 @@ export function parseDecisionResponse(j: unknown): JudgeVerdict {
   if (a?.type === "refusal") throw new Error("OpenAI Decisions refused to answer");
   const p = a?.type === "choice" ? a.probabilities?.find((x) => x?.value === "safe")?.probability : undefined;
   if (typeof p !== "number" || !Number.isFinite(p)) throw new Error("unexpected OpenAI Decisions response: no choice probability for \"safe\"");
+  // The induced question was asked: a missing, refused or malformed answer fails closed (inducedError escalates).
   const ind = (r?.answers ?? []).find((x) => x?.name === "induced");
-  const pi = ind?.type === "choice" ? ind.probabilities?.find((x) => x?.value === "induced")?.probability : undefined;
+  const prob = (v: string) => ind?.probabilities?.find((x) => x?.value === v)?.probability;
   return { pSafe: p, ...(typeof a!.choice === "string" ? { label: a!.choice } : {}), ...(typeof r.model === "string" ? { model: r.model } : {}),
-    ...(typeof pi === "number" && Number.isFinite(pi) ? { pInduced: pi } : {}),
-    ...(ind?.choice === "task" || ind?.choice === "induced" || ind?.choice === "unclear" ? { inducedLabel: ind.choice as "task" | "induced" | "unclear" } : {}) };
+    ...inducedAnswer(ind?.type, ind?.choice, prob("task"), prob("induced")) };
+}
+
+/** The induced answer as verdict fields: P(task), P(induced) and the label, or why it can't be used. */
+export function inducedAnswer(type: unknown, choice: unknown, pTask: unknown, pInduced: unknown): Pick<JudgeVerdict, "pTask" | "pInduced" | "inducedLabel" | "inducedError"> {
+  if (type === undefined) return { inducedError: "no answer to the induced question" };
+  if (type === "refusal") return { inducedError: "the induced question was refused" };
+  const ok = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x) && x >= 0 && x <= 1;
+  if (type !== "choice" || !ok(pTask)) return { inducedError: "malformed answer to the induced question" };
+  return { pTask, ...(ok(pInduced) ? { pInduced } : {}), ...(choice === "task" || choice === "induced" || choice === "unclear" ? { inducedLabel: choice } : {}) };
 }
 
 export class OpenAIDecisionJudge implements ApprovalJudge {
