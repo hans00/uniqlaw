@@ -4,7 +4,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type {
-  AgentEvent, AgentSession, Logger, PermissionDecision, ProviderCapabilities, TurnInput,
+  AgentEvent, AgentSession, Liveness, Logger, PermissionDecision, ProviderCapabilities, TurnInput,
 } from "@uniqlaw/core";
 import {
   claudeShellDialects,
@@ -14,7 +14,7 @@ import {
 import type { Tmux } from "./tmux.ts";
 import { AsyncQueue } from "./queue.ts";
 import { hasReadyPrompt, isLoggedOut, parseLoginPrompt, parsePermissionDialog, type PermissionDialog } from "./dialogs.ts";
-import { isReady, looksActivelyBusy, isRecoverableApiError, isUsageLimit, waitForReady } from "./pane.ts";
+import { isReady, looksActivelyBusy, isRecoverableApiError, isUsageLimit, normalizePaneForLiveness, waitForReady } from "./pane.ts";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -46,8 +46,13 @@ export interface Timings {
   slashIdleMs: number;
   denyRecoveryMs: number;
   interruptFallbackMs: number;
+  /** No liveness signal at all (no jsonl write, no pane change, not busy, no dialog) for this long, at an idle prompt:
+   *  the turn ended without an end marker. */
   stallMs: number;
+  /** No liveness signal at all for this long, whatever the pane shows. */
   stallMaxMs: number;
+  /** Hard ceiling: end the turn after this long without a jsonl write even while the pane looks busy (a hung tool
+   *  still ticks the spinner). 0 = leave it to core's turn.stallMaxSec, which interrupts the turn. */
   busyHardCapMs: number;
   modelEchoMs: number;
   dialogGonePolls: number;
@@ -66,7 +71,7 @@ export const DEFAULT_TIMINGS: Timings = {
   interruptFallbackMs: 6000,
   stallMs: 120_000,
   stallMaxMs: 600_000,
-  busyHardCapMs: 1_800_000,
+  busyHardCapMs: 0,
   modelEchoMs: 5000,
   dialogGonePolls: 3,
   dialogWithdrawnMs: 3000,
@@ -125,6 +130,11 @@ export class ClaudeTmuxSession implements AgentSession {
   private turnStartedAt = 0;
   private lastActivityAt = 0;
   private stallAt = 0;
+  // liveness signals for the stall watchdogs (this one and core's, via liveness())
+  private paneFp = "";
+  private paneChangedAt = 0;
+  private lastPane = "";
+  private toolsInFlight = new Set<string>();
 
   // dialogs
   private activeDialog: { id: string; dialog: PermissionDialog } | null = null;
@@ -365,6 +375,8 @@ export class ClaudeTmuxSession implements AgentSession {
     this.turnStartedAt = Date.now();
     this.lastActivityAt = Date.now();
     this.stallAt = Date.now();
+    this.paneChangedAt = Date.now();
+    this.toolsInFlight.clear();
     this.pendingEndAt = 0;
     this.tentativeAt = 0;
     this.interruptAt = 0;
@@ -435,9 +447,11 @@ export class ClaudeTmuxSession implements AgentSession {
         if (ev.text?.trim()) this.emit({ type: "thinking", segmentId: seg(), text: ev.text });
         break;
       case "assistant-tool-use":
+        if (ev.toolUseId) this.toolsInFlight.add(ev.toolUseId);
         this.emit({ type: "tool_start", id: ev.toolUseId ?? seg(), name: ev.toolName ?? "?", input: ev.toolInput });
         break;
       case "user-tool-result":
+        if (ev.toolUseId) this.toolsInFlight.delete(ev.toolUseId);
         this.emit({ type: "tool_end", id: ev.toolUseId ?? "?", ok: !ev.toolResultIsError, summary: ev.toolResult?.slice(0, 500) });
         if (ev.toolResultIsError && isRejectionText(ev.toolResult ?? "")) this.armDenyRecovery();
         break;
@@ -528,6 +542,9 @@ export class ClaudeTmuxSession implements AgentSession {
     }
     if (await this.tmux.paneDead(this.name)) { this.onDead("claude process exited"); return; }
     this.tailer.flush();
+    this.lastPane = pane;
+    const pfp = fp(normalizePaneForLiveness(pane));
+    if (pfp !== this.paneFp) { this.paneFp = pfp; this.paneChangedAt = Date.now(); }
 
     // Login flow runs in any state.
     if (await this.checkLogin(pane)) return;
@@ -569,18 +586,34 @@ export class ClaudeTmuxSession implements AgentSession {
       if (isRecoverableApiError(pane)) { this.endTurn("error", "rate_limit"); return; }
       if (isUsageLimit(pane)) { this.endTurn("error", "usage_limit"); return; }
     }
-    // Stall watchdog.
-    const quiet = now - this.stallAt;
-    if (quiet > this.t.stallMs) {
-      const sinceStart = now - this.turnStartedAt;
-      if ((busy || this.activeDialog) && sinceStart < this.t.busyHardCapMs) { this.stallAt = now - this.t.stallMs + 60_000; return; }
-      if (ready || sinceStart > this.t.stallMaxMs) {
-        this.log.warn("stall: no jsonl activity; recovering", { quietMs: quiet, pane: pane.split("\n").slice(-15).join("\n") });
-        this.endTurn("error", "stall");
-      } else {
-        this.stallAt = now - this.t.stallMs + 30_000;
-      }
+    // Stall watchdog: only when there is no liveness signal at all. A long tool call (CI wait, a long test run) writes
+    // nothing to the jsonl, but the pane shows it busy or changing, so it is not a stall.
+    const live = this.livenessSignals(now, pane, busy, ready);
+    if (live.jsonlQuietMs <= this.t.stallMs) return;
+    const alive = busy || !!this.activeDialog || live.paneQuietMs < this.t.stallMs || (this.toolsInFlight.size > 0 && !ready);
+    const capped = this.t.busyHardCapMs > 0 && live.jsonlQuietMs >= this.t.busyHardCapMs;
+    if (alive && !capped) return;
+    if (capped || ready || live.jsonlQuietMs > this.t.stallMaxMs) {
+      this.log.warn(capped ? "stall: hard ceiling (busyHardCapMs) without jsonl activity; recovering" : "stall: no liveness signal; recovering",
+        { ...live, alive, stallMs: this.t.stallMs, stallMaxMs: this.t.stallMaxMs, busyHardCapMs: this.t.busyHardCapMs,
+          pane: pane.split("\n").slice(-15).join("\n") });
+      this.endTurn("error", "stall");
     }
+  }
+
+  private livenessSignals(now: number, pane: string, busy = looksActivelyBusy(pane), ready = isReady(pane)) {
+    const jsonlAt = Math.max(this.stallAt, this.tailer.lastActivityAt);
+    return { jsonlQuietMs: now - jsonlAt, paneQuietMs: now - this.paneChangedAt, paneBusy: busy, ready,
+      dialog: !!this.activeDialog, toolsInFlight: this.toolsInFlight.size, jsonlAt, paneChangedAt: this.paneChangedAt };
+  }
+
+  /** What core's stall watchdog checks before abandoning a quiet turn (see AgentSession.liveness). */
+  async liveness(): Promise<Liveness> {
+    const now = Date.now();
+    const l = this.livenessSignals(now, this.lastPane);
+    const { jsonlAt, paneChangedAt, ...signals } = l;
+    return { busy: l.paneBusy || l.dialog || (l.toolsInFlight > 0 && !l.ready), lastActivityAt: Math.max(jsonlAt, paneChangedAt),
+      signals: { ...signals, state: this.state } };
   }
 
   private async checkDialogs(pane: string) {

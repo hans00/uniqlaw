@@ -26,6 +26,12 @@ export function looksActivelyBusy(pane: string): boolean {
   );
 }
 
+/** The pane with what changes on its own while claude merely waits stripped out (spinner glyphs, elapsed time and
+ *  token counters), so a changed fingerprint means real output moved (e.g. a tool streaming its output). */
+export function normalizePaneForLiveness(pane: string): string {
+  return pane.replace(/[\d✻✶✳✢✽✺·*◐◓◑◒⠀-⣿]/g, "").replace(/[ \t]+/g, " ");
+}
+
 /** Transient server error (rate limit/overload) — not the user's usage limit. */
 export function isRecoverableApiError(pane: string): boolean {
   const tail = pane.split("\n").slice(-30).join("\n");

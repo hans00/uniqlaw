@@ -145,6 +145,16 @@ export type AgentEvent =
   | { type: "model"; model: string }
   | { type: "error"; error: string; fatal: boolean };
 
+/** Signs of life a provider can report while a turn is quiet (no events), so a long tool call is not taken for a stall. */
+export interface Liveness {
+  /** Visibly working right now: in a tool call, generating, or waiting on a dialog. */
+  busy?: boolean;
+  /** Epoch ms of the last progress the provider saw outside its events (transcript write, terminal output change…). */
+  lastActivityAt?: number;
+  /** What was checked and what it showed, logged when a stall is declared. */
+  signals?: Record<string, unknown>;
+}
+
 export interface AgentSession {
   readonly capabilities: ProviderCapabilities;
   /** Start a new turn (session must be idle). */
@@ -165,6 +175,8 @@ export interface AgentSession {
   /** The pid every command of this session descends from (e.g. claude-tmux's pane process), so core can tell a
    *  process this session started from others (approval judge provenance). undefined = unknown. */
   processRoot?(): number | undefined;
+  /** Optional: liveness signals, asked by core's stall watchdog before it abandons a quiet turn. */
+  liveness?(): Promise<Liveness>;
   /** Process/connection is alive (used by health checks + reattach). */
   alive(): Promise<boolean>;
 }

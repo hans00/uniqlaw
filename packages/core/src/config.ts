@@ -175,9 +175,13 @@ export const settingsSchema = z.object({
     stream: z.enum(["replace", "keep", "off"]).default("replace"),
   }).prefault({}),
   turn: z.object({
-    /** Abandon a turn after this long with no provider events (0 = off). Paused while a
-     *  permission/input request waits for a human. Raise it for long silent tools. */
+    /** Check a turn after this long with no provider events (0 = off). It is abandoned only if there is no liveness
+     *  signal either: no tool call in flight, and the provider (if it reports liveness) is not busy and saw no activity
+     *  in this window. Paused while a permission/input request waits for a human. */
     stallTimeoutSec: z.number().int().nonnegative().default(900),
+    /** Hard ceiling: abandon a turn after this long with no provider events even if it still looks alive (a hung tool
+     *  call keeps a spinner going). 0 = no ceiling. */
+    stallMaxSec: z.number().int().nonnegative().default(7200),
   }).prefault({}),
   /** Graceful restart / reload (`uniqlaw restart`, `uniqlaw reload`, daemon_restart): new turns wait, running ones
    *  get this long to finish; turns still running then are recorded as interrupted and their sessions told. */

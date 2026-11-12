@@ -1,6 +1,6 @@
 // Per-channel runtime: owns one AgentSession, the input queue, the turn state
 // machine, output routing (by Origin) and approvals. Provider-agnostic.
-import type { AgentEvent, AgentProvider, AgentSession, Attachment, PermissionDecision, Profile, SystemPromptParts, TurnInput } from "./provider.ts";
+import type { AgentEvent, AgentProvider, AgentSession, Attachment, Liveness, PermissionDecision, Profile, SystemPromptParts, TurnInput } from "./provider.ts";
 import type { MsgRef, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
 import type { Logger } from "./plugin.ts";
@@ -213,6 +213,10 @@ export class ChannelRuntime {
   private resumeOrigins?: { origins: Origin[]; until: number };
   private retryTimer?: ReturnType<typeof setTimeout>;
   private stallTimer?: ReturnType<typeof setTimeout>;
+  /** Last provider event (or turn start / human answer) of the running turn: what both stall limits count from. */
+  private lastProgressAt = 0;
+  /** Tool calls of the running turn that started but have not ended (a liveness signal for the stall watchdog). */
+  private toolsInFlight = new Map<string, string>();
   /** Permission prompts waiting for a human, by provider request id (the stall watchdog is paused meanwhile). */
   private pendingPermissions = new Map<string, AbortController>();
   private permissionChain: Promise<void> = Promise.resolve();
@@ -704,6 +708,7 @@ export class ChannelRuntime {
     this.steerLog = [];
     this.steerCarry = undefined;
     this.turn = { origins, input, ...(inputs ? { inputs: [...inputs] } : {}), retries, startedAt: Date.now(), texts: [], toolLines: [], denied: false, unsolicited: false };
+    this.toolsInFlight.clear();
     this.armStall();
     this.state = "running";
     this.record("prompt", input.text, { origins: origins.map((o) => o.kind), retry: retries || undefined });
@@ -749,6 +754,8 @@ export class ChannelRuntime {
   }
 
   private async onEvent(ev: AgentEvent): Promise<void> {
+    if (ev.type === "tool_start") this.toolsInFlight.set(ev.id, ev.name);
+    else if (ev.type === "tool_end") this.toolsInFlight.delete(ev.id);
     if (ev.type !== "session" && ev.type !== "turn_end") this.armStall();
     switch (ev.type) {
       case "session":
@@ -974,7 +981,6 @@ export class ChannelRuntime {
     turn.toolLines = [line];
   }
 
-  /** (Re)start the stall watchdog while a turn is running. */
   /** Origins of a turn that was in flight when the daemon detached (once, shortly after reopening). */
   private takeResumeOrigins(): Origin[] | undefined {
     const r = this.resumeOrigins;
@@ -997,18 +1003,48 @@ export class ChannelRuntime {
     }
   }
 
-  private armStall() {
+  /** (Re)start the stall watchdog while a turn is running. progress=false: re-check later without counting it as
+   *  progress (the hard ceiling keeps counting from the last real event). */
+  private armStall(progress = true) {
     clearTimeout(this.stallTimer);
-    const sec = this.host.settings.turn.stallTimeoutSec;
+    const { stallTimeoutSec: sec, stallMaxSec: maxSec } = this.host.settings.turn;
     if (!sec || !this.turn) return;
-    this.stallTimer = setTimeout(() => void this.onStall(), sec * 1000);
+    if (progress) this.lastProgressAt = Date.now();
+    let ms = sec * 1000;
+    if (maxSec) ms = Math.max(1, Math.min(ms, this.lastProgressAt + maxSec * 1000 - Date.now()));
+    this.stallTimer = setTimeout(() => void this.onStall(), ms);
   }
 
+  /** No provider event for turn.stallTimeoutSec. Abandon the turn only if nothing shows it is still alive, or once
+   *  turn.stallMaxSec has passed without an event whatever the signals say. */
   private async onStall() {
     if (!this.turn || this.state !== "running") return;
     if (this.pendingPermissions.size || this.awaitingInput) return this.armStall();
-    this.log.warn("turn stalled; abandoning", { afterSec: this.host.settings.turn.stallTimeoutSec });
     const turn = this.turn;
+    const { stallTimeoutSec: sec, stallMaxSec: maxSec } = this.host.settings.turn;
+    const now = Date.now();
+    const quietMs = now - this.lastProgressAt;
+    let live: Liveness | undefined;
+    let livenessError: string | undefined;
+    if (this.session?.liveness) {
+      try { live = await this.session.liveness(); } catch (e) { livenessError = String(e); }
+    }
+    if (this.turn !== turn || this.state !== "running") return;
+    const recent = live?.lastActivityAt !== undefined && now - live.lastActivityAt < sec * 1000;
+    const alive = this.toolsInFlight.size > 0 || !!live?.busy || recent;
+    const capped = maxSec > 0 && quietMs >= maxSec * 1000;
+    const signals = {
+      quietSec: Math.round(quietMs / 1000), stallTimeoutSec: sec, stallMaxSec: maxSec,
+      toolsInFlight: [...this.toolsInFlight.values()],
+      liveness: this.session?.liveness ? (livenessError ? { error: livenessError } : {
+        busy: live?.busy, lastActivityAgoSec: live?.lastActivityAt !== undefined ? Math.round((now - live.lastActivityAt) / 1000) : undefined,
+        ...live?.signals }) : "not reported by this provider",
+    };
+    if (alive && !capped) {
+      this.log.info("turn quiet but alive; not a stall", signals);
+      return this.armStall(false);
+    }
+    this.log.warn(capped ? "turn stalled: hard ceiling (turn.stallMaxSec) reached; abandoning" : "turn stalled: no liveness signal; abandoning", signals);
     turn.stalled = true;
     if (this.session?.interrupt && this.capabilities.interrupt) {
       // The interrupt's own turn_end (if the provider still responds) finishes the turn as a stall;
@@ -1027,6 +1063,7 @@ export class ChannelRuntime {
 
   private async finishTurnInner(reason: "done" | "interrupted" | "error", error?: string) {
     clearTimeout(this.stallTimer);
+    this.toolsInFlight.clear();
     // The turn is over: a prompt still waiting has nothing left to answer, and hook verdicts belong to this turn.
     this.cancelPermissions();
     this.hookEscalated = [];
