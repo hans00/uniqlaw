@@ -369,11 +369,24 @@ Progress lives in memory with the turn: it is not persisted, and a reload loses 
 **An `agent_ask` (or `worker_start` with a task) that reaches a session mid-turn** follows `queue.mode`, like a human
 message would. It never interrupts unless `queue.mode` is `interrupt`:
 - `queue` (default): it waits in the queue (`task_status` → `queued`) and runs as its own turn once the current one ends.
-  Several inputs that piled up meanwhile are merged into that one turn, and each ask gets the turn's whole answer.
+  Several inputs that piled up meanwhile are merged into that one turn, which answers all their tasks (see below).
 - `steer` (when the provider can steer; claude-tmux types it into the pane, held while a permission dialog is open): it
-  joins the running turn. That turn's final answer completes both tasks, so each asker gets the same combined reply.
+  joins the running turn, and that turn's answer completes every task in it (see below).
 - `interrupt`: the current turn is stopped (a task it was answering fails with `(interrupted) …` plus any text it had), then the queue runs.
 - A worker a human holds (`/attach`, terminal takeover) refuses the ask instead.
+
+**One turn answering several asks** (steered in, or merged from the queue): the result is the turn's whole answer
+(all its texts, so its progress lines plus the final report), and it is delivered **once per asking session**:
+- Asks from the same session: the earliest one (in the order they joined) gets the answer, prefixed with
+  `[This result also answers your agent_asks <id>, …: they joined this turn]`. Each later one is resolved
+  (`completed`, or `failed` with the turn) with the result `merged into task <id>; result delivered there`. A
+  `wait=false` merged ask has no delivery of its own; a `wait=true` one returns that pointer. Before this, N asks
+  steered into one long turn delivered the same multi-KB answer N times at once and flooded the asker.
+- Asks from different sessions each get the whole answer. The turn is one conversation: what it said for one asker
+  reaches the others too.
+- Not chosen: giving each ask only the output produced after it joined (as `task_status` progress does). Text from
+  before an ask joined cannot answer it, but the final report comes at the end and lands in every task's tail, so the
+  asker would still get it N times; it only trims the prefix.
 
 **Identity binding:** the MCP Gateway URL carries a per-session token (`/mcp/<token>`). Tools do not accept
 "who am I" style parameters; the caller's identity is determined by the token, so an agent cannot impersonate another session.

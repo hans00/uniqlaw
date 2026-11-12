@@ -43,7 +43,7 @@ function setup(queueMode: "queue" | "steer" = "queue") {
     providers: new Map([["fake", provider]]), platforms: new Map([["tg", new FakePlatform()]]), profiles: new Map([["main", profile]]),
     gatewayFor: (k) => gw.endpointFor(k), systemPrompt: async () => ({ fragments: [] }), providerEnv: async () => ({}) });
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }), () => store.close(), () => gw.stop(), () => mgr.stop());
-  return { gw, mgr, provider, gate };
+  return { gw, mgr, provider, gate, store };
 }
 
 test("a running task reports elapsed time, the text being streamed and recent activity; a finished one only its result", async () => {
@@ -108,4 +108,57 @@ test("queue.mode steer: agent_ask to a session mid-turn joins the running turn a
   gate.release!();
   await until(() => mgr.taskReport(second.taskId)?.state === "completed");
   expect(mgr.taskReport(second.taskId)!.result).toBe(mgr.taskReport(first.taskId)!.result!);
+});
+
+/** Make the askers sessions, so async results are delivered to them (CLI/API callers only keep them in the task). */
+const asSessions = (store: StateStore, ...keys: string[]) => {
+  for (const k of keys) store.upsertSession({ channelKey: k, profile: "main", provider: "fake", providerSessionId: null, multiparty: false, createdAt: 0, lastActivityAt: 0, lastTarget: null, adapterState: null });
+};
+const resultsFor = (provider: FakeProvider, key: string) => {
+  const s = provider.sessions.get(key);
+  return s ? [...s.sent, ...s.steered].flatMap((i) => i.text.match(/Result of your agent_ask [\w-]+/g) ?? []) : [];
+};
+
+test("queue.mode steer: several asks from one session merged into a turn are answered once, the rest point to it", async () => {
+  // Was: every ask that joined the turn resolved with the whole answer, so the asker got it N times at once.
+  const { mgr, provider, gate, store } = setup("steer");
+  asSessions(store, "tg:-1", "tg:-3");
+  const first = await mgr.ask("tg:-1", "tg:-2", "long job", false);
+  await until(() => mgr.taskReport(first.taskId)?.progress?.phase === "running");
+  const second = await mgr.ask("tg:-1", "tg:-2", "and this", false);
+  const third = mgr.ask("tg:-1", "tg:-2", "and wait for this", true); // blocking: resolves with the pointer
+  const other = await mgr.ask("tg:-3", "tg:-2", "another asker", false);
+  await until(() => provider.sessions.get("tg:-2")!.steered.length === 3);
+  gate.release!();
+  const blocked = await third;
+  const answer = "Running the tests now.\n\nAll tests pass.";
+  const pointer = `merged into task ${first.taskId}; result delivered there`;
+  await until(() => mgr.taskReport(first.taskId)?.state === "completed");
+  expect(mgr.taskReport(first.taskId)!.result)
+    .toBe(`[This result also answers your agent_asks ${second.taskId}, ${blocked.taskId}: they joined this turn]\n\n${answer}`);
+  expect(mgr.taskReport(second.taskId)).toMatchObject({ state: "completed", result: pointer });
+  expect(blocked.result).toEqual({ ok: true, text: pointer });
+  expect(mgr.taskReport(other.taskId)!.result).toBe(answer); // another session still gets the whole answer
+
+  // The asker gets one result delivered, not one per merged ask.
+  await until(() => resultsFor(provider, "tg:-1").length > 0 && resultsFor(provider, "tg:-3").length > 0);
+  await Bun.sleep(100);
+  expect(resultsFor(provider, "tg:-1")).toEqual([`Result of your agent_ask ${first.taskId}`]);
+  expect(resultsFor(provider, "tg:-3")).toEqual([`Result of your agent_ask ${other.taskId}`]);
+});
+
+test("queue mode: asks from one session that pile up and run as one merged turn are answered once too", async () => {
+  const { mgr, provider, gate, store } = setup("queue");
+  asSessions(store, "tg:-1", "tg:-3");
+  const first = await mgr.ask("tg:-3", "tg:-2", "long job", false);
+  await until(() => mgr.taskReport(first.taskId)?.progress?.phase === "running");
+  const a = await mgr.ask("tg:-1", "tg:-2", "question a", false);
+  const b = await mgr.ask("tg:-1", "tg:-2", "question b", false);
+  gate.release!();
+  await until(() => mgr.taskReport(b.taskId)?.state === "completed" && mgr.taskReport(a.taskId)?.state === "completed");
+  expect(mgr.taskReport(a.taskId)!.result).toBe(`[This result also answers your agent_asks ${b.taskId}: they joined this turn]\n\nquick answer`);
+  expect(mgr.taskReport(b.taskId)!.result).toBe(`merged into task ${a.taskId}; result delivered there`);
+  await until(() => resultsFor(provider, "tg:-1").length > 0);
+  await Bun.sleep(100);
+  expect(resultsFor(provider, "tg:-1")).toEqual([`Result of your agent_ask ${a.taskId}`]);
 });

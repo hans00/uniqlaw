@@ -76,8 +76,9 @@ export interface RuntimeHost {
   /** A turn hit the provider's usage limit. Return true when the host took over telling the human
    *  (e.g. asked the owner to switch profile); false = the runtime posts its usual error. */
   onUsageLimit?(channelKey: string, failed: { origins: Origin[]; input?: TurnInput }): Promise<boolean>;
-  /** Called when a peer ask/trigger turn finishes. */
-  onTaskResult(taskId: string, ok: boolean, text: string): void;
+  /** Called when a peer ask/trigger turn finishes. `mergedInto`: this ask shared its turn with an earlier ask from
+   *  the same session, whose result carries the answer; `text` is only a pointer to it (no separate delivery). */
+  onTaskResult(taskId: string, ok: boolean, text: string, opts?: { mergedInto?: string }): void;
   /** Graceful restart: return true to take this input away (it is persisted and replayed after the restart)
    *  instead of letting it start a turn now. */
   deferInput?(channelKey: string, input: QueuedInput): boolean;
@@ -159,6 +160,27 @@ const PROGRESS_LINE_CHARS = 200;
 const PROGRESS_TEXT_CHARS = 1500;
 const oneLine = (s: string, max: number) => { const t = s.replace(/\s+/g, " ").trim(); return t.length > max ? t.slice(0, max - 1) + "…" : t; };
 const tailOf = (s: string, max: number) => (s.length > max ? "…" + s.slice(-(max - 1)) : s);
+
+/**
+ * Asks from the same session that ended up in one turn (steered into it, or queued and merged at drain) get one
+ * result: the earliest of them (in join order) carries the turn's answer and lists the others; each later one is
+ * resolved with a pointer to it. One turn's answer delivered N times would flood the asker (a turn's text is all its
+ * progress lines plus the final report). Asks from different sessions each still get the whole answer.
+ */
+export function mergedAsks(origins: Origin[]): { primaryOf: Map<string, string>; mergedFor: Map<string, string[]> } {
+  const firstBy = new Map<string, string>();
+  const primaryOf = new Map<string, string>();
+  const mergedFor = new Map<string, string[]>();
+  for (const o of origins) {
+    if (o.kind !== "peer" || o.mode !== "ask") continue;
+    const first = firstBy.get(o.fromSession);
+    if (!first) { firstBy.set(o.fromSession, o.taskId); continue; }
+    if (first === o.taskId || primaryOf.has(o.taskId)) continue;
+    primaryOf.set(o.taskId, first);
+    mergedFor.set(first, [...(mergedFor.get(first) ?? []), o.taskId]);
+  }
+  return { primaryOf, mergedFor };
+}
 
 const TYPING_PULSE_MS = 4000;
 const STEER_RACE_MS = 3000;
@@ -1143,9 +1165,17 @@ export class ChannelRuntime {
     }
     if (turn) {
       const answer = turn.texts.filter((t) => !isSilentReplyText(t)).map((t) => extractReactions(stripSilentToken(t)).cleanText).join("\n\n").trim();
+      const result = reason === "done" ? answer : `(${reason}${error ? `: ${error}` : ""}) ${answer}`.trim();
+      const { primaryOf, mergedFor } = mergedAsks(turn.origins);
+      const done = new Set<string>();
       for (const o of turn.origins) {
         if ((o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) || o.kind === "a2a" || (o.kind === "scheduler" && o.taskId)) {
-          this.host.onTaskResult(o.taskId!, reason === "done", reason === "done" ? answer : `(${reason}${error ? `: ${error}` : ""}) ${answer}`.trim());
+          if (done.has(o.taskId!)) continue;
+          done.add(o.taskId!);
+          const into = primaryOf.get(o.taskId!);
+          if (into) { this.host.onTaskResult(o.taskId!, reason === "done", `merged into task ${into}; result delivered there`, { mergedInto: into }); continue; }
+          const merged = mergedFor.get(o.taskId!);
+          this.host.onTaskResult(o.taskId!, reason === "done", merged ? `[This result also answers your agent_asks ${merged.join(", ")}: they joined this turn]\n\n${result}` : result);
         }
       }
       if (reason === "error" && error) await this.notifyFailure(turn.origins.at(-1), `⚠️ ${error === "rate_limit" ? "Still rate limited after retries — please try again later." : error === "stall" ? "The agent stopped responding; the turn was abandoned." : error}`);

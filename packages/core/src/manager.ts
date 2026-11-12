@@ -70,7 +70,9 @@ export interface TakeoverInfo { key: string; argv: string[]; cwd: string; live: 
 
 export type GroupSettings = { mode: GroupMode; ignoreOtherMentions: boolean; historyLimit: number; allowFrom: string[]; others: "context" | "ignore" };
 
-type TaskWaiter = { resolve: (r: { ok: boolean; text: string }) => void };
+/** `merged`: an async ask whose turn's answer went out with an earlier ask from the same session (no delivery of
+ *  its own). A blocking ask has no `merged` and resolves with the pointer text. */
+type TaskWaiter = { resolve: (r: { ok: boolean; text: string }) => void; merged?: () => void };
 
 /** A turn still in flight (graceful restart bookkeeping). */
 export interface InflightTurn { channelKey: string; origins: Origin[]; detachable: boolean; inputs: QueuedInput[] }
@@ -108,7 +110,7 @@ export class ChannelManager {
       ...deps,
       platform: (n) => deps.platforms.get(n),
       operatorTargets: () => [...deps.platforms.values()].flatMap((p) => p.operatorTargets()),
-      onTaskResult: (id, ok, text) => this.completeTask(id, ok, text),
+      onTaskResult: (id, ok, text, opts) => this.completeTask(id, ok, text, opts?.mergedInto),
       onUsageLimit: (key, failed) => this.onUsageLimit(key, failed),
       emit: (ev: RuntimeEvent) => { this.events.emit("event", ev); },
       isInternal: (k) => this.kindOf(k) === "internal",
@@ -1152,7 +1154,7 @@ export class ChannelManager {
    *  rounds and chain, see deliverAsyncResult), trigger → an echo. `release` frees the asker's bus.maxPending slot. */
   private asyncWaiter(mode: "ask" | "trigger", from: string, to: string, taskId: string,
     at: { hop: number; rounds: number; chain: string }, release?: () => void): TaskWaiter {
-    if (mode === "ask") return { resolve: (r) => { release?.(); this.deliverAsyncResult(from, to, taskId, at, r); } };
+    if (mode === "ask") return { resolve: (r) => { release?.(); this.deliverAsyncResult(from, to, taskId, at, r); }, merged: () => release?.() };
     return { resolve: (r) => {
       release?.();
       // Only sessions get the echo; CLI/API callers ("cli", "api", …) are not sessions.
@@ -1180,10 +1182,11 @@ export class ChannelManager {
     return new Promise<{ ok: boolean; text: string }>((resolve) => this.waiters.set(taskId, { resolve }));
   }
 
-  private completeTask(taskId: string, ok: boolean, text: string) {
+  private completeTask(taskId: string, ok: boolean, text: string, mergedInto?: string) {
     this.deps.store.updateTask(taskId, ok ? "completed" : "failed", text);
     const w = this.waiters.get(taskId);
     this.waiters.delete(taskId);
+    if (mergedInto && w?.merged) { w.merged(); return; }
     w?.resolve({ ok, text: text || "(empty reply)" });
   }
 
