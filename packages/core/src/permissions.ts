@@ -26,14 +26,20 @@ export interface ApprovalJudgeConfig {
   audit: boolean;
   /** Escalate when P(induced by content) reaches this, or the judge answers "unclear" (default 0.5). */
   inducedAbove?: number;
+  /** Auto-allow needs P(the call serves the task) at or above this (default 0.5). */
+  taskAbove?: number;
   /** Taint tracking (docs §10.4); defaults when absent. */
   taint?: {
     enabled: boolean;
     taintedAbove: number;
     sticky: boolean;
+    /** Turns after a tainted turn that keep its taint (default 3; sticky overrides: the whole session). */
+    carryTurns?: number;
     trustRepoFiles: boolean;
     highImpactEffects: ("read" | "create" | "modify" | "delete" | "execute" | "send" | "install" | "publish")[];
     thirdPartyTools?: string[];
+    /** MCP tool-name patterns that are local data (memory, notes): never third-party. Replaces the defaults. */
+    localTools?: string[];
   };
 }
 

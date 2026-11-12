@@ -10,7 +10,7 @@
 /** The shell that interprets a command: from the provider and tool (outer), switched only by an explicit inner
  *  interpreter (`bash -c`, `zsh -c`, `fish -c`, `pwsh -Command`). `argv`: no shell (an argument vector, codex);
  *  `unknown`: not reported by the provider, read as POSIX. */
-export type ShellDialect = "sh" | "bash" | "dash" | "zsh" | "fish" | "powershell" | "argv" | "unknown";
+export type ShellDialect = "sh" | "bash" | "dash" | "zsh" | "fish" | "csh" | "powershell" | "argv" | "unknown";
 const POSIX_DIALECTS = new Set<ShellDialect>(["sh", "bash", "dash", "argv", "unknown"]);
 /** posix | zsh | unsupported: switching between POSIX shells (sh, bash, dash) is not a dialect switch. */
 const family = (d: ShellDialect) => (POSIX_DIALECTS.has(d) ? "posix" : d === "zsh" ? "zsh" : "unsupported");
@@ -19,9 +19,11 @@ export const isParsedDialect = (d: ShellDialect) => POSIX_DIALECTS.has(d) || d =
 
 /** Dialect of a shell binary path or name (`/bin/zsh` → zsh, `pwsh` → powershell). */
 export function dialectOfShell(shell: string | undefined): ShellDialect {
-  const b = (shell ?? "").replace(/^.*[\\/]/, "").replace(/\.exe$/i, "").toLowerCase();
+  // Versioned names (bash5.2, ksh93, zsh-5.9) are the same shell.
+  const b = (shell ?? "").replace(/^.*[\\/]/, "").replace(/\.exe$/i, "").toLowerCase().replace(/-?\d+(\.\d+)*$/, "");
   if (b === "bash" || b === "sh" || b === "dash" || b === "zsh" || b === "fish") return b;
-  if (b === "ash" || b === "ksh" || b === "mksh" || b === "busybox") return "sh";
+  if (b === "ash" || b === "ksh" || b === "mksh" || b === "yash" || b === "busybox" || b === "busybox-sh") return "sh";
+  if (b === "csh" || b === "tcsh") return "csh";
   if (b === "pwsh" || b === "powershell") return "powershell";
   return "unknown";
 }
@@ -94,8 +96,11 @@ function readParen(src: string, i: number): [string, number] | undefined {
   return undefined;
 }
 
-function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[]; ok: boolean } {
+function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[]; ok: boolean; wordParen: boolean } {
   const toks: Tok[] = [];
+  /** An unquoted "(" right after a word (`*(e:'…':)`, `x(+f)`): a zsh glob qualifier or pattern group. Not `f()`,
+   *  `a=(…)`, `$(`, `<(`. */
+  let wordParen = false;
   const comments: string[] = [];
   const subs: string[] = [];
   let ok = true;
@@ -182,6 +187,7 @@ function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[
       continue;
     }
     if (c === "\n" || c === ";" || c === "&" || c === "|" || c === "(" || c === ")") {
+      if (c === "(" && cur && (cur.value || cur.quoted) && n !== ")" && !cur.value.endsWith("=")) wordParen = true;
       flush();
       let op = c;
       if ((c === "&" && n === "&") || (c === "|" && n === "|") || (c === ";" && n === ";") || (c === "|" && n === "&") || (c === ";" && n === "&")) { op += n; i++; }
@@ -210,20 +216,57 @@ function tokenize(src: string): { toks: Tok[]; comments: string[]; subs: string[
   }
   flush();
   if (heredocs.length) ok = false; // a here-document with no body
-  return { toks, comments, subs, ok };
+  return { toks, comments, subs, ok, wordParen };
 }
 
-const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "mksh", "pwsh", "powershell", "busybox-sh"]);
-const INTERPRETERS = new Set(["python", "python2", "python3", "perl", "ruby", "node", "nodejs", "deno", "bun", "php", "lua", "luajit", "osascript", "Rscript", "tclsh", "pypy", "pypy3"]);
+// A deny list can never be complete, so the reader fails closed: anything that runs a string or a file as code, or
+// changes what a command word resolves to, is flagged unresolvable (allowBlockers then keeps the request from being
+// auto-allowed while a Bash deny rule exists). Names are matched by pattern, so versioned binaries count too.
+/** Shells, versioned names included (bash5.2, ksh93). */
+const SHELL_NAME = /^(sh|bash|zsh|dash|ksh|ksh93|fish|ash|mksh|yash|csh|tcsh|pwsh|powershell|busybox-sh)(-?\d+(\.\d+)*)?$/;
+/** Interpreters, versioned names included (python3.12, node22, lua5.4, perl5.36). */
+export const INTERPRETER_NAME = /^(python|pythonw|pypy|perl|ruby|irb|jruby|node|nodejs|deno|bun|php|lua|luajit|osascript|Rscript|tclsh|wish|expect|julia|guile|racket|sbcl|elixir|escript|groovy|jython|ts-node|tsx)(-?\d+(\.\d+)*)?$/;
 const AWKS = new Set(["awk", "gawk", "mawk", "nawk", "busybox-awk"]);
 /** Shell reserved words that may precede a command in a simple-command position. */
-const LEADING_RESERVED = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "(", "time", "in", "coproc"]);
-const CLOSERS = new Set(["fi", "done", "esac", "}", ")"]);
-/** git -c keys that make git run another program. */
-const GIT_RUNS_COMMAND = /(^|\.)(pager|editor|sshcommand|askpass|hookspath|fsmonitor|textconv|externaldiff|external)$|^alias\.|^core\.(pager|editor|sshcommand|askpass|hookspath|fsmonitor|gitproxy)$|^(diff|merge|filter)\.|^credential\.helper$|^gpg\.program$|^sequence\.editor$/i;
+const LEADING_RESERVED = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "(", "time", "in", "coproc", "always"]);
+const CLOSERS = new Set(["fi", "done", "esac", "}", ")", "end"]);
+/** git -c / git config keys that make git run another program or read more config. */
+const GIT_RUNS_COMMAND = /(^|\.)(pager|editor|sshcommand|askpass|hookspath|fsmonitor|textconv|externaldiff|external|program|cmd|command|helper|tool)$|^alias\.|^core\.(pager|editor|sshcommand|askpass|hookspath|fsmonitor|gitproxy)$|^(diff|merge|filter|difftool|mergetool)\.|^credential\.|^gpg\.|^sequence\.editor$|^include\.|^includeif\./i;
+/** git's own commands: anything else is an alias (`!sh …`) or an external git-<name> program. Aliases can't shadow these. */
+const GIT_BUILTINS = new Set(("add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap " +
+  "check-ref-format checkout checkout-index cherry cherry-pick citool clean clone column commit commit-graph commit-tree config count-objects " +
+  "credential describe diagnose diff diff-files diff-index diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch " +
+  "for-each-ref for-each-repo format-patch fsck gc get-tar-commit-id grep gui hash-object help hook index-pack init instaweb " +
+  "interpret-trailers lfs log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-tree " +
+  "mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects pack-refs patch-id prune prune-packed pull push range-diff read-tree " +
+  "rebase reflog refs remote repack replace replay request-pull rerere reset restore rev-list rev-parse revert rm send-email shortlog show " +
+  "show-branch show-index show-ref sparse-checkout stash status stripspace submodule switch symbolic-ref tag unpack-objects update-index " +
+  "update-ref var verify-commit verify-pack verify-tag version whatchanged worktree write-tree").split(" "));
+/** git global options that take a separate argument. */
+const GIT_GLOBAL_ARGS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--exec-path", "--list-cmds", "--attr-source"]);
+/** Variables that make programs run other programs, load code or resolve commands differently (`PAGER=… git log`,
+ *  `LD_PRELOAD=…`, `PATH=…`, `HOME=…` with its dotfiles). */
+const HOOK_ENV = /^(BASH_ENV|ENV|ZDOTDIR|HOME|XDG_CONFIG_HOME|PROMPT_COMMAND|PS4|IFS|PATH|CDPATH|SHELL|BROWSER|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_\w+|PERL5OPT|PERL5LIB|PERLLIB|PYTHONSTARTUP|PYTHONPATH|PYTHONHOME|NODE_OPTIONS|NODE_PATH|RUBYOPT|RUBYLIB|LESSOPEN|LESSCLOSE|GIT_CONFIG\w*|GIT_EXEC_PATH|GIT_TEMPLATE_DIR|GIT_DIR|GIT_EXTERNAL_DIFF|\w*(PAGER|EDITOR|VISUAL|ASKPASS|_SSH|_COMMAND|_CMD|_PROGRAM|_HOOK|_RSH))$/;
+/** ssh options that run a local command, load code or read more config. */
+const SSH_RUNS = /^\s*(proxycommand|localcommand|knownhostscommand|match|include|pkcs11provider|securitykeyprovider)\b/i;
+/** Options that make a program run a command or code given as a string or file, per program. */
+const CODE_FLAGS: Record<string, RegExp> = {
+  tar: /^--(to-command|use-compress-program|checkpoint-action|rsh-command|info-script|new-volume-script|rmt-command)(=|$)|^-[A-Za-z]*[IF]/,
+  zip: /^(-TT|--unzip-command)(=|$)/,
+  vi: /^(-c|--cmd|-S|\+(?!\d*$).+)$/, vim: /^(-c|--cmd|-S|\+(?!\d*$).+)$/, nvim: /^(-c|--cmd|-S|-l|\+(?!\d*$).+)$/, ex: /^(-c|--cmd|-S|\+(?!\d*$).+)$/, view: /^(-c|--cmd|-S|\+(?!\d*$).+)$/,
+  emacs: /^(--eval|-l|--load|-f|--funcall|--batch|-batch|-x|--script)(=|$)/,
+  gdb: /^(-ex|--ex|-x|--command|--eval-command|-iex|-ix|-batch|--batch)(=|$)/, lldb: /^(-o|-O|--one-line|-s|--source|-k|-S)(=|$)/,
+  man: /^(-P|--pager|-H|--html)(=|$)/,
+  scp: /^-[A-Za-z]*S/, sftp: /^-[A-Za-z]*[SD]/,
+};
+/** Command words in a standard system binary directory (a path elsewhere runs a file the agent may have written). */
+const SYSTEM_BIN = /^\/(usr\/(local\/)?)?s?bin\/[^/]+$|^\/opt\/homebrew\/s?bin\/[^/]+$|^\/run\/current-system\/sw\/bin\/[^/]+$/;
 const base = (cmd: string) => cmd.replace(/^.*\//, "");
 const isAssign = (w: Word) => /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/.test(w.value);
+const assignName = (w: Word) => w.value.replace(/(\[[^\]]*\])?\+?=.*$/s, "");
 const lit = (value: string): Word => ({ value, dyn: false, quoted: false });
+/** Does a sed script run commands (the `e` command, `1e cmd`, `/re/e`, or `s///e`)? Errs toward yes. */
+const sedExecutes = (s: string) => /(^|[;\n{}!]|[\d$/]|^\s*)\s*e(\s|;|}|$)/.test(s) || /s([^\w\s\\])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpIiMm0-9w]*e/.test(s);
 
 /** Options taking a separate argument, per wrapper (anything else starting with "-" is a flag). */
 const OPT_ARGS: Record<string, string[]> = {
@@ -245,14 +288,35 @@ const OPT_ARGS: Record<string, string[]> = {
   runuser: ["-u", "-g", "-G", "--user", "--group"], su: ["-c", "-s", "-g", "-G"], chrt: [], cgexec: ["-g"], unshare: [], nsenter: ["-t"],
   faketime: [], torsocks: [], proxychains: ["-f"], proxychains4: ["-f"], firejail: [], parallel: [],
   "sandbox-exec": ["-f", "-p", "-n", "-D"],
+  // zsh precommand modifiers (`-` runs the command with a dash-prefixed argv[0]).
+  noglob: [], nocorrect: [], "-": [],
+  "systemd-run": ["-u", "--unit", "-p", "--property", "--description", "--slice", "-E", "--setenv", "--uid", "--gid", "-M", "--machine", "-H", "--host",
+    "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--path-property",
+    "--socket-property", "--working-directory", "--nice", "--service-type"],
+  run0: ["-u", "--user", "-g", "--group", "--unit", "--property", "--description", "--slice", "--setenv", "--nice", "-D", "--chdir"],
+  pkexec: ["--user"],
+  setpriv: ["--ruid", "--euid", "--reuid", "--rgid", "--egid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits",
+    "--pdeathsig", "--selinux-label", "--apparmor-profile", "--landlock-access", "--landlock-rule", "--seccomp-filter"],
+  script: ["-T", "-I", "-O", "-B", "-E", "-o", "-m", "--log-timing", "--log-in", "--log-out", "--log-io", "--echo", "--output-limit", "--logging-format"],
+  sg: [], runcon: [], gtimeout: ["-s", "-k", "--signal", "--kill-after"], eatmydata: [], fakeroot: ["-l", "--lib", "--faked", "-s", "-i", "-b"],
+  "dbus-run-session": ["--config-file", "--dbus-daemon"], "xvfb-run": ["-n", "--server-num", "-e", "--error-file", "-f", "--auth-file", "-p", "--xauth-protocol", "-s", "--server-args"],
+  "systemd-inhibit": ["--what", "--who", "--why", "--mode"], prlimit: ["-p", "--pid", "-o", "--output"], numactl: ["-C", "-N", "-m", "-p", "-i"],
+  valgrind: [], catchsegv: [], caffeinate: ["-t", "-w"], "ssh-agent": ["-a", "-E", "-P", "-t"], cpulimit: ["-l", "--limit", "-p", "--pid", "-e", "--exe"],
+  trickle: ["-u", "-d", "-w", "-t", "-l", "-n"], "aa-exec": ["-p", "--profile", "-n", "--namespace"], chpst: ["-u", "-U", "-e", "-/", "-n", "-l", "-L", "-m", "-d", "-o", "-p", "-f", "-c"],
 };
 /** Wrappers whose first non-option argument is not the command (a duration, a root dir, a lock file, a cpu mask, …). */
-const SKIP_POSITIONAL: Record<string, number> = { timeout: 1, chroot: 1, flock: 1, taskset: 1, chrt: 1, faketime: 1 };
+const SKIP_POSITIONAL: Record<string, number> = { timeout: 1, gtimeout: 1, chroot: 1, flock: 1, taskset: 1, chrt: 1, faketime: 1, sg: 1, runcon: 1 };
 
 /** Split a wrapper's arguments: its options, then the wrapped command. undefined = it doesn't run a command
  *  (`command -v`, `ionice -p`). */
 function unwrap(name: string, args: Word[]): { rest: Word[]; inner?: Word[] } | undefined {
   const withArg = OPT_ARGS[name] ?? [];
+  if (name === "script") { // options may follow the file; without -c it starts an interactive shell
+    const k = args.findIndex((w) => w.value === "-c" || w.value === "--command");
+    if (k >= 0) return { rest: [], inner: args.slice(k + 1, k + 2) };
+    const e = args.find((w) => w.value.startsWith("--command="));
+    return e ? { rest: [], inner: [{ ...e, value: e.value.slice(10) }] } : undefined;
+  }
   let i = 0;
   let positional = SKIP_POSITIONAL[name] ?? 0;
   while (i < args.length) {
@@ -263,7 +327,7 @@ function unwrap(name: string, args: Word[]): { rest: Word[]; inner?: Word[] } | 
     if (name === "command" && (a === "-v" || a === "-V")) return undefined;
     if (name === "ionice" && a === "-p") return undefined;
     if (name === "flock" && (a === "-c" || a === "--command")) return { rest: [], inner: args.slice(i + 1, i + 2) };
-    if (name === "su" && a === "-c") return { rest: [], inner: args.slice(i + 1, i + 2) };
+    if ((name === "su" || name === "sg") && (a === "-c" || a === "--command")) return { rest: [], inner: args.slice(i + 1, i + 2) };
     if (a.startsWith("-") && a.length > 1) {
       const key = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
       i += withArg.includes(key) && !a.includes("=") && !(key.length === 2 && a.length > 2) ? 2 : 1;
@@ -273,8 +337,9 @@ function unwrap(name: string, args: Word[]): { rest: Word[]; inner?: Word[] } | 
     break;
   }
   let rest = args.slice(i);
-  if (name === "parallel") { const k = rest.findIndex((w) => w.value === ":::"); if (k >= 0) rest = rest.slice(0, k); }
-  if (name === "watch") return { rest: [], inner: rest };
+  if (name === "parallel") { const k = rest.findIndex((w) => /^:::+$/.test(w.value)); if (k >= 0) rest = rest.slice(0, k); }
+  // watch and parallel hand their arguments to a shell as one string.
+  if (name === "watch" || name === "parallel") return { rest: [], inner: rest };
   return { rest };
 }
 
@@ -306,9 +371,11 @@ export function analyzeShell(src: string, dialect: ShellDialect = "bash", depth 
   if (depth > 8) { unres("nested too deep"); return out; }
   if (!isParsedDialect(dialect)) { unres(`${dialect} is not parsed`); return out; }
   if (dialect === "zsh" && /(^|[\s;&|(])=[A-Za-z_]|\$\{[~=^(#]|[*?\]]\([^)\s]*\)|=\(|<\(\(|\$\{\(/.test(src)) unres("zsh-specific syntax");
-  const { toks, comments, subs, ok } = tokenize(src);
+  const { toks, comments, subs, ok, wordParen } = tokenize(src);
   out.comments.push(...comments);
   if (!ok) unres("unbalanced quotes or here-document");
+  // zsh glob qualifiers run code (`*(e:'…':)`, `*(+f)`); an unknown shell may be zsh.
+  if (wordParen && (dialect === "zsh" || dialect === "unknown")) unres("zsh glob qualifier or pattern group");
   for (const t of toks) if (t.t === "redir") out.redirects.push({ op: t.op, target: t.target });
   const merge = (a: ShellAnalysis) => {
     out.commands.push(...a.commands); out.comments.push(...a.comments); out.redirects.push(...a.redirects); out.remote.push(...a.remote);
@@ -319,7 +386,6 @@ export function analyzeShell(src: string, dialect: ShellDialect = "bash", depth 
   if (subs.length) out.hasSubstitution = true;
   for (const s of subs) merge(analyzeShell(s, dialect, depth + 1));
   // Simple commands: words between separators, with what feeds their stdin.
-  type Seg = { words: Word[]; piped: boolean; heredocs: string[]; herestrings: Word[]; stdinFile: boolean };
   let seg: Seg = { words: [], piped: false, heredocs: [], herestrings: [], stdinFile: false };
   const segments: Seg[] = [];
   const close = (next: Seg) => { if (seg.words.length) segments.push(seg); seg = next; };
@@ -348,22 +414,46 @@ function braceExpand(w: Word): string[] | undefined | null {
   return m[2]!.split(",").map((alt) => m[1]! + alt + m[3]!);
 }
 
-function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; herestrings: Word[]; stdinFile: boolean }, dialect: ShellDialect, depth: number,
-  out: ShellAnalysis, merge: (a: ShellAnalysis) => void, unres: (why: string) => void) {
+type Seg = { words: Word[]; piped: boolean; heredocs: string[]; herestrings: Word[]; stdinFile: boolean };
+const plainSeg = (words: Word[]): Seg => ({ words, piped: false, heredocs: [], herestrings: [], stdinFile: false });
+
+/** Value of option `-x val` / `-xval` / `--long val` / `--long=val` at args[k], or undefined. `short`: the option's
+ *  letter, matched also at the end of a cluster (`-avze ssh`). Returns [value, words consumed]. */
+function optValue(args: Word[], k: number, short: string | undefined, long: string[]): [Word, number] | undefined {
+  const v = args[k]!.value;
+  for (const l of long) { if (v === l) return args[k + 1] ? [args[k + 1]!, 2] : undefined; if (v.startsWith(`${l}=`)) return [{ ...args[k]!, value: v.slice(l.length + 1) }, 1]; }
+  if (short && /^-[A-Za-z0-9]+$/.test(v) && v.endsWith(short)) return args[k + 1] ? [args[k + 1]!, 2] : undefined;
+  return undefined;
+}
+
+function runSimple(seg: Seg, dialect: ShellDialect, depth: number, out: ShellAnalysis, merge: (a: ShellAnalysis) => void, unres: (why: string) => void) {
   let words = seg.words;
   const stdinCode = () => [...seg.heredocs, ...seg.herestrings.map((w) => { if (w.dyn) unres("here-string with substitution"); return w.value; })];
-  for (let guard = 0; guard < 16; guard++) {
+  /** Analyse a string the command runs as shell code. */
+  const code = (w: Word, what: string, d: ShellDialect = dialect) => { out.wrappers.push(what); if (w.dyn) unres(`${what} with substitution`); merge(analyzeShell(w.value, d, depth + 1)); };
+  const hookEnv = (ws: Word[]) => { for (const w of ws) if (isAssign(w) && HOOK_ENV.test(assignName(w))) unres(`${assignName(w)}= changes what runs`); };
+  const sshOpts = (args: Word[], via: string) => {
+    for (let k = 0; k < args.length; k++) {
+      const v = args[k]!.value;
+      const o = v === "-o" ? args[k + 1]?.value : /^-o./.test(v) ? v.slice(2) : undefined;
+      if (o !== undefined && SSH_RUNS.test(o)) unres(`${via} -o ${o.trim().split(/[\s=]/)[0]} runs a command`);
+      if (v === "-F" || /^-F./.test(v)) unres(`${via} -F: a config file may run commands`);
+    }
+  };
+  for (let guard = 0; guard < 24; guard++) {
     // Reserved words and grouping are syntax, not commands; loop / case headers run nothing themselves.
-    while (words.length && LEADING_RESERVED.has(words[0]!.value) && !words[0]!.dyn && !words[0]!.quoted) {
+    while (words.length && !words[0]!.dyn && !words[0]!.quoted && (LEADING_RESERVED.has(words[0]!.value) || words[0]!.value === "repeat")) {
       const kw = words[0]!.value;
-      words = words.slice(1);
+      words = words.slice(kw === "repeat" ? 2 : 1); // zsh `repeat N cmd`
       if (kw === "time" && words[0]?.value === "-p") words = words.slice(1); // `time -p cmd`
     }
     while (words.length && CLOSERS.has(words.at(-1)!.value) && !words.at(-1)!.dyn && !words.at(-1)!.quoted) words = words.slice(0, -1);
-    if (words.length && ["for", "select", "case"].includes(words[0]!.value) && !words[0]!.quoted) return;
+    if (words.length && ["for", "select", "case", "foreach"].includes(words[0]!.value) && !words[0]!.quoted) return;
     if (words.length && words[0]!.value === "function" && !words[0]!.quoted) { words = words.slice(2); continue; }
     if (words.length && CLOSERS.has(words[0]!.value) && words.length === 1) return;
-    while (words.length && isAssign(words[0]!)) words = words.slice(1);
+    const k0 = words.findIndex((w) => !isAssign(w));
+    hookEnv(k0 < 0 ? words : words.slice(0, k0));
+    words = k0 < 0 ? [] : words.slice(k0);
     if (!words.length) return;
     // Brace expansion of the command word: {r,}m → rm m.
     const exp = braceExpand(words[0]!);
@@ -372,10 +462,14 @@ function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; her
     const first = words[0]!;
     if (first.dyn || !first.value) { unres("command word from a variable or substitution"); out.commands.push(words.map((w) => w.value)); return; }
     if (dialect === "zsh" && first.value.startsWith("=")) { unres("zsh =command expansion"); out.commands.push(words.map((w) => w.value)); return; }
+    // A quoted command word with spaces (`sudo -s 'rm -rf x'`, a string meant for a shell): read it as code too.
+    if (/\s/.test(first.value)) { unres("command word contains spaces"); merge(analyzeShell(first.value, dialect, depth + 1)); out.commands.push(words.map((w) => w.value)); return; }
+    // A path outside the system binary directories runs a file (`./x.sh`, `bin/run`), like `bash x.sh`.
+    if (first.value.includes("/") && !SYSTEM_BIN.test(first.value)) unres(`${first.value} runs a script file`);
     const name = base(first.value);
     const args = words.slice(1);
     const cmd = [name, ...args.map((w) => w.value)];
-    if (SHELLS.has(name)) {
+    if (SHELL_NAME.test(name)) {
       const inner = dialectOfShell(name === "busybox-sh" ? "sh" : name);
       if (inner === "powershell") {
         out.dialectSwitches.push(`${name} -Command`); unres(`${name} code is not parsed`); out.commands.push(cmd); return;
@@ -391,32 +485,92 @@ function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; her
         return;
       }
       out.commands.push(cmd);
-      const code = stdinCode();
-      if (code.length) { out.wrappers.push(`${name} <<`); if (family(inner) !== family(dialect)) out.dialectSwitches.push(`${name} <<`); for (const c of code) merge(analyzeShell(c, inner, depth + 1)); return; }
+      const sc = stdinCode();
+      if (sc.length) { out.wrappers.push(`${name} <<`); if (family(inner) !== family(dialect)) out.dialectSwitches.push(`${name} <<`); for (const c of sc) merge(analyzeShell(c, inner, depth + 1)); return; }
       const script = args.find((w) => !w.value.startsWith("-"));
       if (seg.piped && !script) { out.hasPipeToShell = true; unres(`${name} reads commands from a pipe`); return; }
       if (seg.stdinFile && !script) { unres(`${name} reads commands from a file`); return; }
       if (script) { unres(`${name} runs a script file`); return; }
       return; // an interactive shell
     }
-    if (INTERPRETERS.has(name)) {
+    if (INTERPRETER_NAME.test(name)) {
       out.commands.push(cmd);
       const inline = args.some((w) => /^(-[A-Za-z]*[ceE]|-r|--eval|-p|--print|eval)$/.test(w.value) && !(name.startsWith("python") && /^-[A-Za-z]*[eE]$/.test(w.value)));
       if (inline) unres(`inline ${name} code`);
       else if (stdinCode().length || args.some((w) => w.value === "-") || ((seg.piped || seg.stdinFile) && !args.some((w) => !w.value.startsWith("-")))) unres(`${name} reads code from stdin`);
+      else if (args.some((w) => !w.value.startsWith("-") || w.value === "-m")) unres(`${name} runs a script file`);
       return;
     }
+    if (name === "." || name === "source") { out.commands.push(cmd); unres(`${name} runs a script file`); return; }
     if (AWKS.has(name)) {
       out.commands.push(cmd);
       if (args.some((w) => /\bsystem\s*\(|\|\s*getline|\|\s*"|print[^;}]*\|/.test(w.value))) unres("awk runs commands");
+      if (args.some((w) => w.value === "-f" || w.value.startsWith("--file"))) unres("awk runs a script file");
       return;
     }
-    if (name === "git") {
-      for (let k = 0; k + 1 < args.length && args[k]!.value.startsWith("-"); k++) {
-        if (args[k]!.value === "-c" && GIT_RUNS_COMMAND.test((args[k + 1]!.value.split("=")[0] ?? "").trim())) unres(`git -c ${args[k + 1]!.value.split("=")[0]} runs a command`);
-        if (args[k]!.value.startsWith("--config-env")) unres("git --config-env");
-      }
+    if (name === "sed" || name === "gsed") {
       out.commands.push(cmd);
+      const scripts: Word[] = [];
+      let explicit = false;
+      for (let k = 0; k < args.length; k++) {
+        const v = args[k]!.value;
+        const e = optValue(args, k, "e", ["--expression"]);
+        if (e) { scripts.push(e[0]); explicit = true; k += e[1] - 1; continue; }
+        if (optValue(args, k, "f", ["--file"])) { unres("sed runs a script file"); explicit = true; k++; continue; }
+        if (v === "-l" || v === "--line-length") { k++; continue; }
+        if (!v.startsWith("-") && !explicit) { scripts.push(args[k]!); explicit = true; }
+      }
+      if (scripts.some((w) => w.dyn || sedExecutes(w.value))) unres("sed e command runs commands");
+      return;
+    }
+    if (name === "trap") {
+      out.commands.push(cmd);
+      const k = args.findIndex((w) => !w.value.startsWith("-") || w.value === "-");
+      if (k >= 0 && args[k]!.value !== "-" && args.length > k + 1) code(args[k]!, "trap");
+      return;
+    }
+    if (name === "alias") { // alias x='…': what x would run
+      out.commands.push(cmd);
+      for (const w of args) if (/^[^=-][^=]*=/.test(w.value)) code({ ...w, value: w.value.slice(w.value.indexOf("=") + 1) }, "alias");
+      return;
+    }
+    if (name === "export" || name === "declare" || name === "typeset" || name === "local" || name === "readonly") { out.commands.push(cmd); hookEnv(args); return; }
+    if (name === "at" || name === "batch") {
+      out.commands.push(cmd);
+      const sc = stdinCode();
+      if (sc.length) { out.wrappers.push(name); for (const c of sc) merge(analyzeShell(c, "sh", depth + 1)); return; }
+      if (!args.some((w) => /^-[lrdc]$/.test(w.value))) unres(`${name} runs commands from stdin or a file`);
+      return;
+    }
+    if (name === "crontab") { out.commands.push(cmd); if (!args.some((w) => /^-[lre]$/.test(w.value))) unres("crontab installs commands"); return; }
+    if (name === "sched") { out.wrappers.push("sched"); words = args.slice(1); continue; } // zsh `sched +1 cmd`
+    if (name === "git") {
+      out.commands.push(cmd);
+      let sub: Word | undefined;
+      let k = 0;
+      for (; k < args.length; k++) {
+        const v = args[k]!.value;
+        if (v === "-c" && args[k + 1]) { const key = (args[k + 1]!.value.split("=")[0] ?? "").trim(); if (GIT_RUNS_COMMAND.test(key)) unres(`git -c ${key} runs a command`); k++; continue; }
+        if (v.startsWith("--config-env")) { unres("git --config-env"); if (!v.includes("=")) k++; continue; }
+        if (v.startsWith("--exec-path=") || v === "--exec-path" && args[k + 1] && !args[k + 1]!.value.startsWith("-")) { unres("git --exec-path runs programs from a directory"); if (!v.includes("=")) k++; continue; }
+        if (GIT_GLOBAL_ARGS.has(v)) { k++; continue; }
+        if (v.startsWith("-")) continue;
+        sub = args[k];
+        break;
+      }
+      const rest = args.slice(k + 1);
+      if (!sub) return;
+      if (sub.dyn) { unres("git command from a variable or substitution"); return; }
+      // -c given after the subcommand is not a config option for most commands, but scan anyway: it costs nothing.
+      for (let j = 0; j + 1 < rest.length; j++) if (rest[j]!.value === "-c" && /=/.test(rest[j + 1]!.value) && GIT_RUNS_COMMAND.test(rest[j + 1]!.value.split("=")[0]!.trim())) unres(`git -c ${rest[j + 1]!.value.split("=")[0]} runs a command`);
+      const s = sub.value;
+      if (!GIT_BUILTINS.has(s)) unres(`git ${s}: an alias or external command`);
+      if (s === "config") { for (const w of rest) if (!w.value.startsWith("-") && GIT_RUNS_COMMAND.test(w.value.trim())) { unres(`git config ${w.value} sets a command`); break; } }
+      if (s === "submodule") { const f = rest.findIndex((w) => w.value === "foreach"); if (f >= 0) { const c = rest.slice(f + 1).filter((w) => !/^(--recursive|-q|--quiet)$/.test(w.value)); if (c.length) code({ value: c.map((w) => w.value).join(" "), dyn: c.some((w) => w.dyn), quoted: true }, "git submodule foreach"); } }
+      if (s === "rebase") for (let j = 0; j < rest.length; j++) { const e = optValue(rest, j, "x", ["--exec"]); if (e) { code(e[0], "git rebase --exec"); j += e[1] - 1; } }
+      if (s === "bisect" && rest[0]?.value === "run" && rest.length > 1) { out.wrappers.push("git bisect run"); words = rest.slice(1); continue; }
+      if (s === "filter-branch" || s === "hook") unres(`git ${s} runs commands`);
+      if ((s === "difftool" || s === "mergetool") && rest.some((w) => /^(-x|--extcmd|-t|--tool)(=|$)/.test(w.value))) unres(`git ${s} runs a tool command`);
       return;
     }
     if (name === "eval") {
@@ -426,8 +580,10 @@ function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; her
       return;
     }
     // Remote / container execution: what runs there is analysed as POSIX (the remote shell is unknown).
-    if (name === "ssh" || name === "mosh") {
+    if (name === "ssh" || name === "mosh" || name === "autossh") {
       out.commands.push(cmd);
+      sshOpts(args, name);
+      if (args.some((w) => /^--ssh(=|$)/.test(w.value))) unres(`${name} --ssh runs a command`);
       let i = 0;
       while (i < args.length && args[i]!.value.startsWith("-")) i += SSH_OPT_ARGS.has(args[i]!.value) ? 2 : 1;
       const host = args[i]?.value;
@@ -438,6 +594,18 @@ function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; her
       const a = analyzeShell(rest.map((w) => w.value).join(" "), "unknown", depth + 1);
       out.remote.push({ via: name, host, commands: [...a.commands, ...a.remote.flatMap((r) => r.commands)] });
       for (const r of a.unresolvableReasons) unres(r);
+      return;
+    }
+    if (name === "scp" || name === "sftp") sshOpts(args, name);
+    if (name === "rsync") {
+      out.commands.push(cmd);
+      for (let k = 0; k < args.length; k++) {
+        const v = args[k]!.value;
+        const e = optValue(args, k, "e", ["--rsh"]);
+        if (e) { code(e[0], "rsync -e"); k += e[1] - 1; continue; }
+        if (/^-[A-Za-z0-9]*e[A-Za-z0-9]+$/.test(v) && !v.startsWith("--")) unres("rsync -e inside an option cluster");
+        if (/^--rsync-path(=|$)/.test(v)) unres("rsync --rsync-path runs a remote command");
+      }
       return;
     }
     if ((name === "docker" || name === "podman" || name === "kubectl" || name === "nerdctl") && ["exec", "run"].includes(args.find((w) => !w.value.startsWith("-"))?.value ?? "")) {
@@ -462,12 +630,13 @@ function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; her
       out.wrappers.push(`${name} ${verb}`);
       if (inner.some((w) => w.dyn)) unres(`${name} ${verb} command with substitution`);
       const sub2 = emptyAnalysis("unknown");
-      runSimple({ words: inner, piped: false, heredocs: [], herestrings: [], stdinFile: false }, "unknown", depth + 1, sub2,
+      runSimple(plainSeg(inner), "unknown", depth + 1, sub2,
         (a) => { sub2.commands.push(...a.commands, ...a.remote.flatMap((x) => x.commands)); a.unresolvableReasons.forEach(unres); a.dialectSwitches.forEach((d) => out.dialectSwitches.push(d)); }, unres);
       out.remote.push({ via: `${name} ${verb}`, host, commands: sub2.commands });
       out.dialectSwitches.push(...sub2.dialectSwitches);
       return;
     }
+    if (name === "ip" && args[0]?.value === "netns" && args[1]?.value === "exec" && args.length > 3) { out.wrappers.push("ip netns exec"); words = args.slice(3); continue; }
     if (name === "bwrap") {
       out.wrappers.push("bwrap");
       let i = 0;
@@ -482,6 +651,7 @@ function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; her
       continue;
     }
     if (name in OPT_ARGS) {
+      if (name === "env") hookEnv(args);
       const u = unwrap(name, args);
       out.wrappers.push(name);
       if (!u) { out.commands.push(cmd); return; }
@@ -495,15 +665,20 @@ function runSimple(seg: { words: Word[]; piped: boolean; heredocs: string[]; her
       continue;
     }
     out.commands.push(cmd);
+    const flags = CODE_FLAGS[name];
+    if (flags && args.some((w) => flags.test(w.value))) unres(`${name} runs a command given as an option`);
+    // tar's old-style first argument (`tar xIf …`).
+    if (name === "tar" && args[0] && !args[0].value.startsWith("-") && /^[A-Za-z]*[IF]/.test(args[0].value)) unres("tar runs a command given as an option");
     // find -exec / -execdir / -ok … ; runs a command per file.
     if (name === "find") {
       for (let k = 0; k < args.length; k++) {
         if (!["-exec", "-execdir", "-ok", "-okdir"].includes(args[k]!.value)) continue;
         const end = args.findIndex((w, j) => j > k && (w.value === ";" || w.value === "+"));
         const inner = args.slice(k + 1, end < 0 ? undefined : end);
-        if (inner.length) { out.wrappers.push("find -exec"); runSimple({ words: inner, piped: false, heredocs: [], herestrings: [], stdinFile: false }, dialect, depth, out, merge, unres); }
+        if (inner.length) { out.wrappers.push("find -exec"); runSimple(plainSeg(inner), dialect, depth, out, merge, unres); }
       }
     }
     return;
   }
+  unres("too many nested wrappers");
 }

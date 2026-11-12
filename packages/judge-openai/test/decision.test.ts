@@ -17,7 +17,7 @@ const answer = (safe: number) => Response.json({ id: "d1", model: "gpt-6-luna", 
 test("POST /v1/decisions: gpt-6-luna, request as input_json, one choice question safe|unsafe; pSafe = probability of \"safe\"", async () => {
   const { f, calls } = fakeFetch(() => answer(0.83));
   const j = new OpenAIDecisionJudge({ key: async () => KEY, fetch: f, organization: "org-1", project: "proj-1" });
-  expect(await j.judge(INPUT, new AbortController().signal)).toEqual({ pSafe: 0.83, label: "safe", model: "gpt-6-luna" });
+  expect(await j.judge(INPUT, new AbortController().signal)).toEqual({ pSafe: 0.83, label: "safe", model: "gpt-6-luna", inducedError: "no answer to the induced question" });
   const c = calls[0]!;
   expect(c.url).toBe("https://api.openai.com/v1/decisions");
   const h = c.init.headers as Record<string, string>;
@@ -71,8 +71,19 @@ test("one request carries both questions (safety + induced); pInduced is the \"i
     { type: "choice", name: "induced", choice: "unclear", probabilities: [{ value: "unclear", probability: 0.5 }, { value: "induced", probability: 0.3 }, { value: "task", probability: 0.2 }], confidence: 0.2 },
   ] }));
   const v = await new OpenAIDecisionJudge({ key: async () => KEY, fetch: f }).judge(INPUT, new AbortController().signal);
-  expect(v).toEqual({ pSafe: 0.93, label: "safe", model: "gpt-6-luna", pInduced: 0.3, inducedLabel: "unclear" });
+  expect(v).toEqual({ pSafe: 0.93, label: "safe", model: "gpt-6-luna", pTask: 0.2, pInduced: 0.3, inducedLabel: "unclear" });
   expect(calls).toHaveLength(1);
   expect(calls[0]!.body.questions.map((q: { name: string }) => q.name)).toEqual(["safety", "induced"]);
   expect(calls[0]!.body.questions[1].choices.map((c: { value: string }) => c.value)).toEqual(["task", "induced", "unclear"]);
+});
+
+test("the induced answer fails closed: missing, refused or malformed → inducedError; P(task) is parsed", () => {
+  const safety = { type: "choice", name: "safety", choice: "safe", probabilities: [{ value: "safe", probability: 0.95 }, { value: "unsafe", probability: 0.05 }] };
+  const parse = (...more: unknown[]) => parseDecisionResponse({ model: "gpt-6-luna", answers: [safety, ...more] });
+  expect(parse()).toMatchObject({ inducedError: "no answer to the induced question" });
+  expect(parse({ type: "refusal", name: "induced" })).toMatchObject({ inducedError: "the induced question was refused" });
+  expect(parse({ type: "choice", name: "induced", choice: "task", probabilities: [{ value: "induced", probability: 0.1 }] })).toMatchObject({ inducedError: "malformed answer to the induced question" });
+  expect(parse({ type: "choice", name: "induced", choice: "task" })).toMatchObject({ inducedError: "malformed answer to the induced question" });
+  const v = parse({ type: "choice", name: "induced", choice: "task", probabilities: [{ value: "task", probability: 0.45 }, { value: "induced", probability: 0.3 }, { value: "unclear", probability: 0.25 }] });
+  expect(v).toEqual({ pSafe: 0.95, label: "safe", model: "gpt-6-luna", pTask: 0.45, pInduced: 0.3, inducedLabel: "task" });
 });

@@ -87,21 +87,21 @@ describe("taint raises the threshold for high-impact requests", () => {
     expect(r.audit()[0]).toMatchObject({ threshold: 0.97, taintStrict: true });
   });
 
-  test("sticky: taint from an earlier turn still counts in the next one (default: per turn)", async () => {
-    for (const sticky of [false, true]) {
+  test("carry: taint from an earlier turn still counts in the next one (default carryTurns 3; 0 = per turn; sticky)", async () => {
+    for (const [taintCfg, expected] of [[{ carryTurns: 0 }, false], [{}, true], [{ carryTurns: 0, sticky: true }, true]] as const) {
       let turn = 0;
       const r = setup((_i, s) => {
         if (turn++ === 0) s.emit({ type: "tool_start", id: "w", name: "WebFetch", input: { url: "https://x.example" } }, { type: "tool_end", id: "w", ok: true },
           { type: "permission_request", id: "p0", tool: "Bash", input: { command: "ls" }, title: "t" }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
         else s.emit({ type: "permission_request", id: "p1", tool: "Bash", input: POST, title: "t" });
-      }, { judge: { taint: { sticky } } });
+      }, { judge: { taint: taintCfg } });
       r.platform.choiceAnswer = 0;
       await r.mgr.handleInbound(inbound("first"));
       await until(() => r.judge.calls.length === 1);
       await Bun.sleep(30);
       await r.mgr.handleInbound(inbound("second"));
       await until(() => r.judge.calls.length === 2);
-      expect(r.judge.calls[1]!.taint!.tainted, String(sticky)).toBe(sticky);
+      expect(r.judge.calls[1]!.taint!.tainted, JSON.stringify(taintCfg)).toBe(expected);
     }
   });
 });
