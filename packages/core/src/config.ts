@@ -48,19 +48,26 @@ export const approvalJudgeSchema = z.object({
   audit: z.boolean().default(true),
   /** Escalate when the judge's "induced by content" probability reaches this (or it answers "unclear"). */
   inducedAbove: z.number().min(0).max(1).default(0.5),
+  /** Auto-allow needs P(task) from the induced question at or above this; mass on induced + unclear counts against. */
+  taskAbove: z.number().min(0).max(1).default(0.5),
   /** Taint tracking: untrusted content that entered the agent's context this turn (docs §10.4). */
   taint: z.object({
     enabled: z.boolean().default(true),
     /** Threshold for a tainted request with a high-impact effect or an external / remote / global / protected target. */
     taintedAbove: z.number().min(0).max(1).default(0.97),
-    /** Keep taint for the rest of the session instead of resetting it each turn. */
+    /** Keep taint for the rest of the session (until /new, /clear or /compact). */
     sticky: z.boolean().default(false),
+    /** A tainted turn's taint also applies to this many following turns (its content is still in the context);
+     *  cleared by /new, /clear and /compact. 0 = per turn only. */
+    carryTurns: z.number().int().min(0).default(3),
     /** Reads of files the project's git tracks are not taint (set false to treat the own repo as untrusted). */
     trustRepoFiles: z.boolean().default(true),
     /** Effects that count as high impact under taint. */
     highImpactEffects: z.array(z.enum(["read", "create", "modify", "delete", "execute", "send", "install", "publish"])).default(["send", "publish", "delete", "install"]),
     /** Tool-name patterns (regex, case-insensitive) of MCP tools whose results are third-party content; replaces the defaults. */
     thirdPartyTools: z.array(z.string()).optional(),
+    /** Tool-name patterns of local MCP tools (memory, notes) that are never third-party; replaces the defaults. */
+    localTools: z.array(z.string()).optional(),
   }).prefault({}),
 });
 

@@ -95,12 +95,15 @@ function bornAfter(p: string, t: number): boolean {
   try { const s = statSync(p); return s.birthtimeMs > 0 && s.birthtimeMs >= t; } catch { return false; }
 }
 
+/** Does the ref exist already: a local branch or tag, or a branch on any remote this repo knows (refs/remotes/<r>/<name>:
+ *  a branch that exists on a remote is not one this session created). The remote itself is not queried (network). */
 function refExists(ref: string, cwd: string): boolean {
-  const name = ref.startsWith("tags/") ? `refs/tags/${ref.slice(5)}` : `refs/heads/${ref}`;
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
   try {
-    const r = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", name], { cwd: nearestDir(cwd), stdout: "ignore", stderr: "ignore", env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
-    return r.exitCode === 0;
-  } catch { return true; } // can't tell: not a creation
+    if (ref.startsWith("tags/")) return Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `refs/tags/${ref.slice(5)}`], { cwd: nearestDir(cwd), stdout: "ignore", stderr: "ignore", env }).exitCode === 0;
+    const r = Bun.spawnSync(["git", "for-each-ref", "--count=1", "--format=%(refname)", `refs/heads/${ref}`, `refs/remotes/*/${ref}`], { cwd: nearestDir(cwd), stdout: "pipe", stderr: "ignore", env });
+    return r.exitCode === 0 && r.stdout.toString().trim() !== ""; // not a repo (yet): nothing exists
+  } catch { return true; }
 }
 
 /** /proc/<pid>/stat fields after the command name: [state, ppid, …, starttime (field 22)]. */
@@ -171,7 +174,7 @@ const P = (id: string, effect: Effect, details?: Record<string, unknown>): Raw =
 registerCommandExtractor(["rm", "rmdir", "unlink", "shred"], (a) => flagsOff(a).map((p) => P(p, "delete")));
 registerCommandExtractor(["mkdir", "touch"], (a) => flagsOff(a.filter((x, i) => !(a[i - 1] === "-m" || a[i - 1] === "-d" || a[i - 1] === "-t" || a[i - 1] === "-r"))).map((p) => P(p, "create")));
 registerCommandExtractor("truncate", (a) => flagsOff(a.filter((_, i) => a[i - 1] !== "-s" && a[i - 1] !== "-r")).map((p) => P(p, "modify")));
-registerCommandExtractor(["chmod", "chown", "chgrp"], (a) => flagsOff(a).slice(1).map((p) => P(p, "modify")));
+registerCommandExtractor(["chmod", "chown", "chgrp"], (a, c) => { const [mode, ...ps] = flagsOff(a); return ps.map((p) => P(p, "modify", c.name === "chmod" && mode ? { chmod: mode } : undefined)); });
 registerCommandExtractor(["mv", "cp", "ln", "install", "rsync"], (a, c) => {
   const ps = flagsOff(a.filter((_, i) => !["-t", "--target-directory", "-S", "--suffix", "-m", "--mode", "-e"].includes(a[i - 1] ?? "")));
   if (ps.length < 2) return ps.map((p) => P(p, "read"));
@@ -258,8 +261,15 @@ registerCommandExtractor(["curl", "wget", "http", "https", "xh"], (a, c) => {
     || a.some((x) => /^(-d|--data|--data-\w+|-F|--form|-T|--upload-file|--json|--post-data|--post-file|--body-data)(=|$)/.test(x) || /^-[dFT].+/.test(x))
     || (["http", "https", "xh"].includes(c.name) && /^(POST|PUT|PATCH|DELETE)$/i.test(a[0] ?? ""));
   const out: Raw[] = urls.map((u) => urlRaw(u, sends ? "send" : "read", { method: method || (sends ? "POST" : "GET") }));
-  const o = optVal(a, "-o", "--output", "-O", "--output-document");
+  // curl -o FILE / -O (remote name); wget -O FILE, else the URL's file name (in -P DIR).
+  const cluster = (letter: string) => { const i = a.findIndex((x) => new RegExp(`^-[a-zA-Z]*${letter}`).test(x) && !x.startsWith("--")); if (i < 0) return undefined; const rest = a[i]!.slice(a[i]!.indexOf(letter) + 1); return rest || a[i + 1]; };
+  const o = c.name === "wget" ? optVal(a, "--output-document") ?? cluster("O") : optVal(a, "--output") ?? cluster("o");
+  const fileOf = (u: string) => { try { return decodeURIComponent(new URL(/^[a-z]+:\/\//i.test(u) ? u : `http://${u}`).pathname.split("/").pop() || "index.html"); } catch { return undefined; } };
   if (o && o !== "-") out.push(P(o, "create"));
+  else if (!o && (c.name === "wget" || has(a, "-O") || a.includes("--remote-name"))) {
+    const dir = c.name === "wget" ? optVal(a, "-P", "--directory-prefix") : undefined;
+    for (const u of urls) { const f = fileOf(u); if (f) out.push(P(dir ? `${dir.replace(/\/$/, "")}/${f}` : f, "create")); }
+  }
   return out;
 });
 // processes
@@ -509,6 +519,9 @@ export function pathCategory(p: string): "generated" | "source" | "config" | "da
   const parts = normPath(p).split("/").filter(Boolean);
   const name = parts.at(-1) ?? "";
   if (SECRETISH.test(p)) return "secret";
+  // Startup files and hooks run later as code: config, whatever their name.
+  if (/^\.(profile|bash_profile|bash_login|bash_logout|zshenv|zprofile|zlogin|zlogout|login|xinitrc|xprofile)$|^authorized_keys$|^crontab$/.test(name)
+    || parts.some((s) => s === ".config" || s === "autostart" || s === "systemd" || s === "cron.d") || /(^|\/)\.git\/hooks\/|(^|\/)\.github\/workflows\//.test(normPath(p))) return "config";
   const GEN = /^(build|builds|dist|out|output|outputs|target|node_modules|__pycache__|\.cache|cache|caches|tmp|temp|\.tmp|coverage|\.next|\.nuxt|\.turbo|\.parcel-cache|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.tox|\.gradle|logs?|checkpoints?|ckpts?|runs|wandb|lightning_logs|artifacts|\.venv|venv)$/i;
   if (parts.some((s) => GEN.test(s) || /^out[\w.-]*$/i.test(s) || /_outputs?(\b|_|$)/i.test(s) || /^outputs?_/i.test(s) || /^tmp[\w.-]*/i.test(s) || /checkpoint/i.test(s))) return "generated";
   if (/\.(log|tmp|bak|pyc|pyo|o|obj|a|so\.\d|class|swp)$/i.test(name)) return "generated";
@@ -587,6 +600,7 @@ KIND_PROVENANCE.set("git-ref", async (t, ctx, cache) => {
     if (defaultBranch) d.defaultBranch = defaultBranch;
     d.isProtected = PROTECTED.test(branch) || !!d.isDefaultBranch;
     t.existsNow = (await run(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], dir)).code === 0;
+    if ((await run(["git", "for-each-ref", "--count=1", "--format=%(refname)", `refs/remotes/*/${branch}`], dir)).out) d.onRemote = true;
   }
   t.createdThisSession = ctx.ledger.has("git-ref", branch) || ctx.ledger.has("git-ref", t.id);
   t.details = d;

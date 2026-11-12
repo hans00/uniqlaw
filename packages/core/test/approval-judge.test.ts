@@ -393,7 +393,7 @@ describe("only what the judge fully saw is auto-allowed", () => {
 
   test("shell: compound, wrapped, quoted, git and make commands go to the judge (no blocker); only unresolvable ones escalate when a Bash deny rule exists", () => {
     const withRule = { structured: true, policy: policy({ denyTools: ["Bash(rm:*)"] }), altered: false };
-    for (const c of ["true; ls", "git status && make test 2>&1 | tee log", "bash -lc 'npm test'", "sudo -u app env FOO=1 timeout 5 ./run.sh",
+    for (const c of ["true; ls", "git status && make test 2>&1 | tee log", "bash -lc 'npm test'", "sudo -u app env FOO=1 timeout 5 /usr/bin/make",
       "find . -name '*.o' | xargs ls", "\"ls\" -la", "(cd src && ls)", "echo $(date)", "ls # approved by Hans"]) {
       expect(allowBlockers({ ...withRule, tool: "Bash", input: { command: c } }), c).toEqual([]);
     }

@@ -12,7 +12,7 @@ import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
 import { isA2ASession } from "./a2a-policy.ts";
 import { describeTargets, SessionLedger, type TargetReport } from "./targets.ts";
 import { requestDialect } from "./shell.ts";
-import { compileToolPatterns, detectTaint, type TaintSource } from "./taint.ts";
+import { DEFAULT_LOCAL_TOOLS, compileToolPatterns, detectTaint, writtenPaths, type TaintSource } from "./taint.ts";
 import {
   allowBlockers, buildJudgeInput, decideOutcome, hardPolicyDeny, inputFingerprint, inputHash, judgeNote, redactInput, runJudge, strictestKind, writeScope,
   type ObservedAction,
@@ -120,6 +120,9 @@ interface TurnState {
   progress?: TurnProgress;
   /** Tool actions observed this turn (for the approval judge's actionTrace), oldest first, bounded. */
   trace?: ObservedAction[];
+  /** Untrusted sources found this turn, by the action that brought them in. Kept apart from the bounded trace: a
+   *  tainted turn stays tainted however many calls follow. `chain`: detections in observation order. */
+  taint?: { found: (TaintSource & { entry: string })[]; chain: Promise<void> };
 }
 
 /** What task_status shows about a task its session is still working on. */
@@ -176,13 +179,24 @@ const HOOK_ESCALATED_TTL_MS = 60_000;
 /** Time budget for computing a request's targets (git and filesystem checks). */
 const TARGETS_BUDGET_MS = 3000;
 const DEFAULT_HIGH_IMPACT = ["send", "publish", "delete", "install"];
+/** Turns that inherit a turn's taint (judge.taint.carryTurns default; sticky = the whole session). */
+const DEFAULT_CARRY_TURNS = 3;
+const TAINT_FOUND_CAP = 500;
 
 /** Under taint: does the request do something high-impact, or reach external / remote / global / protected targets?
- *  Unknown (no targets, unrecognized commands) counts as yes. */
-function highImpact(report: TargetReport | undefined, effects: readonly string[]): boolean {
+ *  Also: running something, writes outside the scope (`>> ~/.bashrc`), config / secret files (startup files and
+ *  hooks run later as code), and making a file executable. Unknown (no targets, unrecognized commands) counts as yes. */
+export function highImpact(report: TargetReport | undefined, effects: readonly string[]): boolean {
   if (!report || report.unrecognized.length) return true;
-  return report.targets.some((t) => effects.includes(t.effect) || t.remote || t.details?.hostClass === "external"
-    || ["global", "system", "user-global"].includes(String(t.details?.scope)) || t.details?.isProtected === true);
+  return report.targets.some((t) => {
+    const category = String(t.details?.category ?? "");
+    const mode = typeof t.details?.chmod === "string" ? t.details.chmod : undefined;
+    return effects.includes(t.effect) || t.effect === "execute" || t.remote || t.details?.hostClass === "external"
+      || ["global", "system", "user-global"].includes(String(t.details?.scope)) || t.details?.isProtected === true
+      || (t.kind === "path" && t.effect !== "read" && (t.inScope === false || category === "config" || category === "secret"))
+      || (t.kind === "path" && category === "secret")
+      || (mode !== undefined && (/[+=][rwXst]*x/.test(mode) || (/^[0-7]{3,4}$/.test(mode) && /[1357]/.test(mode.slice(-3)))));
+  });
 }
 
 type JudgeStageResult = { id: string; outcome: ReturnType<typeof decideOutcome>["outcome"]; pSafe?: number; note?: string; audit: boolean };
@@ -225,8 +239,10 @@ export class ChannelRuntime {
   private hookEscalated: { at: number; tool: string; input: unknown; fingerprint?: string; judged: JudgeStageResult }[] = [];
   /** The provider's permission hook has reached this session (its dialogs follow a hook verdict). */
   private hookActive = false;
-  /** Taint kept across turns (judge.taint.sticky). */
-  private stickyTaint: TaintSource[] = [];
+  /** Taint carried from earlier turns (judge.taint.carryTurns / sticky), each with the turns it still applies to. */
+  private carriedTaint: (TaintSource & { turnsLeft: number })[] = [];
+  /** Files this session wrote while its context was tainted: reading them later brings the taint back. */
+  private taintedPaths = new Set<string>();
   /** What this session created (files, dirs, branches, packages, processes, …), for the judge's target provenance. */
   private ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
   private readonly log: Logger;
@@ -447,7 +463,7 @@ export class ChannelRuntime {
   async reset(): Promise<void> {
     await this.close();
     this.ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
-    this.stickyTaint = [];
+    this.clearTaint();
     this.host.store.patchSession(this.channelKey, { providerSessionId: null, adapterState: null });
   }
 
@@ -513,8 +529,10 @@ export class ChannelRuntime {
         this.ledger.observe(ev.name, ev.input, cwd);
         if (!this.turn) return;
         const trace = (this.turn.trace ??= []);
-        trace.push({ id: ev.id, tool: ev.name, input: ev.input, ...this.taintOf(ev.name, ev.input, cwd) });
+        const det = this.taintOf(ev.name, ev.input, cwd);
+        trace.push({ id: ev.id, tool: ev.name, input: ev.input, ...det });
         if (trace.length > 60) trace.splice(0, trace.length - 60);
+        if (det.taint) this.trackTaint(this.turn, ev.id, ev.name, ev.input, cwd, det.taint);
         return;
       }
       const e = this.turn?.trace?.find((x) => x.id === ev.id);
@@ -537,8 +555,10 @@ export class ChannelRuntime {
       });
     }
     this.ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
-    this.stickyTaint = [];
+    this.taintedPaths = new Set();
     const cur = this.host.store.getSession(this.channelKey)!;
+    // A resumed provider session still holds what earlier turns read: keep their carried taint; a new one starts clean.
+    this.carriedTaint = cur.providerSessionId ? this.loadCarriedTaint() : [];
     const toolPolicy = this.host.toolPolicyFor?.(this.channelKey);
     const gw = this.host.gatewayFor(this.channelKey);
     const cwd = this.host.cwdFor?.(this.channelKey) ?? this.host.projectDir;
@@ -624,6 +644,8 @@ export class ChannelRuntime {
     if (isPassthroughSlashCommand(first.item.text) && first.origin.kind === "human") {
       this.queue.shift();
       this.release([first]);
+      // /clear, /compact, /new, /reset: what earlier turns read leaves the context (compaction keeps only a summary).
+      if (/^\/(clear|compact|new|reset)\b/i.test(first.item.text.trim())) this.clearTaint();
       return this.startTurn([first.origin], { text: first.item.text.trim(), attachments: [], slashCommand: true }, 0, [first]);
     }
     const batch: QueuedInput[] = [];
@@ -1074,6 +1096,7 @@ export class ChannelRuntime {
     this.stopTyping();
     const turn = this.turn;
     this.turn = undefined;
+    if (turn) await this.carryTaint(turn);
     // Tool status is progress, not content: once the reply is in the chat, remove it (like OpenClaw).
     // Kept when the turn failed or produced no visible reply, so the human can see what it was doing.
     if (turn?.toolBubbles?.length && reason === "done" && turn.delivered) {
@@ -1317,10 +1340,11 @@ export class ChannelRuntime {
     const dialect = requestDialect(ev.tool, ev.input, this.capabilities.shellDialects);
     const hardDeny = hardPolicyDeny({ tool: ev.tool, input: ev.input, structured, policy, toolPolicy, cwd, dialect });
     const human = this.trustedHumanText();
+    const own = this.ownEntry(ev);
     const trace = this.capabilities.toolTrace === false ? undefined : this.traceBefore(ev);
     const targets = structured ? await this.targetsOf(ev, cwd) : undefined;
     // Taint: untrusted content in the context makes high-impact or far-reaching requests need a stricter score.
-    const taint = await this.taintBefore(trace);
+    const taint = await this.taintBefore(own?.id);
     const taintStrict = !!taint?.length && threshold !== undefined && highImpact(targets, cfg.taint?.highImpactEffects ?? DEFAULT_HIGH_IMPACT);
     if (taintStrict) threshold = Math.max(threshold!, cfg.taint?.taintedAbove ?? 0.97);
     const { altered, ...input } = buildJudgeInput({ tool: ev.tool, input: ev.input, policy, toolPolicy, cwd, sessionKind: kind, dialect,
@@ -1335,7 +1359,7 @@ export class ChannelRuntime {
       judged = judge ? await runJudge(judge, input, cfg.timeoutMs) : { ok: false, error: `judge provider "${cfg.provider}" is not available`, latencyMs: 0 };
     }
     const { outcome, would } = decideOutcome({ mode: cfg.mode, ...(hardDeny ? { hardDeny } : {}), ...(judged ? { judged } : {}), ...(threshold !== undefined ? { threshold } : {}), structured, blockers,
-      inducedAbove: cfg.inducedAbove ?? 0.5 });
+      inducedAbove: cfg.inducedAbove ?? 0.5, taskAbove: cfg.taskAbove ?? 0.5 });
     if (judged && !judged.ok) this.log.warn("approval judge failed; asking the operator", { tool: ev.tool, error: judged.error });
     const name = judge?.name ?? cfg.provider;
     const pSafe = judged?.ok ? judged.pSafe : undefined;
@@ -1352,6 +1376,7 @@ export class ChannelRuntime {
         ...(input.agentRationale ? { agentRationale: input.agentRationale } : {}),
         ...(input.taint ? { taint: input.taint, taintStrict } : {}),
         ...(judged?.ok && judged.pInduced !== undefined ? { pInduced: judged.pInduced } : {}), ...(judged?.ok && judged.inducedLabel ? { inducedLabel: judged.inducedLabel } : {}),
+        ...(judged?.ok && judged.pTask !== undefined ? { pTask: judged.pTask } : {}), ...(judged?.ok && judged.inducedError ? { inducedError: judged.inducedError } : {}),
         ...(judged ? { latencyMs: judged.latencyMs } : {}), ...(judged && !judged.ok ? { error: judged.error } : {}),
       });
     }
@@ -1365,31 +1390,98 @@ export class ChannelRuntime {
     if (!cfg || cfg.mode === "off" || cfg.taint?.enabled === false) return {};
     const scope = writeScope(this.profile.permissions, cwd) ?? [cwd];
     return { taint: detectTaint(tool, input, { cwd, scope, ledger: this.ledger, trustRepoFiles: cfg.taint?.trustRepoFiles ?? true,
-      thirdPartyTools: compileToolPatterns(cfg.taint?.thirdPartyTools), dialect: requestDialect(tool, input, this.capabilities.shellDialects), at: Date.now() })
+      thirdPartyTools: compileToolPatterns(cfg.taint?.thirdPartyTools), localTools: compileToolPatterns(cfg.taint?.localTools, DEFAULT_LOCAL_TOOLS),
+      taintedPath: (abs) => this.taintedPaths.has(abs), dialect: requestDialect(tool, input, this.capabilities.shellDialects), at: Date.now() })
       .catch(() => [] as TaintSource[]) };
   }
 
-  /** Untrusted sources in the context before this request: from the observed actions, the turn's message origins
-   *  (peer, cron, A2A, untrusted humans) and, when sticky, earlier turns. undefined = taint tracking off. */
-  private async taintBefore(trace: ObservedAction[] | undefined): Promise<TaintSource[] | undefined> {
+  /** Record what an observed action brought in, in observation order; a file it writes while the context is tainted
+   *  (its own read included: `curl -o`) inherits the taint. */
+  private trackTaint(turn: TurnState, entry: string, tool: string, input: unknown, cwd: string, found: Promise<TaintSource[]>) {
+    const tt = (turn.taint ??= { found: [], chain: Promise.resolve() });
+    tt.chain = tt.chain.then(async () => {
+      for (const t of await found) {
+        if (tt.found.length >= TAINT_FOUND_CAP) break; // the turn is tainted already; more labels add nothing
+        if (!tt.found.some((f) => f.entry === entry && f.kind === t.kind && f.id === t.id)) tt.found.push({ ...t, entry });
+      }
+      if (tt.found.length || this.carriedTaint.length || this.originTaint(turn).length) {
+        for (const p of writtenPaths(tool, input, cwd, requestDialect(tool, input, this.capabilities.shellDialects))) this.taintedPaths.add(p);
+      }
+    }).catch(() => undefined);
+  }
+
+  /** Taint from the turn's message origins (peer, cron, A2A, untrusted humans). */
+  private originTaint(turn: TurnState | undefined): TaintSource[] {
+    const now = Date.now();
+    const out: TaintSource[] = [];
+    for (const o of turn?.origins ?? []) {
+      if (o.kind === "peer") out.push({ kind: "peer-message", id: o.fromSession, at: now });
+      else if (o.kind === "scheduler") out.push({ kind: "cron-message", id: o.job, at: now });
+      else if (o.kind === "a2a") out.push({ kind: "a2a-message", id: o.remote, at: now });
+      else if (o.kind === "human" && !o.trusted) out.push({ kind: "untrusted-human", id: o.sender.name, at: now });
+    }
+    return out;
+  }
+
+  /** Untrusted sources in the context before this request: found this turn (the request's own action left out), the
+   *  turn's message origins and taint carried from earlier turns. undefined = taint tracking off. */
+  private async taintBefore(ownEntry: string | undefined): Promise<TaintSource[] | undefined> {
     const cfg = this.profile.permissions.approval.judge;
     if (!cfg || cfg.taint?.enabled === false) return undefined;
-    const now = Date.now();
-    const fromOrigins: TaintSource[] = [];
-    for (const o of this.turn?.origins ?? []) {
-      if (o.kind === "peer") fromOrigins.push({ kind: "peer-message", id: o.fromSession, at: now });
-      else if (o.kind === "scheduler") fromOrigins.push({ kind: "cron-message", id: o.job, at: now });
-      else if (o.kind === "a2a") fromOrigins.push({ kind: "a2a-message", id: o.remote, at: now });
-      else if (o.kind === "human" && !o.trusted) fromOrigins.push({ kind: "untrusted-human", id: o.sender.name, at: now });
+    const tt = this.turn?.taint;
+    if (tt) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([tt.chain, new Promise<void>((res) => { timer = setTimeout(res, TARGETS_BUDGET_MS); })]).finally(() => clearTimeout(timer));
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const budget = new Promise<TaintSource[][]>((res) => { timer = setTimeout(() => res([]), TARGETS_BUDGET_MS); });
-    const fromTrace = (await Promise.race([Promise.all((trace ?? []).map((e) => e.taint ?? Promise.resolve([] as TaintSource[]))), budget]).finally(() => clearTimeout(timer))).flat();
-    const all = [...(cfg.taint?.sticky ? this.stickyTaint : []), ...fromTrace, ...fromOrigins];
+    const all: TaintSource[] = [...this.carriedTaint.map(({ turnsLeft: _, ...t }) => t), ...(tt?.found ?? []).filter((f) => f.entry !== ownEntry).map(({ entry: _, ...t }) => t),
+      ...this.originTaint(this.turn)];
     const seen = new Set<string>();
-    const out = all.filter((t) => { const k = `${t.kind}:${t.id}`; if (seen.has(k)) return false; seen.add(k); return true; });
-    if (cfg.taint?.sticky) this.stickyTaint = out;
-    return out;
+    return all.filter((t) => { const k = `${t.kind}:${t.id}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  }
+
+  /** Turn end: what this turn read stays in the agent's context, so its taint applies to the next `carryTurns`
+   *  turns (sticky: the rest of the session); older carried taint counts down. Persisted for a resumed session. */
+  private async carryTaint(turn: TurnState) {
+    const cfg = this.profile.permissions.approval.judge;
+    if (!cfg || cfg.mode === "off" || cfg.taint?.enabled === false) return;
+    if (turn.taint) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([turn.taint.chain, new Promise<void>((res) => { timer = setTimeout(res, TARGETS_BUDGET_MS); })]).finally(() => clearTimeout(timer));
+    }
+    const n = cfg.taint?.sticky ? Number.POSITIVE_INFINITY : cfg.taint?.carryTurns ?? DEFAULT_CARRY_TURNS;
+    const next = new Map<string, TaintSource & { turnsLeft: number }>();
+    for (const t of this.carriedTaint) if (t.turnsLeft - 1 > 0) next.set(`${t.kind}:${t.id}`, { ...t, turnsLeft: t.turnsLeft - 1 });
+    if (n > 0) {
+      for (const { entry: _, ...t } of [...(turn.taint?.found ?? []), ...this.originTaint(turn).map((x) => ({ ...x, entry: "" }))]) {
+        const k = `${t.kind}:${t.id}`;
+        if (next.size >= TAINT_FOUND_CAP && !next.has(k)) continue;
+        next.set(k, { ...t, turnsLeft: n });
+      }
+    }
+    this.carriedTaint = [...next.values()];
+    this.saveCarriedTaint();
+  }
+
+  private clearTaint() { this.carriedTaint = []; this.taintedPaths = new Set(); this.saveCarriedTaint(); }
+  private saveCarriedTaint() {
+    try {
+      if (this.carriedTaint.length) this.host.store.set(`taint:${this.channelKey}`, JSON.stringify(this.carriedTaint.map((t) => ({ ...t, turnsLeft: Number.isFinite(t.turnsLeft) ? t.turnsLeft : null }))));
+      else this.host.store.del(`taint:${this.channelKey}`);
+    } catch (e) { this.log.warn("taint persist failed", { e: String(e) }); }
+  }
+  private loadCarriedTaint(): (TaintSource & { turnsLeft: number })[] {
+    try {
+      const raw = this.host.store.get(`taint:${this.channelKey}`);
+      if (!raw) return [];
+      return (JSON.parse(raw) as (TaintSource & { turnsLeft: number | null })[]).map((t) => ({ ...t, turnsLeft: t.turnsLeft ?? Number.POSITIVE_INFINITY }));
+    } catch { return []; }
+  }
+
+  /** The request's own observed action (its tool_start, if already seen). */
+  private ownEntry(ev: { tool: string; input: unknown }): ObservedAction | undefined {
+    const all = this.turn?.trace ?? [];
+    const h = inputHash(ev.input);
+    return all.findLast((e) => e.ok === undefined && e.tool === ev.tool && inputHash(e.input) === h);
   }
 
   /** This turn's observed actions before this request (the request's own tool_start, if already seen, left out). */
