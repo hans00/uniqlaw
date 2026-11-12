@@ -1,0 +1,14 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│ Do you trust the files in this folder?                                       │
+│                                                                              │
+│ /home/user/scratch/worker-dir                                                │
+│                                                                              │
+│ Claude Code may read files in this folder. Reading untrusted files may lead   │
+│ Claude Code to behave in unexpected ways.                                    │
+│                                                                              │
+│ ❯ 1. Yes, I trust this folder                                                │
+│   2. No, exit                                                                │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+   Enter to confirm · Esc to exit
