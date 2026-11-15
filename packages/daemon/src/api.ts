@@ -112,7 +112,13 @@ export function startApi(o: ApiOptions) {
           if (!path.startsWith("/api/")) return json({ ok: false, error: "not found" }, 404);
           if (!authorized(req)) return json({ ok: false, error: "unauthorized" }, 401);
 
-          if (req.method === "GET" && path === "/api/status") return json({ ok: true, version: o.version, agents: manager.listAgents(), restart: o.restart?.status() ?? { pending: false } });
+          if (req.method === "GET" && path === "/api/status") return json({ ok: true, version: o.version, agents: manager.listAgents(), restart: o.restart?.status() ?? { pending: false },
+            channels: manager.channelHealth(), orphans: manager.sessionHealth().filter((h) => h.orphan) });
+          // Health (docs §11.4): channels and every session's process / MCP link. ?refresh=1 inspects now.
+          if (req.method === "GET" && path === "/api/health") {
+            if (url.searchParams.get("refresh") === "1") await manager.health?.refresh();
+            return json({ ok: true, channels: manager.channelHealth(), sessions: manager.sessionHealth() });
+          }
           if (req.method === "GET" && path === "/api/agents") return json({ ok: true, agents: agentsDetail() });
           if (req.method === "GET" && path === "/api/jobs") {
             const jobs = loadJobs(o.jobsDir).map((j) => ({ name: j.name, schedule: j.schedule, recurring: j.recurring, target: j.target,

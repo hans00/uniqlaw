@@ -4,7 +4,8 @@ import { join, resolve } from "node:path";
 import {
   BRAND_PROMPT, ChannelManager, channelPolicyWarnings, ISOLATED_SCOPE_PROMPT, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
   createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, RestartCoordinator, type MemoryOriginKind, type RestartKind,
-  ApprovalAudit, type ApprovalJudge, type ApprovalJudgeConfig,
+  ApprovalAudit, type ApprovalJudge, type ApprovalJudgeConfig, ChannelSupervisor, withDeadline, type SupervisorOptions,
+  HealthMonitor, type HealthOptions,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
   type Profile, type Scheduler, type SecretRef, type Settings, type SessionContext, type SystemPromptParts, type Transcriber, type Transport,
 } from "@uniqlaw/core";
@@ -72,7 +73,12 @@ export interface Daemon {
   restart: RestartCoordinator;
   webPort?: number;
   gatewayPort?: number;
+  /** Chat platforms, started in the background (their health: channels.health()). */
+  channels: ChannelSupervisor;
 }
+
+/** Deadline of each shutdown step (a platform that hangs must not hold up a restart). */
+export const CLEANUP_TIMEOUT_MS = 10_000;
 
 export interface DaemonOptions {
   logToStderr?: boolean;
@@ -84,6 +90,10 @@ export interface DaemonOptions {
    *  process (reattaching sessions, the restart record, deferred input, open tasks). false = don't: this start is
    *  being abandoned (runForever: the restarting parent gave up on us) and is about to be stopped. */
   beforeResume?: () => Promise<boolean>;
+  /** Channel supervisor timings (tests). */
+  channels?: SupervisorOptions;
+  /** Session health timings (tests). */
+  health?: Partial<HealthOptions>;
 }
 
 export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}): Promise<Daemon> {
@@ -101,6 +111,14 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
     registerInstance(instanceId, projectDir);
     const store = new StateStore(join(stateDir, "state.db"));
     cleanups.push(() => store.close());
+
+    // ── MCP gateway first ── Bound before anything slow so sessions that outlived the previous process (claude-tmux)
+    // find it as soon as possible; requests wait until the manager exists (markReady below).
+    let manager!: ChannelManager;
+    const gateway = new McpGateway(() => manager, log.child("gateway"), join(stateDirOf(projectDir), "gateway.json"));
+    gateway.hold();
+    const gatewayPort = gateway.start(settings.mcpGateway.host, settings.mcpGateway.port);
+    cleanups.push(() => gateway.stop());
     const ctx = (scope: string): PluginContext => ({ log: log.child(scope), instanceId, projectDir, stateDir, timezone: settings.timezone });
 
     // ── plugins ──
@@ -165,9 +183,7 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
       ? new MemoryStore(projectDir, store, { dir: settings.memory.dir, maxInjectBytes: settings.memory.maxInjectBytes, timezone: settings.timezone })
       : undefined;
 
-    // ── gateway + manager ──
-    let manager!: ChannelManager;
-    const gateway = new McpGateway(() => manager, log.child("gateway"), join(stateDirOf(projectDir), "gateway.json"));
+    // ── gateway tools + manager ──
     if (memory) {
       const classify = (caller: string): MemoryOriginKind => {
         const k = manager.kindOf(caller);
@@ -178,8 +194,6 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
       gateway.addTools(memory.tools(classify, (caller) => caller !== DREAM_SESSION));
     }
     for (const s of schedulers.values()) if (s.tools) gateway.addTools(s.tools());
-    const gatewayPort = gateway.start(settings.mcpGateway.host, settings.mcpGateway.port);
-    cleanups.push(() => gateway.stop());
 
     const transcript = new TranscriptStore(store);
     const engine = settings.transcription.engine;
@@ -205,32 +219,40 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
       },
       execute: (kind) => opts.onRestart!(kind) });
     gateway.addTools(restart.tools());
+    gateway.markReady();
     // Before restore(): reopening a session consumes its inflight-turn key, which re-arms the tasks it answers.
     restart.prepare();
     manager.start();
     cleanups.push(() => manager.stop());
+    // Session health: MCP recovery for reattached sessions, pane watchdog (docs §11.4).
+    const health = new HealthMonitor(manager, gateway, log.child("health"), opts.health);
+    manager.setHealth(health);
+    health.start();
+    cleanups.push(() => health.stop());
 
     manager.pairing.sync(); // before start: paired users must be accepted from the first message
-    for (const [name, p] of platforms) {
-      await p.start({
-        message: (m) => void manager.handleInbound(m).catch((e) => log.error("inbound failed", { platform: name, e: String(e) })),
-        unknownSender: (u) => void manager.pairing.onUnknownSender(u).catch((e) => log.error("pairing failed", { platform: name, e: String(e) })),
-      });
-      cleanups.push(() => p.stop());
-      if (p.setCommands) {
-        await p.setCommands([
-          { name: "stop", description: "Interrupt the agent and clear the queue" },
-          { name: "new", description: "Start a fresh agent session" },
-          { name: "status", description: "Show this channel's session status" },
-          { name: "model", description: "Show or switch the model" },
-          { name: "activation", description: "Group: answer only when mentioned, or every message (mention / always / reset)" },
-          { name: "profile", description: "Show or switch this chat's profile (agent / model); reset = default" },
-          { name: "pair", description: "Operator: list / approve / deny DM pairing requests" },
-        ]).catch((e) => log.warn("setCommands failed", { e: String(e) }));
-      }
-    }
+    // ── chat platforms: in the background, with a deadline and retry each ── A platform that can't be reached
+    // (Telegram's servers misbehaving) is degraded; the daemon, its sessions and the other platforms carry on.
+    const channels = new ChannelSupervisor(platforms, (name) => ({
+      message: (m) => void manager.handleInbound(m).catch((e) => log.error("inbound failed", { platform: name, e: String(e) })),
+      unknownSender: (u) => void manager.pairing.onUnknownSender(u).catch((e) => log.error("pairing failed", { platform: name, e: String(e) })),
+    }), log.child("channels"), opts.channels, async (_name, p) => {
+      if (!p.setCommands) return;
+      await withDeadline(CLEANUP_TIMEOUT_MS, "setCommands", () => p.setCommands!([
+        { name: "stop", description: "Interrupt the agent and clear the queue" },
+        { name: "new", description: "Start a fresh agent session" },
+        { name: "status", description: "Show this channel's session status" },
+        { name: "model", description: "Show or switch the model" },
+        { name: "activation", description: "Group: answer only when mentioned, or every message (mention / always / reset)" },
+        { name: "profile", description: "Show or switch this chat's profile (agent / model); reset = default" },
+        { name: "pair", description: "Operator: list / approve / deny DM pairing requests" },
+      ]));
+    });
+    manager.setChannelHealth(() => channels.health());
+    channels.start();
+    cleanups.push(() => channels.stop());
 
-    // ── schedulers (after platforms, so replyTo targets resolve) ──
+    // ── schedulers (platform adapters exist, so replyTo targets resolve; they connect in the background) ──
     for (const [name, sch] of schedulers) {
       await sch.start({
         fire: (o) => manager.fireScheduled(o),
@@ -296,16 +318,18 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
 
     let stopped: Promise<void> | undefined;
     return {
-      manager, restart, webPort, gatewayPort,
+      manager, restart, webPort, gatewayPort, channels,
       // Idempotent and single-flight: a second call (SIGTERM during a restart) waits for the first.
       stop: () => (stopped ??= (async () => {
         log.info("stopping");
-        for (const c of cleanups.reverse()) await Promise.resolve(c()).catch((e) => log.warn("cleanup failed", { e: String(e) }));
+        for (const c of cleanups.reverse()) {
+          await withDeadline(CLEANUP_TIMEOUT_MS, "cleanup step", () => Promise.resolve(c())).catch((e) => log.warn("cleanup failed", { e: String(e) }));
+        }
       })()),
     };
   } catch (e) {
     log.error("startup failed", { e: e instanceof Error ? e.message : String(e) });
-    for (const c of cleanups.reverse()) await Promise.resolve(c()).catch(() => {});
+    for (const c of cleanups.reverse()) await withDeadline(CLEANUP_TIMEOUT_MS, "cleanup step", () => Promise.resolve(c())).catch(() => {});
     throw e;
   }
 }

@@ -28,6 +28,8 @@ function project(token = "bot-token-1") {
 async function start(dir: string): Promise<Daemon> {
   const d = await startDaemon(dir);
   cleanups.push(() => d.stop());
+  // Platforms connect in the background (channel supervisor).
+  for (let i = 0; i < 200 && d.channels.health().some((c) => c.state !== "connected"); i++) await Bun.sleep(5);
   return d;
 }
 

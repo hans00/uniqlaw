@@ -247,8 +247,25 @@ To carry it over instead, have your agent follow docs/MIGRATE.md (in Claude Code
           ? `  ${rs.kind} draining: waiting for ${rs.inflight?.join(", ") || "nothing"} · ${rs.deferred ?? 0} message(s) held`
           : `  ${rs.kind} scheduled at ${new Date(rs.fireAt!).toLocaleString()} (requested by ${rs.requestedBy?.join(", ")})`);
       }
-      for (const a of (s.agents as { name: string; profile: string; provider: string; state: string; queue: number; lastActivityAt: number }[])) {
-        console.log(`  ${a.name.padEnd(28)} ${a.profile}/${a.provider}  ${a.state}${a.queue ? ` (+${a.queue} queued)` : ""}  ${a.lastActivityAt ? new Date(a.lastActivityAt).toLocaleString() : ""}`);
+      type Ch = { name: string; state: string; lastPollAt?: number; lastSendAt?: number; lastError?: string; consecutiveFailures: number; nextRetryAt?: number };
+      const ago = (t?: number) => t ? `${Math.max(0, Math.round((Date.now() - t) / 1000))}s ago` : "never";
+      for (const c of (s.channels as Ch[] | undefined) ?? []) {
+        const bad = c.state !== "connected";
+        console.log(`  channel ${c.name.padEnd(20)} ${bad ? c.state.toUpperCase() : c.state}  poll ${ago(c.lastPollAt)} · send ${ago(c.lastSendAt)}`
+          + (c.consecutiveFailures ? ` · ${c.consecutiveFailures} failure(s) in a row` : "")
+          + (c.lastError && (bad || c.consecutiveFailures) ? ` · last error: ${c.lastError}` : "")
+          + (c.nextRetryAt ? ` · retry in ${Math.max(0, Math.round((c.nextRetryAt - Date.now()) / 1000))}s` : ""));
+      }
+      type H = { process: string; blocked?: string; mcp?: string; issues: string[] };
+      for (const a of (s.agents as { name: string; profile: string; provider: string; state: string; queue: number; lastActivityAt: number; health?: H }[])) {
+        const h = a.health;
+        const flags = h ? [h.process !== "alive" && h.process !== "absent" ? `process ${h.process.toUpperCase()}` : "", h.blocked ? `blocked: ${h.blocked}` : "",
+          h.mcp === "unknown" || h.mcp === "recovering" ? `mcp ${h.mcp}` : ""].filter(Boolean).join(" · ") : "";
+        console.log(`  ${a.name.padEnd(28)} ${a.profile}/${a.provider}  ${a.state}${a.queue ? ` (+${a.queue} queued)` : ""}  ${a.lastActivityAt ? new Date(a.lastActivityAt).toLocaleString() : ""}${flags ? `  ⚠ ${flags}` : ""}`);
+        for (const i of h?.issues ?? []) console.log(`      - ${i}`);
+      }
+      for (const o of (s.orphans as { name: string; process: string; issues: string[] }[] | undefined) ?? []) {
+        console.log(`  ${o.name.padEnd(28)} (orphan)  process ${o.process}  ${o.issues.join("; ")}`);
       }
       return;
     }

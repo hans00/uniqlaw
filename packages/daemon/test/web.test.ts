@@ -23,7 +23,13 @@ function project(extra: Record<string, unknown> = {}, token = `web-${Math.random
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
-async function start(dir: string): Promise<Daemon> { const d = await startDaemon(dir); cleanups.push(() => d.stop()); return d; }
+async function start(dir: string, opts: Parameters<typeof startDaemon>[1] = {}): Promise<Daemon> {
+  const d = await startDaemon(dir, opts);
+  cleanups.push(() => d.stop());
+  // Platforms connect in the background (channel supervisor).
+  for (let i = 0; i < 200 && d.channels.health().some((c) => c.state !== "connected"); i++) await Bun.sleep(5);
+  return d;
+}
 const sendHi = (text = "hello") => instances.at(-1)!.sink!.message({ platform: "tg", channelKey: "tg:100", replyTarget: { platform: "tg", chatId: "100" },
   ref: { platform: "tg", chatId: "100", messageId: "1" }, sender: { id: "7", name: "Hans" }, trusted: true, multiparty: false, text, attachments: [], receivedAt: Date.now() });
 const until = async (c: () => boolean | Promise<boolean>, ms = 3000) => { const e = Date.now() + ms; while (!(await c())) { if (Date.now() > e) throw new Error("timeout"); await Bun.sleep(20); } };
@@ -137,8 +143,7 @@ test("tailFile reads only the end", () => {
 
 test("restart API: a session is only trusted as the requester with proof (its gateway token, or web.token)", async () => {
   const dir = project();
-  const d = await startDaemon(dir, { onRestart: () => false });
-  cleanups.push(() => d.stop());
+  const d = await start(dir, { onRestart: () => false });
   const base = `http://127.0.0.1:${d.webPort}`;
   await sendHi();
   await until(() => !!d.manager.runtimes.get("tg:100") && d.manager.runtimes.get("tg:100")!.state !== "opening");

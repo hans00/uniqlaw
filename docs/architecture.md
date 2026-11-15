@@ -1071,6 +1071,32 @@ A restart used to cut every running turn off, including the one that asked for i
 
 **Delivery guarantees.** User input (everything in `deferred_input`) is **at-least-once**: replay only claims a row, and the row is deleted when the turn that consumes it starts or it is steered into a running one (or the input is dropped: queue cap, `/stop`, session failed to open). A crash, kill or failed reload before that leaves the row, and the next start unclaims it and replays it again. Restart notices are **at-most-once**: the record is deleted before any notice is sent, so a crash right after the start never notifies twice. A crash between persisting and exiting (or mid-drain) is covered because everything is in `state.db` before the process stops. `Daemon.stop()` is idempotent and single-flight (a `SIGTERM` during a restart waits for the same stop).
 
+### 11.4 Resilience: channels, MCP links, pane health
+
+Incident 2026-11-15: Telegram's servers misbehaved; a restart then hung in `getMe`, `uniqlaw status` didn't say which part was broken, the long-lived claude-tmux session reattached with a dead MCP client (all UniQlaw tools gone), and a worker whose pane had died at the folder-trust prompt days earlier was never reported.
+
+**Startup / shutdown never wait on a platform** (`core/channel-supervisor.ts`). The MCP gateway binds first, right after the state store (requests wait until the manager exists: `McpGateway.hold()` / `markReady()`, 30 s, then 503), so reattached sessions find it as early as possible. Then manager, schedulers, transports, web API, `runtime.json`, restore. Chat platforms start in the background: each `start(sink, signal)` gets 20 s, then is stopped and retried with backoff 5 s → 5 min. A `PlatformStartError` (Telegram 401/404 from `getMe`: a rejected token) marks the channel **failed** (no retry; `ChannelSupervisor.retry()` tries again). Other failures mark it **degraded**. A connected channel whose API calls fail 3 times in a row (adapter `health()`) also shows as degraded. Every Telegram request has a deadline (30 s; polls `pollSeconds + 15 s`; uploads and downloads 120 s); the offset confirmation in `stop()` is bounded to 5 s and done once. Each shutdown step is bounded to 10 s (`CLEANUP_TIMEOUT_MS`), as is each platform `stop()`.
+
+**MCP links** (`McpGateway.link()`). Per session the gateway records the last request, the last `initialize`, and open GET event-streams. Claude Code holds such a stream while connected, but probes on 2.1.325 show it never retries after an outage longer than a couple of seconds: 60 s down → `/mcp` shows "✘ failed" for good; 2 s down → still "✔", with no stream (tool calls still work by POST). So only contact since this gateway started counts as evidence: `connected` (stream open), `seen` (requests but no stream), `unknown` (nothing).
+
+**MCP recovery** (`core/health.ts` `HealthMonitor`, claude-tmux `mcp.ts`). On start, `restore()` reattaches every session whose provider process is alive (`AgentProvider.inspect`), not lazily at the next message. A session is reconnected when it:
+- is still `unknown` 15 s after the gateway started (or after the session opened), or
+- lost its event-stream with no request since, for 60 s.
+
+Before a reattached session's first turn, the same check runs first and the turn waits for it, so the turn has its tools. Reconnecting happens only when the runtime is idle, nothing is waiting on a human, and nobody holds the session. claude-tmux then pauses its poller and holds input. It checks the pane is idle at an empty prompt (ANSI capture: a dim suggestion counts as empty). It types `/mcp`, selects the server, then "Reconnect", each by its text with the cursor checked after every key ("Reconnect" sits between "Authenticate" and "Disable"; the cursor starts on "Authenticate"). It checks the pane again before every key. It waits for "Reconnected to uniqlaw." with the dialog closed, then checks that the gateway saw a fresh `initialize`. On anything unexpected (a turn starts, a screen doesn't match, "Failed to reconnect…", no `initialize`) it presses Esc until the pane is back at an empty prompt (clearing a typed `/mcp`), never leaving it in a menu. If reconnecting fails, it respawns with `--resume` once per 30 min, verified the same way. After that the owner is told once. Attempts: at most one per 10 min per session; one aborted by a turn is retried after a minute. The `/mcp` detail menu has the shape of a numbered permission dialog: `parsePermissionDialog` ignores it, so it is never forwarded as an approval.
+
+**Pane watchdog** (every 60 s, `HealthMonitor.inspectAll`). Every known session (persisted, open, workers) is inspected through its open session or `AgentProvider.inspect` (without opening it), plus `uq-<instance>-*` panes that belong to no session (`orphans`, listed only). What it does:
+- A session that died while running in this daemon is respawned once per 30 min.
+- A dead process of a closed session (e.g. a worker that died at a startup prompt) is only reported; the next message starts it again.
+- A folder-trust prompt is answered only when the directory is inside `workers.roots` or the project.
+- A `/mcp` dialog left open for two checks is closed with Esc.
+- Permission and question dialogs belong to the approval path and are never touched.
+- Anything else (another startup prompt, an unknown modal for two checks, a dead process, failed MCP recovery) is reported. The owner is told once per condition: a worker's owning chat, a chat itself, else the operators. This goes straight to the platform, since the session may be the broken part. The condition is kept in kv `health-notified:<session>:<condition>`, so a restart doesn't repeat it, and cleared once it is gone.
+
+Nothing is repaired while a human holds the session.
+
+**Status.** `GET /api/status` adds `channels` (state, attempts, last poll / send, last error, consecutive failures, next retry) and `orphans`. Agents carry `health` (process, blocked, mcp, issues). `GET /api/health[?refresh=1]` lists channels and every session's full health. `uniqlaw status` prints channels and flags sessions with a dead process, a blocker or an unknown MCP link, with their issues. **Workers:** `workers.max` counts only workers with an open session; a closed or dead one keeps its record (it can be resumed by name) but holds no process.
+
 ## 12. Repo structure (Bun workspaces)
 
 ```
