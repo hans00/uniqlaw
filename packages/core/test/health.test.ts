@@ -41,7 +41,7 @@ class HealthSession extends FakeSession {
   onReconnect: (verify: (since: number) => boolean) => Promise<{ ok: boolean; outcome: string; detail: string }> = async () => ({ ok: true, outcome: "reconnected", detail: "ok" });
   onRespawn: () => Promise<boolean> = async () => true;
   async inspect() { return this.inspection; }
-  async reconnectMcp(verify: (since: number) => boolean) { this.reconnects++; return this.onReconnect(verify); }
+  async reconnectMcp(verify: (since: number) => boolean, _signal?: AbortSignal) { this.reconnects++; return this.onReconnect(verify); }
   async respawn() { this.respawns++; return this.onRespawn(); }
   async repair(a: SessionRepair) { this.repairs.push(a); return a === "close-dialog" ? "mcp-dialog" : "folder-trust"; }
 }
@@ -231,4 +231,32 @@ test("worker limit counts only workers with an open session", async () => {
   await mgr.startWorker("tg:1", { name: "fresh", profile: "main", cwd: join(dir, "repo") });
   // …but now one is running.
   await expect(mgr.startWorker("tg:1", { name: "third", profile: "main", cwd: join(dir, "repo") })).rejects.toThrow(/worker limit reached \(1 running: worker:fresh\)/);
+});
+
+test("stop() aborts a reconnect in progress and waits for it to back out (bounded); no repairs while draining", async () => {
+  const { mgr, provider, health } = setup();
+  let backedOut = false;
+  provider.configure = (s) => {
+    s.reattached = false;
+    s.onReconnect = async () => new Promise((resolve) => setTimeout(() => { backedOut = true; resolve({ ok: false, outcome: "aborted", detail: "stopped" }); }, 100));
+  };
+  const origReconnect = HealthSession.prototype.reconnectMcp;
+  let gotSignal: AbortSignal | undefined;
+  HealthSession.prototype.reconnectMcp = async function (this: HealthSession, v, signal) { gotSignal = signal; return origReconnect.call(this, v, signal); };
+  cleanups.push(() => { HealthSession.prototype.reconnectMcp = origReconnect; });
+  await mgr.runtime("tg:8").ensureOpen();
+  const p = health.recoverMcp("tg:8", "test");
+  await until(() => !!gotSignal);
+  await health.stop();
+  expect(gotSignal!.aborted).toBe(true);
+  expect(backedOut).toBe(true);
+  await p;
+
+  const b = setup();
+  b.provider.configure = (s) => { s.reattached = false; };
+  await b.mgr.runtime("tg:9").ensureOpen();
+  b.mgr.beginDrain();
+  await Bun.sleep(60);
+  await b.health.recoverMcp("tg:9", "test");
+  expect(sess(b.provider, "tg:9").reconnects).toBe(0);
 });

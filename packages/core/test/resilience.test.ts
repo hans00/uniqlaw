@@ -156,3 +156,16 @@ test("gateway: tracks each session's MCP link — initialize, requests, open eve
   expect(mcpLinkState(gw.link("tg:1"))).toBe("seen");
   expect(gw.startedAt).toBeGreaterThan(0);
 });
+
+test("gateway: event-streams get keep-alive comments (headers at once; Bun would close an idle stream at 255 s)", async () => {
+  const { gw, make } = gwSetup(false);
+  make();
+  const url = gw.endpointFor("tg:2")!.url;
+  const ac = new AbortController();
+  const res = await fetch(url, { headers: { accept: "text/event-stream" }, signal: ac.signal });
+  expect(res.headers.get("content-type")).toContain("text/event-stream");
+  const first = await res.body!.getReader().read();
+  expect(new TextDecoder().decode(first.value)).toBe(": keepalive\n\n");
+  ac.abort();
+  await until(() => gw.link("tg:2")!.streams === 0);
+});

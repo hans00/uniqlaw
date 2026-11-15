@@ -112,6 +112,8 @@ export interface ReconnectDeps {
   /** How long to wait for each screen / the result / the gateway. */
   stepTimeoutMs?: number;
   resultTimeoutMs?: number;
+  /** Aborted (daemon stopping): stop before the next key and go back to an empty prompt. */
+  signal?: AbortSignal;
   log?: (msg: string, extra?: Record<string, unknown>) => void;
 }
 
@@ -142,6 +144,7 @@ export async function reconnectMcp(d: ReconnectDeps): Promise<ReconnectOutcome> 
   const waitFor = async (pred: (pane: string) => boolean, ms: number): Promise<string | undefined> => {
     const until = Date.now() + ms;
     for (;;) {
+      if (d.signal?.aborted) throw new Abort("stopped: the daemon is shutting down");
       const pane = await cap();
       if (pred(pane)) return pane;
       if (Date.now() >= until) return undefined;
@@ -150,6 +153,7 @@ export async function reconnectMcp(d: ReconnectDeps): Promise<ReconnectOutcome> 
   };
   /** Before a key inside the dialog: still the screen we expect, and no turn has started. */
   const guard = async (expect: (pane: string) => boolean, what: string): Promise<string> => {
+    if (d.signal?.aborted) throw new Abort("stopped: the daemon is shutting down");
     const pane = await cap();
     if (looksActivelyBusy(pane) && !isMcpDialog(pane)) throw new Abort("a turn started");
     if (!expect(pane)) throw new Abort(`not on the ${what}`);
@@ -174,11 +178,12 @@ export async function reconnectMcp(d: ReconnectDeps): Promise<ReconnectOutcome> 
     }
     throw new Abort(`could not reach "${target.source}" on the ${what}`);
   };
-  /** Back to an empty prompt: Esc out of any dialog, then clear what we typed. */
+  /** Back to an empty prompt: Esc out of the /mcp dialog (only while it is on screen: an Esc anywhere else could
+   *  dismiss a permission dialog or interrupt a turn), then clear a /mcp we typed. */
   const restore = async (): Promise<boolean> => {
     for (let i = 0; i < 4; i++) {
-      const pane = await cap().catch(() => "");
-      if (!isMcpDialog(pane) && isReady(pane)) break;
+      const pane = await cap().catch(() => undefined);
+      if (pane === undefined || !isMcpDialog(pane)) break;
       await d.tmux.sendKeys(d.name, "Escape").catch(() => {});
       await sleep(300);
     }
@@ -199,11 +204,12 @@ export async function reconnectMcp(d: ReconnectDeps): Promise<ReconnectOutcome> 
   const serverLine = new RegExp(`^\\s*(❯\\s*)?[✔✘△◯○●◐⚠✗✓·*]?\\s*${escRe(d.server)}\\b`);
   try {
     // 1. /mcp + Enter (Enter accepts the /mcp completion).
+    if (d.signal?.aborted) return { ok: false, outcome: "skipped", detail: "the daemon is shutting down" };
     await d.tmux.typeLiteral(d.name, "/mcp");
     await sleep(delay * 2);
     const typed = inputBoxText(await capAnsi());
     if (typed !== "/mcp") throw new Abort(`input box shows "${typed ?? "?"}" after typing /mcp`);
-    if (looksActivelyBusy(await cap())) throw new Abort("a turn started");
+    await guard(() => true, "prompt");
     await d.tmux.sendKeys(d.name, "Enter");
     if (!(await waitFor((p) => isMcpList(p) || isMcpDetail(p, d.server), stepTimeout))) throw new Abort("the /mcp dialog did not open");
     // 2. The server list → our server (some versions open the detail directly when there is one server).
@@ -237,7 +243,7 @@ export async function reconnectMcp(d: ReconnectDeps): Promise<ReconnectOutcome> 
     const seen = await cap().catch(() => "");
     const clean = await restore();
     d.log?.("mcp reconnect stopped", { why, paneRestored: clean, pane: seen.split("\n").filter((l) => l.trim()).slice(-60).join("\n") });
-    return { ok: false, outcome: e instanceof Abort && /turn started/.test(why) ? "aborted" : "failed",
+    return { ok: false, outcome: e instanceof Abort && /turn started|stopped:/.test(why) ? "aborted" : "failed",
       detail: clean ? why : `${why}; the pane is not back at an empty prompt` };
   }
 }

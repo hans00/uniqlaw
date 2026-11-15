@@ -31,6 +31,9 @@ export function mcpLinkState(l: McpLink | undefined): McpLinkState {
   return l.lastRequestAt ? "seen" : "unknown";
 }
 
+/** Keep-alive comment interval on GET event-streams (well under Bun's idleTimeout). */
+export const SSE_KEEPALIVE_MS = 25_000;
+
 /** How long a request that arrives before the daemon is ready waits for it (then 503). */
 const READY_WAIT_MS = 30_000;
 
@@ -136,14 +139,24 @@ export class McpGateway {
     };
     // (Not req.signal: Bun aborts it once the handler has returned the Response; the body is cancelled on disconnect.)
     const reader = res.body.getReader();
+    // Keep-alive comments (ignored by SSE clients): without traffic Bun closes the stream at idleTimeout (255 s), and
+    // Claude Code does not reopen it (probed), which would look like a lost link. The first one also flushes the
+    // headers at once (Bun sends them with the first chunk).
+    const ping = new TextEncoder().encode(": keepalive\n\n");
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const stopPing = () => { clearInterval(timer); timer = undefined; };
     const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(ping);
+        timer = setInterval(() => { try { c.enqueue(ping); } catch { stopPing(); } }, SSE_KEEPALIVE_MS);
+      },
       async pull(c) {
         try {
           const r = await reader.read();
-          if (r.done) { end(); c.close(); } else c.enqueue(r.value);
-        } catch (e) { end(); c.error(e); }
+          if (r.done) { stopPing(); end(); c.close(); } else c.enqueue(r.value);
+        } catch (e) { stopPing(); end(); c.error(e); }
       },
-      cancel(reason) { end(); return reader.cancel(reason); },
+      cancel(reason) { stopPing(); end(); return reader.cancel(reason); },
     });
     return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
   }

@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelManager, DEFAULT_PERMISSIONS, McpGateway, StateStore, createLogger, mcpLinkState, parseSettings, silentLogger, type SessionSpec } from "@uniqlaw/core";
+import { EventCollector } from "@uniqlaw/testkit";
 import { ClaudeTmuxProvider, ClaudeTmuxSession, configSchema } from "../src/index.ts";
 import { inputBoxText } from "../src/mcp.ts";
 
@@ -49,6 +50,7 @@ d("claude-tmux MCP recovery", () => {
       expect(mcpLinkState(gw.link(key))).toBe("unknown"); // claude did not come back by itself
 
       const b = (await provider.open({ ...spec, providerSessionId: a.providerSessionId })) as ClaudeTmuxSession;
+      const eb = new EventCollector(b);
       expect(b.reattached).toBe(true);
       for (let i = 0; i < 50 && !(await b.inspect()).idle; i++) await Bun.sleep(200);
       const r = await b.reconnectMcp((since) => (gw.link(key)?.lastInitializeAt ?? 0) >= since);
@@ -58,6 +60,21 @@ d("claude-tmux MCP recovery", () => {
       expect(after.process).toBe("alive");
       expect(after.blocker).toBeUndefined();
       expect(inputBoxText(await tmux.captureAnsi(name))).toBe("");
+
+      // The incident path: the first message right after the reconnect. Its turn must be the model's (the /mcp
+      // output in the transcript must not end it or become its reply) and its tool call must reach the gateway.
+      const m = eb.mark();
+      const sentAt = Date.now();
+      await b.send({ text: "Call the mcp__uniqlaw__agents_list tool once, then reply with exactly: DONE", attachments: [] });
+      await eb.turnEnd(120_000, m);
+      await Bun.sleep(2000); // a second turn_end would show up now
+      const ends = eb.events.slice(m).filter((e) => e.type === "turn_end");
+      expect(ends).toHaveLength(1);
+      expect(ends[0]).toMatchObject({ reason: "done" });
+      expect(eb.texts(m)).toContain("DONE");
+      expect(eb.texts(m)).not.toContain("Reconnected");
+      expect(eb.events.slice(m).some((e) => e.type === "tool_start" && /agents_list/.test(e.name))).toBe(true);
+      expect(gw.link(key)!.lastRequestAt!).toBeGreaterThan(sentAt);
       await b.close();
     } finally {
       await tmux.killSession(name).catch(() => {});

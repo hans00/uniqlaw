@@ -276,6 +276,10 @@ export class ClaudeTmuxSession implements AgentSession {
     this.state = "starting";
     try { return await fn(); }
     finally {
+      // Read what the repair wrote to the transcript (`/mcp` output) while still "starting": it is ignored there,
+      // whereas in the turn a queued input starts next it would be taken for that turn's command output.
+      await sleep(300);
+      this.tailer.flush();
       this.maintaining = false;
       if (!this.closed && this.state === "starting") {
         const pane = await this.tmux.capture(this.name).catch(() => "");
@@ -294,11 +298,11 @@ export class ClaudeTmuxSession implements AgentSession {
     return undefined;
   }
 
-  async reconnectMcp(verify: (since: number) => boolean): Promise<{ ok: boolean; outcome: string; detail: string }> {
+  async reconnectMcp(verify: (since: number) => boolean, signal?: AbortSignal): Promise<{ ok: boolean; outcome: string; detail: string }> {
     const no = this.canMaintain();
     if (no) return { ok: false, outcome: "skipped", detail: no };
     return this.maintain(async () => {
-      const r = await driveMcpReconnect({ tmux: this.tmux, name: this.name, server: MCP_SERVER_NAME, verify,
+      const r = await driveMcpReconnect({ tmux: this.tmux, name: this.name, server: MCP_SERVER_NAME, verify, ...(signal ? { signal } : {}),
         log: (msg, extra) => this.log.warn(msg, extra) });
       this.log.info("mcp reconnect", { outcome: r.outcome, detail: r.detail });
       return r;

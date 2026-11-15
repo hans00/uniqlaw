@@ -81,6 +81,8 @@ export class HealthMonitor {
   /** Sessions whose MCP was checked (or found fine) in this daemon run. */
   private mcpOk = new Set<string>();
   private stopped = false;
+  /** Aborts recoveries in progress when the daemon stops (the driver goes back to an empty prompt). */
+  private abort = new AbortController();
 
   constructor(private manager: ChannelManager, private gateway: GatewayView, private log: Logger, opts: Partial<HealthOptions> = {}) {
     this.o = { ...HEALTH_DEFAULTS, ...opts };
@@ -90,14 +92,21 @@ export class HealthMonitor {
     this.timer = setInterval(() => void this.tick(), this.o.tickMs);
   }
 
-  stop() {
+  /** Stop, and let recoveries in progress back out of the pane (bounded: shutdown must not hang on it). */
+  async stop(maxWaitMs = 8000) {
     this.stopped = true;
     clearInterval(this.timer);
+    this.abort.abort();
+    const running = [...this.recovering.values()];
+    if (running.length) await Promise.race([Promise.allSettled(running), sleep(maxWaitMs)]);
   }
+
+  /** No repairs while stopping or draining for a restart. */
+  private get paused(): boolean { return this.stopped || this.manager.isDraining; }
 
   /** One pass: MCP policy for every open session; process inspection when due. */
   async tick(now = Date.now()) {
-    if (this.stopped) return;
+    if (this.paused) return;
     for (const [key, rt] of this.manager.runtimes) {
       if (rt.state === "closed" || rt.state === "opening") continue;
       if (this.mcpDue(key, now)) void this.recoverMcp(key, "periodic");
@@ -153,10 +162,10 @@ export class HealthMonitor {
 
   private async doRecoverMcp(key: string, why: string, o: { pendingInput?: boolean }) {
     const rt = this.manager.runtimes.get(key);
-    if (!rt || this.manager.heldBy(key)) return;
+    if (!rt || this.manager.heldBy(key) || this.paused) return;
     const verify = (since: number) => (this.gateway.link(key)?.lastInitializeAt ?? 0) >= since;
     const run = o.pendingInput ? rt.maintainWithInput.bind(rt) : rt.maintain.bind(rt);
-    const r = await run((s) => s.reconnectMcp!(verify));
+    const r = await run((s) => s.reconnectMcp!(verify, this.abort.signal));
     if (!r || r.outcome === "skipped") return; // not idle right now: try again on a later tick
     const now = Date.now();
     this.lastReconnect.set(key, now);
@@ -164,6 +173,7 @@ export class HealthMonitor {
     this.log[r.ok ? "info" : "warn"]("mcp reconnect", { key, why, outcome: r.outcome, detail: r.detail });
     if (r.ok) { this.mcpOk.add(key); return; }
     if (r.outcome === "aborted") { this.lastReconnect.set(key, now - this.o.reconnectEveryMs + 60_000); return; } // a turn started: retry in a minute
+    if (this.paused) return;
     // Reconnect failed: respawn with resume (a fresh claude connects at startup), rate limited.
     if (!rt.repairs.respawn || now - (this.lastRespawn.get(key) ?? 0) < this.o.respawnEveryMs) {
       await this.notifyOnce(key, "mcp", `⚠️ ${key}: its UniQlaw tools are disconnected and reconnecting failed (${r.detail}). Restarting the session or sending /mcp in its terminal fixes it.`);
@@ -212,7 +222,7 @@ export class HealthMonitor {
     if (blocked) h.blocked = blocked;
     const prev = this.prevBlocker.get(key);
     if (blocked) this.prevBlocker.set(key, blocked); else this.prevBlocker.delete(key);
-    const held = this.manager.heldBy(key);
+    const held = this.manager.heldBy(key) ?? (this.paused ? "shutdown" : undefined); // no repairs while stopping / draining
 
     // ── dead process ──
     if (insp?.process === "dead") {

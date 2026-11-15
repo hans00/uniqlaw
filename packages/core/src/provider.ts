@@ -202,7 +202,7 @@ export interface AgentSession {
   inspect?(): Promise<PaneInspection>;
   /** Optional: make the provider's MCP client reconnect to the gateway, only while idle at an empty prompt.
    *  `verify(since)`: did the gateway see this session (re)initialize at or after `since`? */
-  reconnectMcp?(verify: (since: number) => boolean): Promise<{ ok: boolean; outcome: string; detail: string }>;
+  reconnectMcp?(verify: (since: number) => boolean, signal?: AbortSignal): Promise<{ ok: boolean; outcome: string; detail: string }>;
   /** Optional: restart the provider process keeping the conversation (resume), only while idle. */
   respawn?(): Promise<boolean>;
   /** Optional: a safe, specific repair of what blocks the session (core decides when it is allowed). */

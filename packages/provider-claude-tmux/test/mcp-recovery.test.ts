@@ -44,7 +44,7 @@ test("fixtures: a dim suggestion in the input box counts as empty, typed text do
 // ── fake TUI ────────────────────────────────────────────────────────────────
 
 const RULE = "─".repeat(80);
-type Screen = "prompt" | "list" | "detail";
+type Screen = "prompt" | "list" | "detail" | "perm";
 
 class FakeTui {
   keys: string[] = [];
@@ -70,6 +70,9 @@ class FakeTui {
         : (ansi ? "❯ \x1b[2mcall it again\x1b[0m" : "❯ call it again");
       return [...h, RULE, box, RULE, "  ⏵⏵ auto mode on (shift+tab to cycle)"].join("\n");
     }
+    if (this.screen === "perm") {
+      return [...h, "─".repeat(80), " Bash command", "", "   rm -rf build", "", " Do you want to proceed?", " ❯ 1. Yes", "   2. No, and tell Claude what to do differently (esc)", ""].join("\n");
+    }
     if (this.screen === "list") {
       const rows = this.listItems.flatMap((it, i) => [...(it.heading ? ["", `     ${it.heading}`] : []), `   ${this.listCursor === i ? "❯" : " "} ${it.name}`]);
       return [...h, "▔".repeat(80), "   Manage MCP servers", `   ${this.listItems.length} servers`, ...rows, "",
@@ -82,7 +85,8 @@ class FakeTui {
   }
   private key(k: string) {
     this.keys.push(k);
-    if (this.screen === "prompt") {
+    if (this.screen === "perm") { if (k === "Escape") this.history.push("PERMISSION DISMISSED"); }
+    else if (this.screen === "prompt") {
       if (k === "Enter" && this.input === "/mcp") { this.history.push("❯ /mcp"); this.input = ""; this.screen = "list"; this.listCursor = 0; }
       else if (k === "BSpace") this.input = this.input.slice(0, -1);
     } else if (this.screen === "list") {
@@ -117,10 +121,11 @@ class FakeTui {
   }
 }
 
-function deps(t: FakeTui, verifyOk = true) {
+function deps(t: FakeTui, verifyOk = true, signal?: AbortSignal) {
   let initAt = 0;
   t.onReconnect = () => { if (verifyOk) initAt = Date.now(); };
-  return { tmux: t.tmux(), name: "p", server: "uniqlaw", verify: (since: number) => initAt >= since, keyDelayMs: 1, stepTimeoutMs: 300, resultTimeoutMs: 300 };
+  return { tmux: t.tmux(), name: "p", server: "uniqlaw", verify: (since: number) => initAt >= since, keyDelayMs: 1, stepTimeoutMs: 300, resultTimeoutMs: 300,
+    ...(signal ? { signal } : {}) };
 }
 const atEmptyPrompt = (t: FakeTui) => t.screen === "prompt" && t.input === "";
 
@@ -200,4 +205,22 @@ test("closeMcpDialog: Esc out of a leftover /mcp detail menu back to the prompt"
   expect(await closeMcpDialog(t.tmux(), "p")).toBe(true);
   expect(t.keys).toEqual(["Escape", "Escape"]);
   expect(t.screen as Screen).toBe("prompt");
+});
+
+test("daemon stopping mid-sequence (abort signal): backs out of the menu to an empty prompt before the next key", async () => {
+  const ac = new AbortController();
+  const t = new FakeTui(false, true, { afterKey: (tui) => { if (tui.screen === "list") ac.abort(); } });
+  const r = await reconnectMcp(deps(t, true, ac.signal));
+  expect(r).toMatchObject({ ok: false, outcome: "aborted" });
+  expect(t.keys.filter((k) => k === "Down")).toEqual([]);
+  expect(atEmptyPrompt(t)).toBe(true);
+});
+
+test("a permission dialog appearing mid-sequence is never answered or dismissed (no Esc outside the /mcp dialog)", async () => {
+  const t = new FakeTui(false, true, { afterKey: (tui) => { if (tui.screen === "list") tui.screen = "perm"; } });
+  const r = await reconnectMcp(deps(t));
+  expect(r.ok).toBe(false);
+  expect(r.detail).toContain("not back at an empty prompt");
+  expect(t.history).not.toContain("PERMISSION DISMISSED");
+  expect(t.keys.at(-1)).toBe("Enter"); // the /mcp Enter was the last key sent
 });
