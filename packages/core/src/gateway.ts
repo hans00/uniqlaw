@@ -8,6 +8,32 @@ import type { ChannelManager } from "./manager.ts";
 import type { GatewayTool, Logger } from "./plugin.ts";
 import { groupAllowed, mcpToolAllowed } from "./channel-policy.ts";
 
+/** What the gateway has seen of one session's MCP client since it started (docs §11.4). Claude Code holds a GET
+ *  event-stream open while connected, but after an outage it may stay "connected" without one (tools still work by
+ *  POST), or give up for good: only contact since this gateway started is positive evidence. */
+export interface McpLink {
+  /** Last request of any kind. */
+  lastRequestAt?: number;
+  /** Last `initialize`: the client (re)connected. */
+  lastInitializeAt?: number;
+  /** Open GET event-streams right now. */
+  streams: number;
+  /** When the last event-stream closed. */
+  streamClosedAt?: number;
+}
+
+export type McpLinkState = "connected" | "seen" | "unknown";
+
+/** connected = an event-stream is open; seen = requests since the gateway started but no stream; unknown = nothing. */
+export function mcpLinkState(l: McpLink | undefined): McpLinkState {
+  if (!l) return "unknown";
+  if (l.streams > 0) return "connected";
+  return l.lastRequestAt ? "seen" : "unknown";
+}
+
+/** How long a request that arrives before the daemon is ready waits for it (then 503). */
+const READY_WAIT_MS = 30_000;
+
 export const GATEWAY_TOOL_NAMES = ["agents_list", "agent_ask", "agent_trigger", "notify", "send_file", "task_status", "worker_start", "worker_stop"];
 
 export class McpGateway {
@@ -21,6 +47,13 @@ export class McpGateway {
   private server?: ReturnType<typeof Bun.serve>;
 
   private lastPort?: number;
+  /** After hold(): bound early (restart: reattached sessions reconnect as soon as possible) but requests wait for
+   *  markReady(). */
+  private ready = true;
+  private readyWaiters: (() => void)[] = [];
+  private links = new Map<string, McpLink>();
+  /** When this gateway started listening. */
+  startedAt = 0;
 
   /** `stateFile` keeps the port and channel tokens across daemon restarts: claude-tmux sessions outlive
    *  the daemon and are reattached with the MCP URL they were spawned with, so that URL must stay valid. */
@@ -52,12 +85,68 @@ export class McpGateway {
       try { this.server = serve(this.lastPort); } catch { this.log.warn("previous gateway port taken; reattached sessions lose MCP until respawned", { port: this.lastPort }); }
     }
     this.server ??= serve(port);
+    this.startedAt = Date.now();
     this.save();
     this.log.info("mcp gateway listening", { url: `http://${host}:${this.server.port}` });
     return this.server.port;
   }
 
   stop() { this.server?.stop(true); }
+
+  /** Hold requests until markReady() (call before start() when the manager does not exist yet). */
+  hold() { this.ready = false; }
+
+  /** The manager exists: held requests go ahead. */
+  markReady() {
+    this.ready = true;
+    for (const w of this.readyWaiters.splice(0)) w();
+  }
+
+  private waitReady(): Promise<boolean> {
+    if (this.ready) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const t = setTimeout(() => resolve(false), READY_WAIT_MS);
+      this.readyWaiters.push(() => { clearTimeout(t); resolve(true); });
+    });
+  }
+
+  /** What the gateway has seen of this session's MCP client since it started. */
+  link(channelKey: string): McpLink | undefined {
+    const l = this.links.get(channelKey);
+    return l ? { ...l } : undefined;
+  }
+
+  private touch(channelKey: string): McpLink {
+    let l = this.links.get(channelKey);
+    if (!l) { l = { streams: 0 }; this.links.set(channelKey, l); }
+    l.lastRequestAt = Date.now();
+    return l;
+  }
+
+  /** Count an open event-stream until the client goes away or the stream ends. */
+  private trackStream(req: Request, res: Response, l: McpLink): Response {
+    if (!res.body || !res.headers.get("content-type")?.includes("text/event-stream")) return res;
+    l.streams++;
+    let ended = false;
+    const end = () => {
+      if (ended) return;
+      ended = true;
+      l.streams = Math.max(0, l.streams - 1);
+      l.streamClosedAt = Date.now();
+    };
+    // (Not req.signal: Bun aborts it once the handler has returned the Response; the body is cancelled on disconnect.)
+    const reader = res.body.getReader();
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        try {
+          const r = await reader.read();
+          if (r.done) { end(); c.close(); } else c.enqueue(r.value);
+        } catch (e) { end(); c.error(e); }
+      },
+      cancel(reason) { end(); return reader.cancel(reason); },
+    });
+    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  }
 
   /** Plugin-contributed tools (registered before sessions open, so prompts list them). */
   addTools(tools: GatewayTool[]) { this.extra.push(...tools); }
@@ -97,9 +186,19 @@ export class McpGateway {
     const m = path.match(/^\/mcp\/([a-f0-9]+)$/);
     const caller = m ? this.tokens.get(m[1]!) : undefined;
     if (!caller) return new Response("unknown token", { status: 401 });
+    if (!(await this.waitReady())) return new Response("daemon starting", { status: 503 });
+    const link = this.touch(caller);
+    if (req.method === "POST") {
+      try {
+        const body = await req.clone().json() as unknown;
+        const msgs = Array.isArray(body) ? body : [body];
+        if (msgs.some((x) => (x as { method?: unknown } | null)?.method === "initialize")) link.lastInitializeAt = Date.now();
+      } catch { /* not JSON: the transport answers it */ }
+    }
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     await this.build(caller).connect(transport);
-    return transport.handleRequest(req);
+    const res = await transport.handleRequest(req);
+    return req.method === "GET" ? this.trackStream(req, res, link) : res;
   }
 
   /** Claude Code `PermissionRequest` HTTP hook (docs §10.4): the approval judge decides on the structured request.
@@ -108,6 +207,7 @@ export class McpGateway {
     const caller = this.hookTokens.get(token); // hook tokens only: an MCP token doesn't open this, nor the reverse
     if (!caller) return new Response("unknown token", { status: 401 });
     if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+    if (!(await this.waitReady())) return Response.json({}); // not ready: defer to the dialog
     try {
       const body = await req.json() as { tool_name?: unknown; tool_input?: unknown };
       if (typeof body?.tool_name !== "string" || !body.tool_input || typeof body.tool_input !== "object") return Response.json({});

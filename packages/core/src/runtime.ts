@@ -1,6 +1,6 @@
 // Per-channel runtime: owns one AgentSession, the input queue, the turn state
 // machine, output routing (by Origin) and approvals. Provider-agnostic.
-import type { AgentEvent, AgentProvider, AgentSession, Attachment, Liveness, PermissionDecision, Profile, SystemPromptParts, TurnInput } from "./provider.ts";
+import type { AgentEvent, AgentProvider, AgentSession, Attachment, Liveness, PaneInspection, PermissionDecision, SessionRepair, Profile, SystemPromptParts, TurnInput } from "./provider.ts";
 import type { MsgRef, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
 import type { Logger } from "./plugin.ts";
@@ -46,6 +46,8 @@ export interface SessionContext {
 
 /** Services the runtime needs from the daemon (kept narrow for testability). */
 export interface RuntimeHost {
+  /** Runs before this session's first turn (health: make sure its MCP client is connected). Must not throw. */
+  beforeFirstTurn?(channelKey: string): Promise<void>;
   log: Logger;
   settings: Settings;
   store: StateStore;
@@ -281,6 +283,15 @@ export class ChannelRuntime {
    *  origins before a queued input could start a turn of its own and take them. */
   private resumeGraceUntil = 0;
   private resumeTimer?: ReturnType<typeof setTimeout>;
+  /** When the current session was opened (0 = not open). */
+  openedAt = 0;
+  /** The current session was given a gateway endpoint. */
+  mcpEnabled = false;
+  /** beforeFirstTurn: running (drain waits) / done for the current session. */
+  private firstTurnGate?: Promise<void>;
+  private firstTurnChecked = false;
+  /** The provider session ended on its own (process died, fatal error) rather than being closed by us. */
+  died?: { at: number; reason: string };
 
   constructor(
     readonly channelKey: string,
@@ -533,6 +544,46 @@ export class ChannelRuntime {
     if (s) await s.close().catch((e) => this.log.warn("close failed", { e: String(e) }));
   }
 
+  // ── health (docs §11.4) ─────────────────────────────────────────────────
+
+  /** Open, idle, nothing queued or waiting for a human: safe for a repair to drive the provider. */
+  get quiet(): boolean {
+    return !!this.session && this.state === "idle" && !this.queue.length && !this.finishing && !this.pendingPermissions.size && !this.retrying;
+  }
+
+  /** The open session's own view of its process (undefined: not open, or the provider can't tell). */
+  async inspect(): Promise<PaneInspection | undefined> {
+    return this.session?.inspect?.().catch(() => undefined);
+  }
+
+  /** The open session reattached to a process from the previous daemon. */
+  get reattached(): boolean { return !!this.session?.reattached; }
+
+  /** What the open session supports for repairs. */
+  get repairs(): { reconnectMcp: boolean; respawn: boolean; repair: boolean } {
+    const s = this.session;
+    return { reconnectMcp: !!s?.reconnectMcp, respawn: !!s?.respawn, repair: !!s?.repair };
+  }
+
+  /** Run a repair on the open session, only while quiet (the provider re-checks its own pane). */
+  async maintain<T>(fn: (s: AgentSession) => Promise<T>): Promise<T | undefined> {
+    const s = this.session;
+    if (!s || !this.quiet) return undefined;
+    return fn(s);
+  }
+
+  /** Like maintain, with input queued (the first-turn check: the queued turn waits for the repair). */
+  async maintainWithInput<T>(fn: (s: AgentSession) => Promise<T>): Promise<T | undefined> {
+    const s = this.session;
+    if (!s || this.state !== "idle" || this.finishing || this.pendingPermissions.size || this.retrying) return undefined;
+    return fn(s);
+  }
+
+  /** Repair of a session that is not idle-safe by definition (a startup prompt: it never got to idle). */
+  async repairBlocked(action: SessionRepair): Promise<string | undefined> {
+    return this.session?.repair?.(action);
+  }
+
   // ── session lifecycle ───────────────────────────────────────────────────
 
   async ensureOpen(): Promise<void> {
@@ -627,6 +678,10 @@ export class ChannelRuntime {
         } catch {}
       }
       this.session = session;
+      this.openedAt = Date.now();
+      this.mcpEnabled = !!gw;
+      this.firstTurnChecked = false;
+      this.died = undefined;
       this.state = "idle";
       void this.consume(session);
       this.log.info("session open", { provider: this.profile.provider, resumed: !!cur.providerSessionId });
@@ -656,6 +711,18 @@ export class ChannelRuntime {
     }
     // The reattached provider may still be in the turn that was in flight at detach: let it claim its origins first.
     if (this.resumeOrigins && Date.now() < this.resumeGraceUntil) return this.scheduleDrain(250);
+    // First turn of this session: health checks its MCP client first (a reattached claude may have lost it).
+    if (!this.firstTurnChecked && this.host.beforeFirstTurn) {
+      if (!this.firstTurnGate) {
+        const s = this.session;
+        this.firstTurnGate = this.host.beforeFirstTurn(this.channelKey).catch(() => {}).finally(() => {
+          this.firstTurnGate = undefined;
+          if (this.session === s) this.firstTurnChecked = true;
+          this.scheduleDrain(0);
+        });
+      }
+      return;
+    }
     const debounce = this.host.settings.queue.debounceMs;
     const wait = debounce - (Date.now() - this.lastEnqueuedAt);
     // Only debounce when several messages are piling up (first message goes out immediately).
@@ -790,6 +857,7 @@ export class ChannelRuntime {
     }
     if (this.session === session) {
       this.log.warn("event stream ended; session closed");
+      this.died ??= { at: Date.now(), reason: "agent session ended" };
       if (this.turn) await this.finishTurn("error", "agent session ended");
       this.session = undefined;
       this.state = "closed";
@@ -862,6 +930,7 @@ export class ChannelRuntime {
       case "error":
         this.log.error("agent error", { error: ev.error, fatal: ev.fatal });
         if (ev.fatal) {
+          this.died = { at: Date.now(), reason: ev.error };
           await this.notifyFailure(this.turn?.origins.at(-1), `⚠️ Agent error: ${ev.error}`);
           await this.close();
         }

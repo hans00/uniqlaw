@@ -23,3 +23,5 @@ export * from "./approval-judge.ts";
 export * from "./shell.ts";
 export * from "./targets.ts";
 export * from "./taint.ts";
+export * from "./channel-supervisor.ts";
+export * from "./health.ts";

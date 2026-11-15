@@ -1,6 +1,8 @@
 // Owns all ChannelRuntimes: inbound routing, core slash commands, the message
 // bus (agents_list / agent_ask / agent_trigger / notify) and idle cleanup.
-import type { AgentProvider, Profile, TurnInput } from "./provider.ts";
+import type { AgentProvider, PaneInspection, Profile, TurnInput } from "./provider.ts";
+import type { ChannelHealth } from "./channel-supervisor.ts";
+import { insideRoots, type HealthMonitor, type SessionHealth } from "./health.ts";
 import type { InboundRequest, RemoteAgent, ScheduledFire, Transcriber } from "./plugin.ts";
 import type { InboundMessage, OutboundFile, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
@@ -42,6 +44,8 @@ export interface AgentInfo {
   cwd?: string;
   owner?: string;
   heldBy?: string;
+  /** Last health check (docs §11.4): process alive/dead, what blocks it, MCP link, problems. */
+  health?: { process: string; blocked?: string; mcp?: string; issues: string[] };
 }
 
 /** A worker: a session running some coding agent (profile) in some directory, started by another session. */
@@ -105,9 +109,13 @@ export class ChannelManager {
   /** Set while the daemon drains for a restart: new input is persisted (deferred_input) instead of starting turns. */
   private draining?: { since: number; acked: Set<string> };
 
+  private healthMonitor?: HealthMonitor;
+  private channelHealthFn?: () => ChannelHealth[];
+
   constructor(private readonly deps: ManagerDeps) {
     this.host = {
       ...deps,
+      beforeFirstTurn: (k) => this.healthMonitor?.beforeFirstTurn(k) ?? Promise.resolve(),
       platform: (n) => deps.platforms.get(n),
       operatorTargets: () => [...deps.platforms.values()].flatMap((p) => p.operatorTargets()),
       onTaskResult: (id, ok, text, opts) => this.completeTask(id, ok, text, opts?.mergedInto),
@@ -144,6 +152,57 @@ export class ChannelManager {
     clearInterval(this.cleanupTimer);
     // Keep provider processes alive where the adapter supports reattach (claude-tmux keeps tmux).
     await Promise.all([...this.runtimes.values()].map((r) => r.detach()));
+  }
+
+  // ── health (docs §11.4) ─────────────────────────────────────────────────
+
+  get store() { return this.deps.store; }
+  setHealth(m: HealthMonitor) { this.healthMonitor = m; }
+  get health(): HealthMonitor | undefined { return this.healthMonitor; }
+  setChannelHealth(fn: () => ChannelHealth[]) { this.channelHealthFn = fn; }
+  channelHealth(): ChannelHealth[] { return this.channelHealthFn?.() ?? []; }
+  sessionHealth(): SessionHealth[] { return this.healthMonitor?.sessions() ?? []; }
+
+  /** The open session was given a gateway endpoint (has UniQlaw tools over MCP). */
+  hasMcp(key: string): boolean { return !!this.runtimes.get(key)?.mcpEnabled; }
+
+  /** Every session we know of: persisted, open, and workers. */
+  knownSessionKeys(): string[] {
+    return [...new Set([...this.deps.store.listSessions().map((s) => s.channelKey), ...this.runtimes.keys(), ...this.listWorkers().map((w) => w.key)])];
+  }
+
+  private providerOf(key: string): AgentProvider | undefined {
+    try { return this.deps.providers.get(this.profileFor(key).provider); } catch { return undefined; }
+  }
+
+  /** A session's provider process without opening it (undefined: the provider can't tell). */
+  async inspectClosed(key: string): Promise<PaneInspection | undefined> {
+    return this.providerOf(key)?.inspect?.({ instanceId: this.deps.instanceId, sessionId: key }).catch(() => undefined);
+  }
+
+  /** Provider processes of this instance that belong to no known session. */
+  async orphanProcesses(known: string[]): Promise<{ id: string; inspection: PaneInspection }[]> {
+    const out: { id: string; inspection: PaneInspection }[] = [];
+    for (const p of new Set(this.deps.providers.values())) {
+      if (p.orphans) out.push(...await p.orphans({ instanceId: this.deps.instanceId, known }).catch(() => []));
+    }
+    return out;
+  }
+
+  cwdOf(key: string): string | undefined { return this.host.cwdFor?.(key) ?? this.deps.projectDir; }
+
+  /** A directory a folder-trust prompt may be answered for: inside workers.roots or the project. */
+  trustedDir(dir: string): boolean { return insideRoots(dir, [...this.workerRoots(), this.deps.projectDir]); }
+
+  /** Tell a session's owner about a problem with it: a worker's owning chat, a chat itself, else the operators.
+   *  Goes straight to the platform (the session may be the broken part). */
+  async notifyOwnerOf(key: string, text: string) {
+    const owner = this.workerMeta(key)?.owner;
+    const chat = owner && this.targetForChannel(owner) ? owner : this.targetForChannel(key) ? key : undefined;
+    const target = chat ? this.targetForChannel(chat) : undefined;
+    const p = target ? this.deps.platforms.get(target.platform) : undefined;
+    if (target && p) { await p.send(target, text); return; }
+    await this.notifyOperators(text);
   }
 
   addRemoteAgents(list: RemoteAgent[]) { for (const r of list) this.remotes.set(r.name, r); }
@@ -203,7 +262,15 @@ export class ChannelManager {
       try {
         const rt = this.runtime(row.channelKey, row.multiparty);
         // It was mid-turn when the daemon stopped: reattach now so the reply is delivered, not at the next message.
-        if (this.deps.store.get(`inflight-turn:${row.channelKey}`)) void rt.ensureOpen();
+        if (this.deps.store.get(`inflight-turn:${row.channelKey}`)) { void rt.ensureOpen(); continue; }
+        // Its process outlived the previous daemon (claude-tmux): reattach now, so health can check it (MCP client,
+        // dialogs) before the next message instead of the first turn finding its tools gone.
+        const provider = this.providerOf(row.channelKey);
+        if (provider?.inspect) {
+          void provider.inspect({ instanceId: this.deps.instanceId, sessionId: row.channelKey })
+            .then((i) => { if (i.process === "alive" && rt.state === "closed") return rt.ensureOpen(); })
+            .catch((e) => this.deps.log.warn("reattach check failed", { key: row.channelKey, e: String(e) }));
+        }
       } catch (e) { this.deps.log.warn("restore skipped", { key: row.channelKey, e: String(e) }); }
     }
   }
@@ -488,9 +555,16 @@ export class ChannelManager {
         provider: rt?.profile.provider ?? row?.provider ?? (w ? this.deps.profiles.get(w.profile)?.provider : undefined) ?? "?",
         state: rt?.state ?? "closed", multiparty: rt?.multiparty ?? row?.multiparty ?? false,
         lastActivityAt: row?.lastActivityAt ?? 0, queue: rt?.queueLength ?? 0,
-        ...(w ? { cwd: w.cwd, ...(w.owner ? { owner: w.owner } : {}), ...(held ? { heldBy: held } : {}) } : {}) };
+        ...(w ? { cwd: w.cwd, ...(w.owner ? { owner: w.owner } : {}), ...(held ? { heldBy: held } : {}) } : {}),
+        ...this.healthField(k) };
     }).concat([...this.remotes.values()].map((r): AgentInfo => ({ name: r.name, kind: "remote", profile: r.description ?? "remote", provider: r.name.split(":")[0] ?? "remote",
       state: "remote", multiparty: false, lastActivityAt: 0, queue: 0 })));
+  }
+
+  private healthField(k: string): { health?: AgentInfo["health"] } {
+    const h = this.healthMonitor?.of(k);
+    if (!h) return {};
+    return { health: { process: h.process, ...(h.blocked ? { blocked: h.blocked } : {}), ...(h.mcp ? { mcp: h.mcp.state } : {}), issues: h.issues } };
   }
 
   private checkHop(from: string): number {
@@ -810,7 +884,7 @@ export class ChannelManager {
   }
 
   /** Directories workers may use: settings.workers.roots (realpath), default the project dir. */
-  private workerRoots(): string[] {
+  workerRoots(): string[] {
     const roots = this.deps.settings.workers.roots.length ? this.deps.settings.workers.roots : [this.deps.projectDir];
     return roots.flatMap((r) => {
       try { return [realpathSync(absPath(r, this.deps.projectDir))]; } catch { return []; }
@@ -839,7 +913,10 @@ export class ChannelManager {
       if (o.cwd && this.resolveWorkerCwd(o.cwd) !== meta.cwd) throw new Error(`${key} already exists in ${meta.cwd}; a worker's directory is fixed — pick another name`);
     } else {
       const cfg = this.deps.settings.workers;
-      if (this.listWorkers().length >= cfg.max) throw new Error(`worker limit reached (${cfg.max}); stop one with worker_stop forget=true`);
+      // Only workers with an open session count: a stopped or dead one holds no process (its record stays, so it
+      // can be resumed by name).
+      const open = this.listWorkers().filter((w) => { const st = this.runtimes.get(w.key)?.state; return st !== undefined && st !== "closed"; });
+      if (open.length >= cfg.max) throw new Error(`worker limit reached (${cfg.max} running: ${open.map((w) => w.key).join(", ")}); stop one with worker_stop`);
       if (!o.profile) throw new Error("profile is required for a new worker");
       if (!this.deps.profiles.has(o.profile)) throw new Error(`unknown profile "${o.profile}" (have: ${[...this.deps.profiles.keys()].join(", ")})`);
       if (cfg.profiles.length && !cfg.profiles.includes(o.profile)) throw new Error(`profile "${o.profile}" is not allowed for workers (allowed: ${cfg.profiles.join(", ")})`);

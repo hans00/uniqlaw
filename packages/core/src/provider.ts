@@ -155,6 +155,22 @@ export interface Liveness {
   signals?: Record<string, unknown>;
 }
 
+/** A provider process as seen from outside (docs §11.4 pane watchdog). */
+export interface PaneInspection {
+  process: "alive" | "dead" | "absent";
+  /** Exit status of a dead process, when known. */
+  exitStatus?: number;
+  /** What keeps it from taking input: a startup prompt (label), a permission/question dialog (the approval path owns
+   *  those), the provider's MCP dialog, or another menu/modal. */
+  blocker?: { kind: "startup" | "permission" | "mcp-dialog" | "modal"; label?: string };
+  /** Idle at an empty prompt (open sessions only). */
+  idle?: boolean;
+  /** The process's working directory, when known. */
+  cwd?: string;
+}
+
+export type SessionRepair = "answer-startup-prompt" | "close-dialog";
+
 export interface AgentSession {
   readonly capabilities: ProviderCapabilities;
   /** Start a new turn (session must be idle). */
@@ -179,6 +195,18 @@ export interface AgentSession {
   liveness?(): Promise<Liveness>;
   /** Process/connection is alive (used by health checks + reattach). */
   alive(): Promise<boolean>;
+  /** This session reattached to a process that outlived the previous daemon (its MCP client may have lost the
+   *  gateway during the restart). */
+  readonly reattached?: boolean;
+  /** Optional (pane watchdog): look at the process without changing anything. */
+  inspect?(): Promise<PaneInspection>;
+  /** Optional: make the provider's MCP client reconnect to the gateway, only while idle at an empty prompt.
+   *  `verify(since)`: did the gateway see this session (re)initialize at or after `since`? */
+  reconnectMcp?(verify: (since: number) => boolean): Promise<{ ok: boolean; outcome: string; detail: string }>;
+  /** Optional: restart the provider process keeping the conversation (resume), only while idle. */
+  respawn?(): Promise<boolean>;
+  /** Optional: a safe, specific repair of what blocks the session (core decides when it is allowed). */
+  repair?(action: SessionRepair): Promise<string | undefined>;
 }
 
 export interface AgentProvider {
@@ -188,6 +216,10 @@ export interface AgentProvider {
   /** Optional: how a human takes over this session in a terminal. live = attach to the running
    *  process (core keeps watching); otherwise core closes the session first and the command
    *  resumes the same conversation in the provider's own CLI. undefined = not possible. */
+  /** Optional (pane watchdog): inspect a session's process without opening it. */
+  inspect?(o: { instanceId: string; sessionId: string }): Promise<PaneInspection>;
+  /** Optional: provider processes of this instance that belong to none of `known` (session ids). */
+  orphans?(o: { instanceId: string; known: string[] }): Promise<{ id: string; inspection: PaneInspection }[]>;
   attachCommand?(o: { instanceId: string; sessionId: string; providerSessionId?: string; cwd: string; profile: Profile }):
     { argv: string[]; live: boolean; env?: Record<string, string> } | undefined;
 }
