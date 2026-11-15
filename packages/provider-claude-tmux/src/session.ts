@@ -4,13 +4,14 @@
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type {
-  AgentEvent, AgentSession, Liveness, Logger, PermissionDecision, ProviderCapabilities, TurnInput,
+  AgentEvent, AgentSession, Liveness, Logger, PaneInspection, PermissionDecision, ProviderCapabilities, SessionRepair, TurnInput,
 } from "@uniqlaw/core";
 import {
   claudeShellDialects,
   JsonlTailer, locateJsonl, expectedJsonlPath, classifyInternalOutput, isInterruptMarker,
-  isRejectionText, isCrossSessionMessage, type JsonlEvent,
+  isRejectionText, isCrossSessionMessage, MCP_SERVER_NAME, type JsonlEvent,
 } from "@uniqlaw/claude-common";
+import { answerStartupPrompt, classifyBlocker, closeMcpDialog, reconnectMcp as driveMcpReconnect } from "./mcp.ts";
 import type { Tmux } from "./tmux.ts";
 import { AsyncQueue } from "./queue.ts";
 import { hasReadyPrompt, isLoggedOut, parseLoginPrompt, parsePermissionDialog, type PermissionDialog } from "./dialogs.ts";
@@ -114,6 +115,10 @@ export class ClaudeTmuxSession implements AgentSession {
   private state: State = "starting";
   private staleLaunch = false;
   private respawning = false;
+  /** MCP reconnect / repair in progress: the poller stands still and input waits (state "starting"). */
+  private maintaining = false;
+  /** Reattached to a claude that outlived the previous daemon. */
+  reattached = false;
   private turnId = "";
   private turnSeq = 0;
   private closed = false;
@@ -180,6 +185,7 @@ export class ClaudeTmuxSession implements AgentSession {
   async start(o: { reattach: boolean; readyTimeoutMs?: number; staleLaunch?: boolean }): Promise<void> {
     this.emit({ type: "session", providerSessionId: this.providerSessionId });
     void (this.init.tmux.panePid?.(this.name) ?? Promise.resolve(undefined)).then((p) => { this.rootPid = p; }).catch(() => {});
+    this.reattached = o.reattach;
     if (o.reattach) {
       this.staleLaunch = !!o.staleLaunch && !!this.init.respawn;
       const saved = this.takeTailState();
@@ -249,6 +255,78 @@ export class ClaudeTmuxSession implements AgentSession {
   async alive(): Promise<boolean> {
     if (this.closed) return false;
     return (await this.tmux.hasSession(this.name)) && !(await this.tmux.paneDead(this.name));
+  }
+
+  // ───────────────────────── health / recovery (docs §11.4) ─────────────────────────
+
+  async inspect(): Promise<PaneInspection> {
+    const info = await this.tmux.paneInfo(this.name).catch(() => undefined);
+    if (!info) return { process: "absent" };
+    if (info.dead) return { process: "dead", ...(info.status !== undefined ? { exitStatus: info.status } : {}), cwd: this.init.cwd };
+    const pane = await this.tmux.capture(this.name).catch(() => "");
+    const blocker = classifyBlocker(pane);
+    return { process: "alive", ...(blocker ? { blocker } : {}), cwd: this.init.cwd,
+      idle: this.state === "idle" && !this.activeDialog && !blocker && isReady(pane) && !looksActivelyBusy(pane) };
+  }
+
+  /** Hold input (state "starting", poller paused) while `fn` drives the pane; afterwards pick up whatever the pane
+   *  shows (a turn that started meanwhile is tracked, not lost). */
+  private async maintain<T>(fn: () => Promise<T>): Promise<T> {
+    this.maintaining = true;
+    this.state = "starting";
+    try { return await fn(); }
+    finally {
+      this.maintaining = false;
+      if (!this.closed && this.state === "starting") {
+        const pane = await this.tmux.capture(this.name).catch(() => "");
+        if (looksActivelyBusy(pane)) { this.state = "running"; this.beginTurn(true); }
+        else this.setIdle();
+      }
+    }
+  }
+
+  private canMaintain(): string | undefined {
+    if (this.closed || this.state === "dead") return "session closed";
+    if (this.respawning || this.maintaining) return "already busy with a repair";
+    if (this.state !== "idle") return `session is ${this.state}`;
+    if (this.activeDialog) return "a dialog is open";
+    if (this.pendingSteers.length) return "input is waiting";
+    return undefined;
+  }
+
+  async reconnectMcp(verify: (since: number) => boolean): Promise<{ ok: boolean; outcome: string; detail: string }> {
+    const no = this.canMaintain();
+    if (no) return { ok: false, outcome: "skipped", detail: no };
+    return this.maintain(async () => {
+      const r = await driveMcpReconnect({ tmux: this.tmux, name: this.name, server: MCP_SERVER_NAME, verify,
+        log: (msg, extra) => this.log.warn(msg, extra) });
+      this.log.info("mcp reconnect", { outcome: r.outcome, detail: r.detail });
+      return r;
+    });
+  }
+
+  async respawn(): Promise<boolean> {
+    if (!this.init.respawn || this.canMaintain()) return false;
+    await this.respawnStale();
+    return this.state === "idle";
+  }
+
+  async repair(action: SessionRepair): Promise<string | undefined> {
+    if (this.closed || this.respawning || this.maintaining) return undefined;
+    // A startup prompt only shows before claude takes input (state "starting"); a leftover dialog may sit anywhere
+    // but in a running turn.
+    if (this.state === "running") return undefined;
+    const run = async () => {
+      if (action === "answer-startup-prompt") return answerStartupPrompt(this.tmux, this.name);
+      return (await closeMcpDialog(this.tmux, this.name)) ? "mcp-dialog" : undefined;
+    };
+    const was = this.state;
+    if (was === "starting") {
+      // Not taking input yet: nothing to hold; let the poller see the result (ready → idle).
+      this.maintaining = true;
+      try { return await run(); } finally { this.maintaining = false; }
+    }
+    return this.maintain(run);
   }
 
   private stopAll() {
@@ -533,7 +611,7 @@ export class ClaudeTmuxSession implements AgentSession {
   }
 
   private async poll() {
-    if (this.closed || this.respawning) return;
+    if (this.closed || this.respawning || this.maintaining) return;
     let pane: string;
     try { pane = await this.tmux.capture(this.name); }
     catch {

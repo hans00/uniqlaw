@@ -243,6 +243,9 @@ function parseQuestionDialog(pane: string): PermissionDialog | null {
 }
 
 export function parsePermissionDialog(pane: string): PermissionDialog | null {
+  // The `/mcp` server detail menu (`❯ 1. View tools / 2. Authenticate / 3. Reconnect / 4. Disable`) has the same
+  // numbered-block shape, but it is a settings screen, never a request to forward (see mcp.ts isMcpDetail).
+  if (/^\s*\S+ MCP Server\s*$/m.test(pane) && /^\s*Status:/m.test(pane) && /to navigate/.test(pane)) return null;
   return parseSurvey(pane) ?? parseQuestionDialog(pane) ?? parseBlockDialog(pane);
 }
 

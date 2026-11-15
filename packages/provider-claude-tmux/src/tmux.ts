@@ -88,6 +88,19 @@ export class Tmux {
     }
   }
 
+  /** The visible pane with colours/attributes (escape sequences): tells a dim placeholder from typed text. */
+  async captureAnsi(name: string): Promise<string> {
+    return this.must(["capture-pane", "-p", "-e", "-t", P(name)]);
+  }
+
+  /** pane_dead_status / pane_current_path of a session's pane (undefined fields when unknown). */
+  async paneInfo(name: string): Promise<{ dead: boolean; status?: number; cwd?: string } | undefined> {
+    const r = await this.run(["display-message", "-p", "-t", P(name), "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_path}"]);
+    if (r.exitCode !== 0) return undefined;
+    const [dead, status, cwd] = r.stdout.replace(/\n$/, "").split("\t");
+    return { dead: dead === "1", ...(status ? { status: Number(status) } : {}), ...(cwd ? { cwd } : {}) };
+  }
+
   async capture(name: string, startLine?: number): Promise<string> {
     const args = ["capture-pane", "-p", "-t", P(name)];
     if (startLine !== undefined) args.push("-S", String(startLine));

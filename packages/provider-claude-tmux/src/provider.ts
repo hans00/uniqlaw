@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentProvider, AgentSession, Logger, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
+import type { AgentProvider, AgentSession, Logger, PaneInspection, Profile, ProviderCapabilities, SessionSpec } from "@uniqlaw/core";
 import {
   baseChildEnv, buildPermissionArgs, claudeSettingsArgs, claudeEnvForCredential, composeAppendSystemPrompt, locateJsonl,
   MCP_SERVER_NAME, mcpToolId, writeMcpConfig,
@@ -8,6 +8,7 @@ import {
 import { Tmux } from "./tmux.ts";
 import { ClaudeTmuxSession, CLAUDE_TMUX_CAPABILITIES, newProviderSessionId, type Timings } from "./session.ts";
 import { killLegacySessions, systemLegacyDeps, type LegacyDeps } from "./legacy.ts";
+import { classifyBlocker } from "./mcp.ts";
 
 export interface ClaudeTmuxConfig {
   claudePath: string;
@@ -52,6 +53,24 @@ export class ClaudeTmuxProvider implements AgentProvider {
   /** Live terminal takeover: attach to the agent's own tmux session (core keeps watching). */
   attachCommand(o: { instanceId: string; sessionId: string }): { argv: string[]; live: boolean } {
     return { argv: ["tmux", "-L", this.tmuxFor(o.instanceId).socket, "attach-session", "-t", this.sessionName(o.instanceId, o.sessionId)], live: true };
+  }
+
+  /** A session's tmux pane, without opening it (pane watchdog). */
+  async inspect(o: { instanceId: string; sessionId: string }): Promise<PaneInspection> {
+    return inspectPane(this.tmuxFor(o.instanceId), this.sessionName(o.instanceId, o.sessionId));
+  }
+
+  /** `uq-<instance>-*` panes that belong to none of the known sessions (e.g. a worker whose record is gone). */
+  async orphans(o: { instanceId: string; known: string[] }): Promise<{ id: string; inspection: PaneInspection }[]> {
+    const tmux = this.tmuxFor(o.instanceId);
+    const prefix = `uq-${o.instanceId}-`;
+    const known = new Set(o.known.map((k) => this.sessionName(o.instanceId, k)));
+    const out: { id: string; inspection: PaneInspection }[] = [];
+    for (const name of await tmux.listSessions()) {
+      if (!name.startsWith(prefix) || known.has(name)) continue;
+      out.push({ id: name, inspection: await inspectPane(tmux, name) });
+    }
+    return out;
   }
 
   async open(spec: SessionSpec): Promise<AgentSession> {
@@ -110,6 +129,12 @@ export class ClaudeTmuxProvider implements AgentProvider {
       await tmux.newSession(name, { cwd: spec.cwd, env, argv, width: this.cfg.width, height: this.cfg.height });
       writeFileSync(launchFile, launchFingerprint(argv));
     };
+    // Restart claude with the current profile flags, keeping the conversation (stale launch flags, MCP recovery).
+    const respawn = async () => {
+      log.info("respawning claude with the current profile flags (--resume)", { name });
+      await tmux.killSession(name);
+      await spawn(!!locateJsonl(providerSessionId, env));
+    };
 
     // Reattach after a daemon restart.
     if (spec.providerSessionId && (await tmux.hasSession(name)) && !(await tmux.paneDead(name))) {
@@ -119,11 +144,6 @@ export class ClaudeTmuxProvider implements AgentProvider {
       const had = existsSync(launchFile) ? readFileSync(launchFile, "utf8").trim() : undefined;
       const stale = had !== want;
       log.info("reattaching to existing tmux session", { name, ...(stale ? { staleLaunchArgs: true } : {}) });
-      const respawn = async () => {
-        log.info("respawning claude with the current profile flags (--resume)", { name });
-        await tmux.killSession(name);
-        await spawn(!!locateJsonl(providerSessionId, env));
-      };
       const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings,
         respawn, readyTimeoutMs: this.cfg.readyTimeoutMs, tailStateFile, settingsFile }, "end");
       await s.start({ reattach: true, staleLaunch: stale });
@@ -142,12 +162,21 @@ export class ClaudeTmuxProvider implements AgentProvider {
     // A fresh session id: an old position means nothing. --resume (claude exited while the daemon was down) keeps
     // appending to the same jsonl, so the saved position still applies.
     if (!existing) rmSync(tailStateFile, { force: true });
-    const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings, tailStateFile, settingsFile },
-      existing ? "end" : "start");
+    const s = new ClaudeTmuxSession({ tmux, name, providerSessionId, cwd: spec.cwd, env, log, timings: this.cfg.timings, tailStateFile, settingsFile,
+      respawn, readyTimeoutMs: this.cfg.readyTimeoutMs }, existing ? "end" : "start");
     await s.start({ reattach: false, readyTimeoutMs: this.cfg.readyTimeoutMs });
     this.sessions.set(spec.sessionId, s);
     return s;
   }
+}
+
+async function inspectPane(tmux: Tmux, name: string): Promise<PaneInspection> {
+  const info = await tmux.paneInfo(name).catch(() => undefined);
+  if (!info) return { process: "absent" };
+  const cwd = info.cwd ? { cwd: info.cwd } : {};
+  if (info.dead) return { process: "dead", ...(info.status !== undefined ? { exitStatus: info.status } : {}), ...cwd };
+  const blocker = classifyBlocker(await tmux.capture(name).catch(() => ""));
+  return { process: "alive", ...(blocker ? { blocker } : {}), ...cwd };
 }
 
 /** Launch flags that matter for a live process: everything but the session-id/resume pair. */
