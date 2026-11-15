@@ -108,6 +108,29 @@ test("usage limit hit by cron jobs: one notice per target (not per session), lat
   await until(() => (a.sessions.get("cron:two")?.sent.length ?? 0) === 1);
 });
 
+test("usage limit: jobs fired together into several sessions, all in flight before the limit shows → one notice", async () => {
+  const s = parseSettings({ profiles: { main: { provider: "pa" } }, output: { toolStatus: false }, queue: { debounceMs: 0 } });
+  const limited: Script = (_input, sess) => {
+    const turnId = sess.turnId();
+    setTimeout(() => sess.emit({ type: "turn_end", turnId, reason: "error", error: "usage_limit", limit: { kind: "5-hour", resets: "2:10am (Asia/Taipei)" } }), 40);
+  };
+  const a = new FakeProvider(limited, CAPS);
+  const platform = new FakePlatform();
+  mgr = new ChannelManager({
+    log: silentLogger, settings: s, store, transcript: new TranscriptStore(store), projectDir: dir, instanceId: "test",
+    providers: new Map([["pa", a]]), platforms: new Map([["tg", platform]]),
+    profiles: new Map([["main", { name: "main", provider: "pa", permissions: s.profiles.main!.permissions, options: {} }]]),
+    gatewayFor: () => undefined, providerEnv: async () => ({}), systemPrompt: async () => ({ fragments: [] }),
+  });
+  for (const k of ["cron:a", "cron:b", "cron:c"]) await mgr.fireScheduled({ channelKey: k, job: k, text: "go", sourceLine: "[cron]" });
+  await until(() => ["cron:a", "cron:b", "cron:c"].every((k) => a.sessions.get(k)?.sent.length === 1));
+  await Bun.sleep(150);
+  const notices = platform.sent.filter((x) => x.text.includes("Usage limit reached"));
+  expect(notices).toHaveLength(1);
+  expect(notices[0]!.text).toContain("resets 2:10am (Asia/Taipei)"); // no resetAt: the 30 min default window
+  expect(mgr.activeUsageLimit("main")!.until - Date.now()).toBeGreaterThan(29 * 60_000);
+});
+
 test("/profile lists and refuses unknown profiles; untrusted /profile is a normal message", async () => {
   const { a, platform } = setup();
   await mgr.handleInbound(msg("/profile"));

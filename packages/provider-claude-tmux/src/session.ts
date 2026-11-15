@@ -15,7 +15,7 @@ import { answerStartupPrompt, classifyBlocker, closeMcpDialog, reconnectMcp as d
 import type { Tmux } from "./tmux.ts";
 import { AsyncQueue } from "./queue.ts";
 import { hasReadyPrompt, isLoggedOut, parseLoginPrompt, parsePermissionDialog, type PermissionDialog } from "./dialogs.ts";
-import { isReady, looksActivelyBusy, isRecoverableApiError, parseUsageLimit, describeUsageLimit, normalizePaneForLiveness, waitForReady, type UsageLimitInfo } from "./pane.ts";
+import { isReady, looksActivelyBusy, isRecoverableApiError, parseUsageLimit, normalizePaneForLiveness, waitForReady, type UsageLimitInfo } from "./pane.ts";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -80,6 +80,11 @@ export const DEFAULT_TIMINGS: Timings = {
   dialogGonePolls: 3,
   dialogWithdrawnMs: 3000,
 };
+
+/** Nothing but a limit message and Claude Code's hint lines under it ("/upgrade to increase your usage limit."). */
+function isBareLimitText(text: string): boolean {
+  return text.split("\n").map((l) => l.trim()).filter(Boolean).every((l) => /^\//.test(l) || !!parseUsageLimit(l));
+}
 
 type State = "starting" | "idle" | "running" | "dead";
 
@@ -523,10 +528,11 @@ export class ClaudeTmuxSession implements AgentSession {
   private onJsonl(ev: JsonlEvent) {
     this.lastActivityAt = Date.now();
     this.stallAt = Date.now();
-    // Claude Code records an API failure as a synthetic assistant message (isApiErrorMessage). A usage limit there
-    // ends the turn; it is not the agent's reply.
-    if (ev.type === "assistant-text" && ev.raw?.isApiErrorMessage === true && ev.text && parseUsageLimit(ev.text)) {
-      if (this.state === "running") this.endOnUsageLimit(describeUsageLimit(ev.text), "jsonl");
+    // Claude Code records an API failure as a synthetic assistant message (isApiErrorMessage / model "<synthetic>").
+    // A usage limit there ends the turn; it is not the agent's reply.
+    const limit = ev.type === "assistant-text" && ev.text ? parseUsageLimit(ev.text) : undefined;
+    if (limit && (ev.raw?.isApiErrorMessage === true || ev.model === "<synthetic>")) {
+      if (this.state === "running") this.endOnUsageLimit(limit, "jsonl");
       return;
     }
     const assistant = ev.type === "assistant-text" || ev.type === "assistant-tool-use" || ev.type === "assistant-thinking";
@@ -541,7 +547,9 @@ export class ClaudeTmuxSession implements AgentSession {
     const seg = () => `${ev.msgId ?? ev.uuid ?? "seg"}:${ev.blockIndex ?? this.segSeq++}`;
     switch (ev.type) {
       case "assistant-text":
-        if (this.state === "running" && ev.text) this.turnText += `${ev.text}\n`;
+        // Only prose counts as the agent quoting a limit message: a text that is nothing but the message (whatever
+        // marks it in the jsonl) is Claude Code's notice, and must not hide the one in the pane.
+        if (this.state === "running" && ev.text && !(limit && isBareLimitText(ev.text))) this.turnText += `${ev.text}\n`;
         if (ev.text?.trim()) this.emit({ type: "text", segmentId: seg(), final: ev.text });
         break;
       case "assistant-thinking":
@@ -685,8 +693,9 @@ export class ClaudeTmuxSession implements AgentSession {
     // Transient API errors / usage limit: Claude gives up and returns to the prompt without end_turn.
     if (!busy && ready && now - this.lastActivityAt > this.t.apiErrorQuietMs) {
       if (isRecoverableApiError(pane)) { this.endTurn("error", "rate_limit"); return; }
-      const limit = parseUsageLimit(pane, now);
-      // The agent's own reply may quote such a message (e.g. while discussing one): that is not Claude Code's notice.
+      // Not while a tool runs (its output may print such a line, e.g. tailing a log; a limit comes from an API call),
+      // nor when the agent's own reply quotes the message (e.g. while discussing one).
+      const limit = this.toolsInFlight.size === 0 ? parseUsageLimit(pane, now) : undefined;
       if (limit && !this.turnText.includes(limit.line.slice(0, 60))) { this.endOnUsageLimit(limit, "pane"); return; }
     }
     // Stall watchdog: only when there is no liveness signal at all. A long tool call (CI wait, a long test run) writes

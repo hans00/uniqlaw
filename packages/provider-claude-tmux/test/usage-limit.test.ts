@@ -146,6 +146,34 @@ describe("session", () => {
     expect(ended()).toBeUndefined();
   }, 10_000);
 
+  test("the limit message in the jsonl as a plain assistant text (no flag) does not hide the pane's: still usage_limit", async () => {
+    const { tmux, ended, line } = await running();
+    line({ type: "assistant", uuid: "u3", message: { id: "m3", role: "assistant", model: "claude-opus-5-5",
+      content: [{ type: "text", text: `${INCIDENT_LINE}\n/upgrade to increase your usage limit.` }] } });
+    tmux.pane = INCIDENT_PANE;
+    await waitFor(() => !!ended(), 3000);
+    expect(ended()).toMatchObject({ reason: "error", error: "usage_limit", limit: { kind: "5-hour", resets: "2:10am (Asia/Taipei)" } });
+  }, 10_000);
+
+  test("a tool in flight printing the line (e.g. tailing a log) is not a usage limit", async () => {
+    const { tmux, ended, line } = await running();
+    line({ type: "assistant", uuid: "u4", message: { id: "m4", role: "assistant", model: "claude-opus-5-5",
+      content: [{ type: "tool_use", id: "tool1", name: "Bash", input: { command: "tail -f daemon.log" } }] } });
+    await Bun.sleep(100);
+    tmux.pane = pane("❯ watch the log", "● Bash(tail -f daemon.log)", `  ⎿  ${INCIDENT_LINE}`);
+    await Bun.sleep(600);
+    expect(ended()).toBeUndefined();
+  }, 10_000);
+
+  test("a synthetic message (model <synthetic>, no flag) ends the turn too; its reset comes from the limit line only", async () => {
+    const { ended, line, events } = await running();
+    line({ type: "assistant", uuid: "u5", message: { id: "m5", role: "assistant", model: "<synthetic>",
+      content: [{ type: "text", text: `${INCIDENT_LINE}\n/upgrade to increase your usage limit.` }] } });
+    await waitFor(() => !!ended(), 3000);
+    expect(ended()).toMatchObject({ error: "usage_limit", limit: { kind: "5-hour", resets: "2:10am (Asia/Taipei)" } });
+    expect(events.some((e) => e.type === "text")).toBe(false);
+  }, 10_000);
+
   test("a synthetic API-error message in the jsonl ends the turn as usage_limit and is not posted as a reply", async () => {
     const { ended, line, events } = await running();
     line({ type: "assistant", uuid: "u2", isApiErrorMessage: true, message: { id: "m2", role: "assistant", model: "<synthetic>",
