@@ -106,6 +106,46 @@ export function parseUtcOffset(tz: string): number | null {
   return m[1] === "-" ? -v : v;
 }
 
+// ── reply context ──────────────────────────────────────────────────────────
+
+/** Partial quotes (the user selected part of the replied message) are kept up to this many characters. */
+export const REPLY_QUOTE_MAX = 300;
+/** Otherwise the replied message's start, up to this many characters. */
+export const REPLY_SNIPPET_MAX = 100;
+
+const collapse = (s: string) => s.replace(/\s*[\r\n]+\s*/g, " ").replace(/[ \t]{2,}/g, " ").trim();
+
+/**
+ * The text shown for a replied message. A partial quote: the quote, capped at REPLY_QUOTE_MAX. Otherwise the message
+ * from its start, capped at REPLY_SNIPPET_MAX and cut back to the last sentence or line end within the cap when there
+ * is one (not so early that most of the cap is lost), with … when shortened. Newlines become spaces. Counts code
+ * points, so CJK and emoji are never split.
+ */
+export function replySnippet(text: string, o: { quote?: boolean } = {}): string {
+  const chars = [...text.trim()];
+  const max = o.quote ? REPLY_QUOTE_MAX : REPLY_SNIPPET_MAX;
+  if (chars.length <= max) return collapse(chars.join(""));
+  let cut = max;
+  if (!o.quote) {
+    const head = chars.slice(0, max);
+    const min = Math.floor(max / 3);
+    for (let i = head.length - 1; i >= min; i--) {
+      const c = head[i]!;
+      if (c === "\n") { cut = i; break; }
+      // CJK full stops end a sentence on their own; . ! ? need a following space (not "3.14", "e.g.x").
+      if ("。！？…".includes(c) || (".!?".includes(c) && /\s/.test(chars[i + 1] ?? ""))) { cut = i + 1; break; }
+    }
+  }
+  return `${collapse(chars.slice(0, cut).join(""))}…`;
+}
+
+/** `[Replying to <author> <HH:MM>: "<snippet>"]`; the author is "you" for the bot's own message. */
+export function renderReplyLine(r: { author: string; fromBot: boolean; sentAt?: number; snippet: string }, tz: string): string {
+  const who = r.fromBot ? "you" : r.author;
+  const at = r.sentAt ? ` ${formatTimestamp(new Date(r.sentAt), tz).slice(11, 16)}` : "";
+  return `[Replying to ${who}${at}: "${r.snippet}"]`;
+}
+
 // ── prompt composition ─────────────────────────────────────────────────────
 export function renderSourceLine(platform: string, sender: Sender): string {
   const P = platform.charAt(0).toUpperCase() + platform.slice(1);
@@ -120,11 +160,15 @@ export interface PromptItem {
   sourceLine: string;
   /** Text is already a complete prompt (no "Message:" prefix). */
   raw?: boolean;
+  /** Lines between the source line and "Message:" (e.g. the reply context). */
+  context?: string[];
 }
+
+const header = (it: PromptItem) => [it.sourceLine, ...(it.raw ? [] : it.context ?? [])].join("\n");
 
 export function formatPromptBody(item: PromptItem, tz: string): string {
   const stamp = formatTimestamp(new Date(item.receivedAt), tz);
-  return item.raw ? `[${stamp}]\n${item.sourceLine}\n${item.text}` : `[${stamp}]\n${item.sourceLine}\nMessage: ${item.text}`;
+  return item.raw ? `[${stamp}]\n${item.sourceLine}\n${item.text}` : `[${stamp}]\n${header(item)}\nMessage: ${item.text}`;
 }
 
 export function mergeQueued(items: PromptItem[], tz: string, dropped: string[] = []): string {
@@ -135,7 +179,7 @@ export function mergeQueued(items: PromptItem[], tz: string, dropped: string[] =
   }
   items.forEach((it, i) => {
     const stamp = formatTimestamp(new Date(it.receivedAt), tz);
-    blocks.push(`---\nQueued #${i + 1}\n[${stamp}]\n${it.sourceLine}\n${it.raw ? it.text : `Message: ${it.text}`}`);
+    blocks.push(`---\nQueued #${i + 1}\n[${stamp}]\n${header(it)}\n${it.raw ? it.text : `Message: ${it.text}`}`);
   });
   return blocks.join("\n\n");
 }

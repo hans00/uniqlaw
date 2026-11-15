@@ -3,7 +3,9 @@
 import type { Sender, Target, MsgRef } from "./platform.ts";
 
 export type Origin =
-  | { kind: "human"; platform: string; channelKey: string; sender: Sender; replyTarget: Target; ref: MsgRef; trusted: boolean }
+  | { kind: "human"; platform: string; channelKey: string; sender: Sender; replyTarget: Target; ref: MsgRef; trusted: boolean;
+      /** The platform message id this message replied to (kept for later use; not printed). */
+      replyToMessageId?: string }
   | { kind: "peer"; fromSession: string; hop: number;
       /** ask: answer goes back to fromSession as a task result (no platform output).
        *  trigger: answer goes to this session's own human (deliverTo).

@@ -11,7 +11,7 @@ import { ChannelRuntime, type QueuedInput, type RuntimeHost } from "./runtime.ts
 import { PairingService } from "./pairing.ts";
 import { resolveToolPolicy, type ToolPolicy } from "./channel-policy.ts";
 import { A2A_TOOL_POLICY, a2aPermissions, a2aSessionDir, a2aSessionKey, isA2ASession } from "./a2a-policy.ts";
-import { formatTimestamp, isPassthroughSlashCommand, renderSourceLine } from "./format.ts";
+import { formatTimestamp, isPassthroughSlashCommand, renderReplyLine, renderSourceLine } from "./format.ts";
 import { EventEmitter } from "node:events";
 import type { RuntimeEvent, TranscriptStore } from "./transcript.ts";
 import { realpathSync, statSync } from "node:fs";
@@ -319,11 +319,12 @@ export class ChannelManager {
       return;
     }
     const origin: Origin = { kind: "human", platform: msg.platform, channelKey: msg.channelKey, sender: msg.sender,
-      replyTarget: msg.replyTarget, ref: msg.ref, trusted: msg.trusted };
+      replyTarget: msg.replyTarget, ref: msg.ref, trusted: msg.trusted, ...(msg.replyTo ? { replyToMessageId: msg.replyTo.messageId } : {}) };
     const transcript = await this.transcribe(rt, msg.attachments);
     await rt.enqueue({
       origin,
-      item: { text: [msg.text, transcript].filter(Boolean).join("\n\n"), receivedAt: msg.receivedAt, sourceLine: renderSourceLine(msg.platform, msg.sender) },
+      item: { text: [msg.text, transcript].filter(Boolean).join("\n\n"), receivedAt: msg.receivedAt, sourceLine: renderSourceLine(msg.platform, msg.sender),
+        ...(msg.replyTo ? { context: [renderReplyLine(msg.replyTo, this.deps.settings.timezone)] } : {}) },
       attachments: msg.attachments,
     });
   }

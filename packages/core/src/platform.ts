@@ -25,6 +25,20 @@ export interface Sender {
   isBot?: boolean;
 }
 
+/** The message an inbound message replies to (Telegram reply_to_message, Discord message reference). */
+export interface ReplyContext {
+  /** Platform message id of the replied message (turn metadata; not shown to the agent). */
+  messageId: string;
+  /** Display name of its author. */
+  author: string;
+  /** It is the bot's own message (shown as "you"). */
+  fromBot: boolean;
+  /** When it was sent (epoch ms), if known. */
+  sentAt?: number;
+  /** Already shortened (replySnippet / mediaLabel). */
+  snippet: string;
+}
+
 export interface InboundMessage {
   platform: string;
   /** Session routing key, decided by the platform: every chat is its own session, DMs included
@@ -42,6 +56,8 @@ export interface InboundMessage {
   multiparty: boolean;
   text: string;
   attachments: Attachment[];
+  /** The message this one replies to, if any. */
+  replyTo?: ReplyContext;
   /** Bot was explicitly addressed (@mention / reply-to-bot) in a multiparty chat. */
   addressed?: boolean;
   /** Message @mentions someone other than the bot (and not the bot). */

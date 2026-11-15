@@ -56,7 +56,12 @@ export interface TgMessage {
   video_note?: TgFile;
   animation?: TgFile;
   document?: TgFile;
-  sticker?: TgFile;
+  sticker?: TgFile & { emoji?: string };
+  /** The part of reply_to_message the user selected to quote (Bot API 7.0 TextQuote). */
+  quote?: { text: string; position?: number; is_manual?: boolean };
+  location?: unknown;
+  contact?: unknown;
+  poll?: { question?: string };
 }
 
 export interface TgCallbackQuery {

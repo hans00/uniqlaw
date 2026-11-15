@@ -3,10 +3,10 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { PlatformStartError } from "@uniqlaw/core";
+import { PlatformStartError, replySnippet } from "@uniqlaw/core";
 import type {
   Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, PlatformAdapter,
-  OutboundFile, PlatformCapabilities, PlatformCommand, PlatformHealth, Target,
+  OutboundFile, PlatformCapabilities, PlatformCommand, PlatformHealth, ReplyContext, Target,
 } from "@uniqlaw/core";
 import { TelegramApi, type ApiResult, type TgCallbackQuery, type TgFile, type TgMessage, type TgUpdate, type TgUser } from "./api.ts";
 import {
@@ -360,11 +360,23 @@ export class TelegramAdapter implements PlatformAdapter {
       multiparty: !isDM,
       text,
       attachments,
+      ...(msg.reply_to_message ? { replyTo: this.replyContext(msg, msg.reply_to_message) } : {}),
       addressed,
       ...(!isDM && !addressed && this.mentionsOthers(msg) ? { mentionsOthers: true } : {}),
       receivedAt: Date.now(),
     };
     this.sink?.message(inbound);
+  }
+
+  /** What `msg` replies to: author ("you" when it is the bot's), time, and a snippet (the partial quote if the user
+   *  selected one, else the replied message's start; a media label when it has no text). */
+  private replyContext(msg: TgMessage, r: TgMessage): ReplyContext {
+    const fromBot = !!r.from && !!this.bot && r.from.id === this.bot.id;
+    const body = (r.text ?? r.caption ?? "").trim();
+    const snippet = msg.quote?.text?.trim() ? replySnippet(msg.quote.text, { quote: true })
+      : body ? replySnippet(body) : mediaLabel(r);
+    return { messageId: String(r.message_id), author: r.from ? displayName(r.from) : "unknown", fromBot,
+      ...(r.date ? { sentAt: r.date * 1000 } : {}), snippet };
   }
 
   /** Group message is addressed to the bot if it @mentions it, replies to it, or is a /command@bot. */
@@ -527,6 +539,22 @@ export function startTypingPulse(adapter: Pick<PlatformAdapter, "typing">, targe
   void adapter.typing(target);
   const t = setInterval(() => void adapter.typing?.(target), intervalMs);
   return () => clearInterval(t);
+}
+
+/** "[photo]", "[voice]", "[document: report.pdf]" … for a message without text. */
+export function mediaLabel(m: TgMessage): string {
+  if (m.photo?.length) return "[photo]";
+  if (m.voice) return "[voice]";
+  if (m.video_note) return "[video note]";
+  if (m.video) return m.video.file_name ? `[video: ${m.video.file_name}]` : "[video]";
+  if (m.animation) return "[animation]";
+  if (m.audio) return m.audio.file_name ? `[audio: ${m.audio.file_name}]` : "[audio]";
+  if (m.document) return m.document.file_name ? `[document: ${m.document.file_name}]` : "[document]";
+  if (m.sticker) return m.sticker.emoji ? `[sticker ${m.sticker.emoji}]` : "[sticker]";
+  if (m.poll) return m.poll.question ? `[poll: ${replySnippet(m.poll.question)}]` : "[poll]";
+  if (m.location) return "[location]";
+  if (m.contact) return "[contact]";
+  return "[message]";
 }
 
 function displayName(u: TgUser): string {

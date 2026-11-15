@@ -189,3 +189,21 @@ describe("askChoice", () => {
     expect(await p).toBeNull();
   });
 });
+
+describe("reply context", () => {
+  test("a reply to the bot's message, to a user's message, and to a media-only message; no reference → no replyTo", async () => {
+    const ts = "2026-11-15T05:07:00.000Z";
+    fake.dispatch("MESSAGE_CREATE", msg(OWNER, "yes", { referenced_message: { id: "900", author: { id: fake.botId, username: "bot" }, content: "Shall I merge?", timestamp: ts } }));
+    fake.dispatch("MESSAGE_CREATE", msg(OWNER, "agreed", { referenced_message: { id: "901", author: { id: FRIEND, username: "amy", global_name: "Amy" }, content: "line one\nline two", timestamp: ts } }));
+    fake.dispatch("MESSAGE_CREATE", msg(OWNER, "nice", { referenced_message: { id: "902", author: { id: FRIEND, username: "amy" }, content: "", timestamp: ts,
+      attachments: [{ filename: "cat.png", content_type: "image/png" }] } }));
+    fake.dispatch("MESSAGE_CREATE", msg(OWNER, "file", { referenced_message: { id: "903", author: { id: FRIEND }, content: "", attachments: [{ filename: "report.pdf", content_type: "application/pdf" }] } }));
+    fake.dispatch("MESSAGE_CREATE", msg(OWNER, "plain"));
+    await waitFor(() => inbox.length === 5);
+    expect(inbox[0]!.replyTo).toEqual({ messageId: "900", author: "bot", fromBot: true, sentAt: Date.parse(ts), snippet: "Shall I merge?" });
+    expect(inbox[1]!.replyTo).toMatchObject({ author: "Amy", fromBot: false, snippet: "line one line two" });
+    expect(inbox[2]!.replyTo!.snippet).toBe("[photo]");
+    expect(inbox[3]!.replyTo!.snippet).toBe("[document: report.pdf]");
+    expect(inbox[4]!.replyTo).toBeUndefined();
+  });
+});

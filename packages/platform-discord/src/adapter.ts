@@ -3,8 +3,9 @@
 import { randomBytes } from "node:crypto";
 import type {
   Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, PlatformAdapter,
-  OutboundFile, PlatformCapabilities, PlatformCommand, Target,
+  OutboundFile, PlatformCapabilities, PlatformCommand, ReplyContext, Target,
 } from "@uniqlaw/core";
+import { replySnippet } from "@uniqlaw/core";
 import { chunkText, downloadTo, extFromName, kindFromMime, sleep } from "./download.ts";
 
 export const DISCORD_MSG_LIMIT = 1900;
@@ -249,12 +250,25 @@ export class DiscordAdapter implements PlatformAdapter {
       multiparty: !isDM,
       text,
       attachments,
+      ...(m.referenced_message?.id ? { replyTo: this.replyContext(m.referenced_message) } : {}),
       addressed: isDM || mentionsBot || repliesToBot,
       mentionsOthers: !mentionsBot && mentions.some((u) => u?.id !== this.botUserId),
       ...(isDM ? {} : groupPolicyOf(this.opts.channels[channelId])),
       receivedAt: Date.now(),
     };
     this.sink?.message(inbound);
+  }
+
+  /** The referenced message of a reply: author ("you" when it is the bot's), time, snippet (its start; a media label
+   *  when it has no text). Discord has no partial quotes. */
+  private replyContext(r: any): ReplyContext {
+    const a = r.author as { id?: string; username?: string; global_name?: string } | undefined;
+    const fromBot = !!this.botUserId && a?.id === this.botUserId;
+    let body = String(r.content ?? "").trim();
+    if (this.botUserId) body = body.replace(new RegExp(`<@!?${this.botUserId}>`, "g"), "").trim();
+    const at = r.timestamp ? Date.parse(String(r.timestamp)) : NaN;
+    return { messageId: String(r.id), author: String(a?.global_name ?? a?.username ?? a?.id ?? "unknown"), fromBot,
+      ...(Number.isFinite(at) ? { sentAt: at } : {}), snippet: body ? replySnippet(body) : discordMediaLabel(r) };
   }
 
   private async handleInteraction(i: any): Promise<void> {
@@ -523,4 +537,22 @@ function groupPolicyOf(ch?: { requireMention?: boolean; ignoreOtherMentions?: bo
   if (ch?.requireMention !== undefined) p.mode = ch.requireMention ? "mention" : "always";
   if (ch?.ignoreOtherMentions !== undefined) p.ignoreOtherMentions = ch.ignoreOtherMentions;
   return Object.keys(p).length ? { groupPolicy: p } : {};
+}
+
+/** "[photo]", "[voice]", "[document: report.pdf]" … for a Discord message without text. */
+export function discordMediaLabel(m: any): string {
+  const att = Array.isArray(m?.attachments) ? m.attachments[0] : undefined;
+  if (att) {
+    const type = String(att.content_type ?? "");
+    const name = att.filename ? String(att.filename) : "";
+    if (m.flags & 8192 || /^audio\/ogg/.test(type) && att.duration_secs) return "[voice]"; // IS_VOICE_MESSAGE
+    if (type.startsWith("image/")) return "[photo]";
+    if (type.startsWith("video/")) return name ? `[video: ${name}]` : "[video]";
+    if (type.startsWith("audio/")) return name ? `[audio: ${name}]` : "[audio]";
+    return name ? `[document: ${name}]` : "[document]";
+  }
+  const st = (Array.isArray(m?.sticker_items) ? m.sticker_items : Array.isArray(m?.stickers) ? m.stickers : [])[0];
+  if (st) return st.name ? `[sticker: ${st.name}]` : "[sticker]";
+  if (Array.isArray(m?.embeds) && m.embeds.length) return "[embed]";
+  return "[message]";
 }
