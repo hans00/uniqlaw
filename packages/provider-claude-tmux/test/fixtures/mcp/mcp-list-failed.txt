@@ -1,0 +1,15 @@
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Opus 5.5 · Claude Max
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Manage MCP servers
+   2 servers
+
+     Built-in MCPs (always available)
+   ❯ ✔ claude-in-chrome   20 tools
+     ✘ uniqlaw
+
+   ※ Run claude --debug to see error logs
+   https://code.claude.com/docs/en/mcp for help
+
+   ↑/↓ to navigate · Enter to confirm · Esc to cancel

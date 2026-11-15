@@ -1,0 +1,14 @@
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Uniqlaw MCP Server
+
+   Status:           ✘ failed
+   Issue:            ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+   Auth:             ✘ not authenticated
+   URL:              http://127.0.0.1:34999
+   Config location:  Dynamically configured
+
+   ❯ 1. Authenticate
+     2. Reconnect
+     3. Disable
+
+   ↑/↓ to navigate · Enter to select · Esc to back
