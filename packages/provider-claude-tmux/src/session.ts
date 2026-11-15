@@ -145,6 +145,8 @@ export class ClaudeTmuxSession implements AgentSession {
   private stallAt = 0;
   /** The agent's text in the current turn (a usage-limit line it quotes is not Claude Code's notice). */
   private turnText = "";
+  /** The last jsonl event of the turn is the agent's own text (not a synthetic API-error message). */
+  private agentSpokeLast = false;
   // liveness signals for the stall watchdogs (this one and core's, via liveness())
   private paneFp = "";
   private paneChangedAt = 0;
@@ -470,6 +472,7 @@ export class ClaudeTmuxSession implements AgentSession {
     this.paneChangedAt = Date.now();
     this.toolsInFlight.clear();
     this.turnText = "";
+    this.agentSpokeLast = false;
     this.pendingEndAt = 0;
     this.tentativeAt = 0;
     this.interruptAt = 0;
@@ -549,22 +552,29 @@ export class ClaudeTmuxSession implements AgentSession {
       case "assistant-text":
         // Only prose counts as the agent quoting a limit message: a text that is nothing but the message (whatever
         // marks it in the jsonl) is Claude Code's notice, and must not hide the one in the pane.
-        if (this.state === "running" && ev.text && !(limit && isBareLimitText(ev.text))) this.turnText += `${ev.text}\n`;
+        if (this.state === "running" && ev.text && !(limit && isBareLimitText(ev.text))) {
+          this.turnText += `${ev.text}\n`;
+          // An API error Claude Code records as a message (isApiErrorMessage / "<synthetic>") is not the agent speaking.
+          if (ev.raw?.isApiErrorMessage !== true && ev.model !== "<synthetic>") this.agentSpokeLast = true;
+        }
         if (ev.text?.trim()) this.emit({ type: "text", segmentId: seg(), final: ev.text });
         break;
       case "assistant-thinking":
         if (ev.text?.trim()) this.emit({ type: "thinking", segmentId: seg(), text: ev.text });
         break;
       case "assistant-tool-use":
+        this.agentSpokeLast = false;
         if (ev.toolUseId) this.toolsInFlight.add(ev.toolUseId);
         this.emit({ type: "tool_start", id: ev.toolUseId ?? seg(), name: ev.toolName ?? "?", input: ev.toolInput });
         break;
       case "user-tool-result":
+        this.agentSpokeLast = false;
         if (ev.toolUseId) this.toolsInFlight.delete(ev.toolUseId);
         this.emit({ type: "tool_end", id: ev.toolUseId ?? "?", ok: !ev.toolResultIsError, summary: ev.toolResult?.slice(0, 500) });
         if (ev.toolResultIsError && isRejectionText(ev.toolResult ?? "")) this.armDenyRecovery();
         break;
       case "user-message": {
+        if (!ev.isMeta) this.agentSpokeLast = false;
         const text = ev.userText ?? "";
         if (isInterruptMarker(text)) { this.endTurn("interrupted"); break; }
         if (isRejectionText(text)) { this.endTurn("interrupted"); break; }
@@ -691,7 +701,10 @@ export class ClaudeTmuxSession implements AgentSession {
       return;
     }
     // Transient API errors / usage limit: Claude gives up and returns to the prompt without end_turn.
-    if (!busy && ready && now - this.lastActivityAt > this.t.apiErrorQuietMs) {
+    // Only while a request to the API is due (the last jsonl event is a prompt or a tool result): once the agent's
+    // text is the last word, the turn is finishing (a Stop hook may still run) and no API error can follow, so a
+    // reply that talks about limits or API errors is never taken for one.
+    if (!busy && ready && !this.agentSpokeLast && now - this.lastActivityAt > this.t.apiErrorQuietMs) {
       if (isRecoverableApiError(pane)) { this.endTurn("error", "rate_limit"); return; }
       // Not while a tool runs (its output may print such a line, e.g. tailing a log; a limit comes from an API call),
       // nor when the agent's own reply quotes the message (e.g. while discussing one).

@@ -174,6 +174,33 @@ describe("session", () => {
     expect(events.some((e) => e.type === "text")).toBe(false);
   }, 10_000);
 
+  // Regression (live daemon, 2026-11-16 01:57 and 02:23): agent_asks whose reply discussed usage limits came back
+  // "failed: usage limit reached". The finished reply sat at the bottom of an idle pane while the Stop hook ran (no
+  // end marker yet, jsonl quiet), and the old check matched "usage limit reached" anywhere in the last 30 lines.
+  test("a reply that talks about usage limits, rendered differently from its markdown, is a success, not usage_limit", async () => {
+    const { tmux, ended, line } = await running();
+    const reply = "Done. What changed:\n- **Notice:** it reads `⚠️ Usage limit reached on profile \"main\"; resets 2:10am (Asia/Taipei)`.\n- Cron jobs are skipped while the usage limit lasts.";
+    line({ type: "assistant", uuid: "r1", message: { id: "r1", role: "assistant", model: "claude-opus-5-5", stop_reason: null, content: [{ type: "text", text: reply }] } });
+    tmux.pane = pane("❯ [Agent message] please report back", "● Done. What changed:",
+      '  - Notice: it reads ⚠️ Usage limit reached on profile "main"; resets 2:10am (Asia/Taipei).', "  - Cron jobs are skipped while the usage limit lasts.");
+    await Bun.sleep(600); // well past apiErrorQuietMs: the Stop hook is still running
+    expect(ended()).toBeUndefined();
+    line({ type: "system", subtype: "stop_hook_summary", uuid: "r2" });
+    await waitFor(() => !!ended(), 3000);
+    expect(ended()).toMatchObject({ reason: "done" });
+    expect(ended()!.error).toBeUndefined();
+  }, 10_000);
+
+  test("after a tool result, a limit phrase in earlier output (not right above the prompt) is not the notice", async () => {
+    const { tmux, ended, line } = await running();
+    line({ type: "assistant", uuid: "d1", message: { id: "d1", role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id: "e1", name: "Edit", input: {} }] } });
+    line({ type: "user", uuid: "d2", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "e1", content: "ok" }] } });
+    tmux.pane = pane("❯ fix it", "● Update(runtime.ts)", "  ⎿  +    const text = `⚠️ Usage limit reached on profile ${name}`;", "     +    await post(text);",
+      "     +  }", "     +", "     +  private async notifyFailure() {");
+    await Bun.sleep(600);
+    expect(ended()).toBeUndefined();
+  }, 10_000);
+
   test("a synthetic API-error message in the jsonl ends the turn as usage_limit and is not posted as a reply", async () => {
     const { ended, line, events } = await running();
     line({ type: "assistant", uuid: "u2", isApiErrorMessage: true, message: { id: "m2", role: "assistant", model: "<synthetic>",
