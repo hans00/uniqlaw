@@ -129,3 +129,13 @@ function zonedToEpoch(tz: string, year: number, month: number, day: number, hour
   }
   return at;
 }
+
+/** An epoch as Claude Code words a reset: "2:10am (Asia/Taipei)", with the date ("Nov 20, 3am (…)") when it is not
+ *  within the next 24 hours. */
+export function formatResetTime(at: number, now = Date.now(), tz = Intl.DateTimeFormat().resolvedOptions().timeZone): string {
+  const f = zonedFields(at, tz);
+  const h = f.hour % 12 || 12, ap = f.hour < 12 ? "am" : "pm";
+  const time = `${h}${f.minute ? `:${String(f.minute).padStart(2, "0")}` : ""}${ap}`;
+  const date = at - now > 24 * 3600_000 ? `${MONTHS[f.month]![0]!.toUpperCase()}${MONTHS[f.month]!.slice(1)} ${f.day}, ` : "";
+  return `${date}${time} (${tz})`;
+}

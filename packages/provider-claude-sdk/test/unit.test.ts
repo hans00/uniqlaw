@@ -39,6 +39,29 @@ test("interrupt and error results", () => {
     .toMatchObject({ error: "usage_limit" });
 });
 
+test("usage limit: the current \"You've hit your … limit\" wording, with the reset; a rejected window is not a rate limit", () => {
+  expect(classifyError("You've hit your 5-hour limit · resets 2:10am (Asia/Taipei)")).toBe("usage_limit");
+  expect(classifyError("You’ve hit your weekly limit · resets Nov 20, 3am")).toBe("usage_limit");
+  expect(classifyError("You've reached your usage limit")).toBe("usage_limit");
+  const m = new SdkMapper();
+  m.beginTurn();
+  const [end] = m.map({ type: "result", subtype: "success", is_error: true, result: "You've hit your 5-hour limit · resets 2:10am (Asia/Taipei)" });
+  expect(end).toMatchObject({ type: "turn_end", reason: "error", error: "usage_limit", limit: { kind: "5-hour", resets: "2:10am (Asia/Taipei)" } });
+  expect((end as { limit: { resetAt: number } }).limit.resetAt).toBeGreaterThan(Date.now());
+  // Only the rate_limit_event says when: the window and resetsAt still reach the turn_end, and it is not retried.
+  m.beginTurn();
+  const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+  m.map({ type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "seven_day", resetsAt } });
+  const [end2] = m.map({ type: "result", subtype: "error_during_execution", is_error: true });
+  expect(end2).toMatchObject({ error: "usage_limit", limit: { kind: "weekly", resetAt: resetsAt * 1000 } });
+  expect((end2 as { limit: { resets: string } }).limit.resets).toMatch(/^\d{1,2}(:\d\d)?[ap]m \(.+\)$/);
+  // A successful turn whose reply discusses usage limits is a success.
+  m.beginTurn();
+  m.map({ type: "assistant", message: { content: [{ type: "text", text: "You've hit your 5-hour limit · resets 2:10am is what Claude Code prints." }] } });
+  expect(m.map({ type: "result", subtype: "success", is_error: false, result: "You've hit your 5-hour limit · resets 2:10am is what Claude Code prints." }).at(-1))
+    .toMatchObject({ type: "turn_end", reason: "done" });
+});
+
 test("output without a prompt is an unsolicited (background) turn", () => {
   const m = new SdkMapper();
   const evs = m.map({ type: "assistant", message: { content: [{ type: "text", text: "wakeup" }] } });
