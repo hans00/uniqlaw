@@ -1,6 +1,6 @@
 // Owns all ChannelRuntimes: inbound routing, core slash commands, the message
 // bus (agents_list / agent_ask / agent_trigger / notify) and idle cleanup.
-import type { AgentProvider, PaneInspection, Profile, TurnInput } from "./provider.ts";
+import type { AgentProvider, PaneInspection, Profile, TurnInput, UsageLimit } from "./provider.ts";
 import type { ChannelHealth } from "./channel-supervisor.ts";
 import { insideRoots, type HealthMonitor, type SessionHealth } from "./health.ts";
 import type { InboundRequest, RemoteAgent, ScheduledFire, Transcriber } from "./plugin.ts";
@@ -54,7 +54,11 @@ export interface WorkerMeta { cwd: string; profile: string; owner?: string; crea
 export const WORKER_PREFIX = "worker:";
 
 /** A turn that failed on the usage limit (re-sent after a profile switch). */
-type FailedTurn = { origins: Origin[]; input?: TurnInput };
+type FailedTurn = { origins: Origin[]; input?: TurnInput; limit?: UsageLimit };
+/** How long a usage limit without a readable reset time is assumed to last (scheduled jobs skip it meanwhile). */
+const USAGE_LIMIT_UNKNOWN_MS = 30 * 60_000;
+/** A reset further out than this is not believed (misparsed): treated as unknown. */
+const USAGE_LIMIT_MAX_MS = 8 * 24 * 3600_000;
 /** A chat's provider session on a profile it switched away from (resumed when it switches back). */
 interface SavedProfileSession { provider: string; providerSessionId: string; adapterState: string | null; transcriptId: number }
 
@@ -102,6 +106,8 @@ export class ChannelManager {
   private waiters = new Map<string, TaskWaiter>();
   /** Usage-limit fallback offers waiting for the owner, per chat: the failed turns to re-send after a switch. */
   private pendingSwitch = new Map<string, { failed: FailedTurn[]; until: number }>();
+  /** Profiles at their usage limit: until when, Claude's reset wording, and which targets were told already. */
+  private usageLimits = new Map<string, { until: number; resets?: string; told: Set<string> }>();
   private cleanupTimer?: ReturnType<typeof setInterval>;
   private readonly host: RuntimeHost;
   /** DM pairing (strangers get a code; operators approve). */
@@ -120,6 +126,17 @@ export class ChannelManager {
       operatorTargets: () => [...deps.platforms.values()].flatMap((p) => p.operatorTargets()),
       onTaskResult: (id, ok, text, opts) => this.completeTask(id, ok, text, opts?.mergedInto),
       onUsageLimit: (key, failed) => this.onUsageLimit(key, failed),
+      usageLimitNotice: (profile, t) => {
+        const l = this.activeUsageLimit(profile);
+        if (!l) return true;
+        const k = `${t.platform}:${t.chatId}:${t.threadId ?? ""}`;
+        if (l.told.has(k)) return false;
+        l.told.add(k);
+        return true;
+      },
+      usageLimitCleared: (profile) => {
+        if (this.usageLimits.delete(profile)) this.deps.log.info("usage limit over: a turn succeeded", { profile });
+      },
       emit: (ev: RuntimeEvent) => { this.events.emit("event", ev); },
       isInternal: (k) => this.kindOf(k) === "internal",
       // Inbound A2A sessions run in an empty directory of their own, never in the project.
@@ -437,6 +454,7 @@ export class ChannelManager {
 
   /** Usage limit: the owner is asked whether to switch profile; anyone else just gets the error (runtime posts it). */
   private async onUsageLimit(channelKey: string, failed: FailedTurn): Promise<boolean> {
+    this.recordUsageLimit(this.profileFor(channelKey).name, failed.limit);
     const human = [...failed.origins].reverse().find((o): o is Extract<Origin, { kind: "human" }> => o.kind === "human");
     if (!human?.trusted) return false;
     const cur = this.profileFor(channelKey);
@@ -448,7 +466,7 @@ export class ChannelManager {
     const ttl = 30 * 60_000;
     this.pendingSwitch.set(channelKey, { failed: [failed], until: Date.now() + ttl });
     const platform = this.deps.platforms.get(human.platform);
-    const title = `⛔ Profile "${cur.name}" (${cur.provider}) hit its usage limit.`;
+    const title = `⛔ Profile "${cur.name}" (${cur.provider}) hit its usage limit${failed.limit?.resets ? `; resets ${failed.limit.resets}` : ""}.`;
     if (!platform?.askChoice) {
       await platform?.send(human.replyTarget, `${title} Switch this chat with /profile <name> (${candidates.join(", ")}); your message is re-sent there.`);
       return true;
@@ -466,6 +484,24 @@ export class ChannelManager {
       await platform.send(human.replyTarget, await this.profileCommand(channelKey, name));
     }).catch((e) => this.deps.log.warn("usage-limit offer failed", { key: channelKey, e: String(e) }));
     return true;
+  }
+
+  private recordUsageLimit(profile: string, limit?: UsageLimit) {
+    const now = Date.now();
+    const known = limit?.resetAt !== undefined && limit.resetAt > now && limit.resetAt - now <= USAGE_LIMIT_MAX_MS;
+    const until = known ? limit!.resetAt! : now + USAGE_LIMIT_UNKNOWN_MS;
+    const prev = this.activeUsageLimit(profile);
+    if (prev && prev.until === until) return;
+    this.usageLimits.set(profile, { until, ...(limit?.resets ? { resets: limit.resets } : {}), told: prev?.told ?? new Set() });
+    this.deps.log.warn("usage limit reached; scheduled jobs on this profile are skipped until it resets", {
+      profile, kind: limit?.kind, resets: limit?.resets, until: new Date(until).toISOString(), resetKnown: known });
+  }
+
+  /** The usage limit a profile is at right now, if any. */
+  activeUsageLimit(profile: string): { until: number; resets?: string; told: Set<string> } | undefined {
+    const l = this.usageLimits.get(profile);
+    if (l && l.until <= Date.now()) { this.usageLimits.delete(profile); return undefined; }
+    return l;
   }
 
   /** Transcripts of voice/audio attachments, as text for the prompt (best-effort: failures only log). */
@@ -805,6 +841,13 @@ export class ChannelManager {
   async fireScheduled(o: ScheduledFire) {
     if (this.workerMeta(o.channelKey) && this.heldBy(o.channelKey)) {
       this.deps.log.warn("scheduled job skipped: a human is driving this worker", { job: o.job, key: o.channelKey, by: this.heldBy(o.channelKey) });
+      return;
+    }
+    const profile = o.profile && this.deps.profiles.has(o.profile) ? o.profile : this.profileFor(o.channelKey).name;
+    const limit = this.activeUsageLimit(profile);
+    if (limit) {
+      this.deps.log.warn("scheduled job skipped: its profile is at the usage limit", { job: o.job, key: o.channelKey, profile,
+        until: new Date(limit.until).toISOString(), ...(limit.resets ? { resets: limit.resets } : {}) });
       return;
     }
     const silent = o.deliverTo?.trim().toLowerCase() === "none";

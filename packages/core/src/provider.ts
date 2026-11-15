@@ -117,6 +117,16 @@ export type PermissionDecision =
   | { behavior: "allow"; scope?: "once" | "session" }
   | { behavior: "deny"; message?: string };
 
+/** A usage/quota limit as the provider reported it. */
+export interface UsageLimit {
+  /** "5-hour" | "weekly" | "usage" (generic) or a provider's own label. */
+  kind?: string;
+  /** The provider's own wording of the reset, e.g. "2:10am (Asia/Taipei)", shown to humans as is. */
+  resets?: string;
+  /** The reset as epoch ms, when known. */
+  resetAt?: number;
+}
+
 export type Usage = { inputTokens?: number; outputTokens?: number; costUsd?: number };
 
 export type AgentEvent =
@@ -137,7 +147,9 @@ export type AgentEvent =
       kind?: "login" | "elicitation" }
   | { type: "turn_end"; turnId: string; reason: "done" | "interrupted" | "error"; usage?: Usage;
       /** Free text, or a typed code: "rate_limit" (retryable) | "usage_limit" | "stall" | "auth" | "crash". */
-      error?: string }
+      error?: string;
+      /** error "usage_limit": what the provider could tell about the limit. */
+      limit?: UsageLimit }
   /** A turn the core did not start. source "external" = input arrived through a channel
    *  outside UniQlaw (e.g. Claude's native peer messaging socket): core routes it to
    *  operators only, never to the regular chat. */

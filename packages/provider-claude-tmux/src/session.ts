@@ -4,7 +4,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type {
-  AgentEvent, AgentSession, Liveness, Logger, PaneInspection, PermissionDecision, ProviderCapabilities, SessionRepair, TurnInput,
+  AgentEvent, AgentSession, Liveness, Logger, PaneInspection, PermissionDecision, ProviderCapabilities, SessionRepair, TurnInput, UsageLimit,
 } from "@uniqlaw/core";
 import {
   claudeShellDialects,
@@ -15,7 +15,7 @@ import { answerStartupPrompt, classifyBlocker, closeMcpDialog, reconnectMcp as d
 import type { Tmux } from "./tmux.ts";
 import { AsyncQueue } from "./queue.ts";
 import { hasReadyPrompt, isLoggedOut, parseLoginPrompt, parsePermissionDialog, type PermissionDialog } from "./dialogs.ts";
-import { isReady, looksActivelyBusy, isRecoverableApiError, isUsageLimit, normalizePaneForLiveness, waitForReady } from "./pane.ts";
+import { isReady, looksActivelyBusy, isRecoverableApiError, parseUsageLimit, describeUsageLimit, normalizePaneForLiveness, waitForReady, type UsageLimitInfo } from "./pane.ts";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -55,6 +55,8 @@ export interface Timings {
   /** Hard ceiling: end the turn after this long without a jsonl write even while the pane looks busy (a hung tool
    *  still ticks the spinner). 0 = leave it to core's turn.stallMaxSec, which interrupts the turn. */
   busyHardCapMs: number;
+  /** An API error or usage-limit message at an idle prompt ends the turn once the jsonl has been quiet this long. */
+  apiErrorQuietMs: number;
   modelEchoMs: number;
   dialogGonePolls: number;
   /** A dialog must stay gone this long before it is reported withdrawn (a redraw or resize can hide it briefly). */
@@ -73,6 +75,7 @@ export const DEFAULT_TIMINGS: Timings = {
   stallMs: 120_000,
   stallMaxMs: 600_000,
   busyHardCapMs: 0,
+  apiErrorQuietMs: 5000,
   modelEchoMs: 5000,
   dialogGonePolls: 3,
   dialogWithdrawnMs: 3000,
@@ -135,6 +138,8 @@ export class ClaudeTmuxSession implements AgentSession {
   private turnStartedAt = 0;
   private lastActivityAt = 0;
   private stallAt = 0;
+  /** The agent's text in the current turn (a usage-limit line it quotes is not Claude Code's notice). */
+  private turnText = "";
   // liveness signals for the stall watchdogs (this one and core's, via liveness())
   private paneFp = "";
   private paneChangedAt = 0;
@@ -459,6 +464,7 @@ export class ClaudeTmuxSession implements AgentSession {
     this.stallAt = Date.now();
     this.paneChangedAt = Date.now();
     this.toolsInFlight.clear();
+    this.turnText = "";
     this.pendingEndAt = 0;
     this.tentativeAt = 0;
     this.interruptAt = 0;
@@ -484,7 +490,13 @@ export class ClaudeTmuxSession implements AgentSession {
     }
   }
 
-  private endTurn(reason: "done" | "interrupted" | "error", error?: string) {
+  private endOnUsageLimit(l: UsageLimitInfo, from: "pane" | "jsonl") {
+    this.log.warn("usage limit reached; ending the turn", { from, kind: l.kind, resets: l.resets,
+      resetAt: l.resetAt !== undefined ? new Date(l.resetAt).toISOString() : undefined, line: l.line });
+    this.endTurn("error", "usage_limit", { kind: l.kind, ...(l.resets ? { resets: l.resets } : {}), ...(l.resetAt !== undefined ? { resetAt: l.resetAt } : {}) });
+  }
+
+  private endTurn(reason: "done" | "interrupted" | "error", error?: string, limit?: UsageLimit) {
     if (this.state !== "running") return;
     this.clearTimer("slashTimer");
     this.clearTimer("denyTimer");
@@ -492,7 +504,7 @@ export class ClaudeTmuxSession implements AgentSession {
     this.tentativeAt = 0;
     this.interruptAt = 0;
     this.activeDialog = null;
-    this.emit({ type: "turn_end", turnId: this.turnId, reason, ...(error ? { error } : {}) });
+    this.emit({ type: "turn_end", turnId: this.turnId, reason, ...(error ? { error } : {}), ...(limit ? { limit } : {}) });
     this.setIdle();
   }
 
@@ -511,6 +523,12 @@ export class ClaudeTmuxSession implements AgentSession {
   private onJsonl(ev: JsonlEvent) {
     this.lastActivityAt = Date.now();
     this.stallAt = Date.now();
+    // Claude Code records an API failure as a synthetic assistant message (isApiErrorMessage). A usage limit there
+    // ends the turn; it is not the agent's reply.
+    if (ev.type === "assistant-text" && ev.raw?.isApiErrorMessage === true && ev.text && parseUsageLimit(ev.text)) {
+      if (this.state === "running") this.endOnUsageLimit(describeUsageLimit(ev.text), "jsonl");
+      return;
+    }
     const assistant = ev.type === "assistant-text" || ev.type === "assistant-tool-use" || ev.type === "assistant-thinking";
     if (assistant) {
       this.clearTimer("slashTimer");
@@ -523,6 +541,7 @@ export class ClaudeTmuxSession implements AgentSession {
     const seg = () => `${ev.msgId ?? ev.uuid ?? "seg"}:${ev.blockIndex ?? this.segSeq++}`;
     switch (ev.type) {
       case "assistant-text":
+        if (this.state === "running" && ev.text) this.turnText += `${ev.text}\n`;
         if (ev.text?.trim()) this.emit({ type: "text", segmentId: seg(), final: ev.text });
         break;
       case "assistant-thinking":
@@ -664,9 +683,11 @@ export class ClaudeTmuxSession implements AgentSession {
       return;
     }
     // Transient API errors / usage limit: Claude gives up and returns to the prompt without end_turn.
-    if (!busy && ready && now - this.lastActivityAt > 5000) {
+    if (!busy && ready && now - this.lastActivityAt > this.t.apiErrorQuietMs) {
       if (isRecoverableApiError(pane)) { this.endTurn("error", "rate_limit"); return; }
-      if (isUsageLimit(pane)) { this.endTurn("error", "usage_limit"); return; }
+      const limit = parseUsageLimit(pane, now);
+      // The agent's own reply may quote such a message (e.g. while discussing one): that is not Claude Code's notice.
+      if (limit && !this.turnText.includes(limit.line.slice(0, 60))) { this.endOnUsageLimit(limit, "pane"); return; }
     }
     // Stall watchdog: only when there is no liveness signal at all. A long tool call (CI wait, a long test run) writes
     // nothing to the jsonl, but the pane shows it busy or changing, so it is not a stall.

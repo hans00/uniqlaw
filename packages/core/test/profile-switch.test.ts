@@ -16,7 +16,10 @@ const until = async (cond: () => boolean, ms = 2000) => { const end = Date.now()
 
 /** Replies "<tag>:<last line>", or fails with usage_limit when the prompt says LIMIT. */
 const scripted = (tag: string): Script => (input, s) => {
-  if (input.text.trim().split("\n").at(-1)!.includes("LIMIT") && tag === "A") { s.emit({ type: "turn_end", turnId: s.turnId(), reason: "error", error: "usage_limit" }); return; }
+  if (input.text.trim().split("\n").at(-1)!.includes("LIMIT") && tag === "A") {
+    s.emit({ type: "turn_end", turnId: s.turnId(), reason: "error", error: "usage_limit", limit: { kind: "5-hour", resets: "2:10am (Asia/Taipei)", resetAt: Date.now() + 3600_000 } });
+    return;
+  }
   s.emit({ type: "text", segmentId: "x", final: `${tag}:${input.text.trim().split("\n").at(-1)}` }, { type: "turn_end", turnId: s.turnId(), reason: "done" });
 };
 
@@ -72,9 +75,37 @@ test("usage limit: owner picks the fallback; the chat moves with a raw handoff a
 test("usage limit for a non-owner is reported as an error; nobody is asked", async () => {
   const { platform } = setup();
   await mgr.handleInbound(msg("LIMIT", false));
-  await until(() => platform.sent.some((x) => x.text.startsWith("⛔")));
-  expect(platform.sent.at(-1)!.text).toContain('usage limit of profile "main"');
+  await until(() => platform.sent.some((x) => x.text.startsWith("⚠️")));
+  expect(platform.sent.at(-1)!.text).toContain('Usage limit reached on profile "main"; resets 2:10am (Asia/Taipei)');
   expect(platform.choices).toHaveLength(0);
+});
+
+test("usage limit hit by cron jobs: one notice per target (not per session), later jobs skipped until a turn succeeds", async () => {
+  const { a, platform } = setup();
+  const notices = () => platform.sent.filter((x) => x.text.includes("Usage limit reached"));
+  // Two jobs, two sessions, same operator target (no replyTo): the operator hears it once.
+  await mgr.fireScheduled({ channelKey: "cron:one", job: "one", text: "LIMIT", sourceLine: "[cron]" });
+  await until(() => notices().length === 1);
+  expect(notices()[0]).toEqual({ target: { platform: "tg", chatId: "1" }, text: expect.stringContaining('profile "main"; resets 2:10am (Asia/Taipei)') });
+  expect(mgr.activeUsageLimit("main")).toMatchObject({ resets: "2:10am (Asia/Taipei)" });
+  expect(platform.sent.some((x) => x.text.includes("stopped responding"))).toBe(false);
+
+  // While the limit lasts, scheduled jobs on that profile don't fire at all.
+  await mgr.fireScheduled({ channelKey: "cron:two", job: "two", text: "anything", sourceLine: "[cron]" });
+  await Bun.sleep(50);
+  expect(a.sessions.get("cron:two")?.sent.length ?? 0).toBe(0);
+  expect(notices()).toHaveLength(1);
+
+  // A human still gets an answer (and the switch offer is theirs to take; this one is not the owner).
+  await mgr.handleInbound(msg("LIMIT", false));
+  await until(() => notices().length === 2);
+
+  // A turn that succeeds on the profile means the limit is over: jobs fire again.
+  await mgr.handleInbound(msg("hello", false));
+  await until(() => platform.sent.some((x) => x.text === "A:Message: hello"));
+  expect(mgr.activeUsageLimit("main")).toBeUndefined();
+  await mgr.fireScheduled({ channelKey: "cron:two", job: "two", text: "go", sourceLine: "[cron]" });
+  await until(() => (a.sessions.get("cron:two")?.sent.length ?? 0) === 1);
 });
 
 test("/profile lists and refuses unknown profiles; untrusted /profile is a normal message", async () => {

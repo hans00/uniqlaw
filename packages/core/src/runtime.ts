@@ -1,6 +1,6 @@
 // Per-channel runtime: owns one AgentSession, the input queue, the turn state
 // machine, output routing (by Origin) and approvals. Provider-agnostic.
-import type { AgentEvent, AgentProvider, AgentSession, Attachment, Liveness, PaneInspection, PermissionDecision, SessionRepair, Profile, SystemPromptParts, TurnInput } from "./provider.ts";
+import type { AgentEvent, AgentProvider, AgentSession, Attachment, Liveness, PaneInspection, PermissionDecision, SessionRepair, Profile, SystemPromptParts, TurnInput, UsageLimit } from "./provider.ts";
 import type { MsgRef, PlatformAdapter, Target } from "./platform.ts";
 import type { Origin } from "./origin.ts";
 import type { Logger } from "./plugin.ts";
@@ -77,7 +77,12 @@ export interface RuntimeHost {
   providerEnv(profile: Profile): Promise<Record<string, string>>;
   /** A turn hit the provider's usage limit. Return true when the host took over telling the human
    *  (e.g. asked the owner to switch profile); false = the runtime posts its usual error. */
-  onUsageLimit?(channelKey: string, failed: { origins: Origin[]; input?: TurnInput }): Promise<boolean>;
+  onUsageLimit?(channelKey: string, failed: { origins: Origin[]; input?: TurnInput; limit?: UsageLimit }): Promise<boolean>;
+  /** A usage-limit notice is about to go to `target` (a turn with no human in it, e.g. a cron job): false = this
+   *  target was already told about the current limit of `profile`, stay quiet. Default: always tell. */
+  usageLimitNotice?(profile: string, target: Target): boolean;
+  /** A turn on `profile` succeeded: whatever usage limit was recorded for it is over. */
+  usageLimitCleared?(profile: string): void;
   /** Called when a peer ask/trigger turn finishes. `mergedInto`: this ask shared its turn with an earlier ask from
    *  the same session, whose result carries the answer; `text` is only a pointer to it (no separate delivery). */
   onTaskResult(taskId: string, ok: boolean, text: string, opts?: { mergedInto?: string }): void;
@@ -921,7 +926,7 @@ export class ChannelRuntime {
         await this.onInputRequest(ev);
         return;
       case "turn_end":
-        await this.finishTurn(ev.reason, ev.error);
+        await this.finishTurn(ev.reason, ev.error, ev.limit);
         return;
       case "model":
         this.log.info("model", { model: ev.model });
@@ -1169,12 +1174,12 @@ export class ChannelRuntime {
     }
   }
 
-  private async finishTurn(reason: "done" | "interrupted" | "error", error?: string) {
+  private async finishTurn(reason: "done" | "interrupted" | "error", error?: string, limit?: UsageLimit) {
     this.finishing++;
-    try { await this.finishTurnInner(reason, error); } finally { this.finishing--; }
+    try { await this.finishTurnInner(reason, error, limit); } finally { this.finishing--; }
   }
 
-  private async finishTurnInner(reason: "done" | "interrupted" | "error", error?: string) {
+  private async finishTurnInner(reason: "done" | "interrupted" | "error", error?: string, limit?: UsageLimit) {
     clearTimeout(this.stallTimer);
     this.toolsInFlight.clear();
     // The turn is over: a prompt still waiting has nothing left to answer, and hook verdicts belong to this turn.
@@ -1220,10 +1225,11 @@ export class ChannelRuntime {
       }, delay);
       return;
     }
+    if (turn && reason === "done") this.host.usageLimitCleared?.(this.profile.name);
     if (turn && reason === "error" && error === "usage_limit") {
-      const handled = await this.host.onUsageLimit?.(this.channelKey, { origins: turn.origins, ...(turn.input ? { input: turn.input } : {}) })
+      const handled = await this.host.onUsageLimit?.(this.channelKey, { origins: turn.origins, ...(turn.input ? { input: turn.input } : {}), ...(limit ? { limit } : {}) })
         .catch((e) => { this.log.warn("usage-limit handler failed", { e: String(e) }); return false; }) ?? false;
-      if (!handled) await this.postTo(turn, `⛔ The usage limit of profile "${this.profile.name}" is reached. Try again later, or ask the owner to switch this chat with /profile.`);
+      if (!handled) await this.postUsageLimit(turn, limit);
       for (const o of turn.origins) {
         if (o.kind === "peer" && (o.mode === "ask" || o.mode === "trigger")) this.host.onTaskResult(o.taskId, false, "usage limit reached");
         else if (o.kind === "scheduler" && o.taskId) this.host.onTaskResult(o.taskId, false, "usage limit reached");
@@ -1647,6 +1653,23 @@ export class ChannelRuntime {
     const saved = this.turn;
     this.turn = turn;
     try { await this.postVisible(text); } finally { this.turn = saved; }
+  }
+
+  /** Tell whoever this turn answers that the usage limit is reached. A human always hears it; a turn without one
+   *  (cron, heartbeat, background) tells its target (else the operator) once per limit, not once per session. */
+  private async postUsageLimit(turn: TurnState, limit?: UsageLimit) {
+    const text = `⚠️ Usage limit reached on profile "${this.profile.name}"${limit?.resets ? `; resets ${limit.resets}` : ""}. Try again ${limit?.resets ? "after that" : "later"}, or ask the owner to switch this chat with /profile.`;
+    const saved = this.turn;
+    this.turn = turn;
+    let target: Target | undefined;
+    try { target = this.lastHumanOrigin() ? undefined : this.visibleTarget() ?? this.host.operatorTargets()[0]; } finally { this.turn = saved; }
+    if (!target) { await this.postTo(turn, text); return; }
+    if (this.host.usageLimitNotice && !this.host.usageLimitNotice(this.profile.name, target)) {
+      this.log.info("usage-limit notice already sent to this target; not repeating it", { profile: this.profile.name, target: `${target.platform}:${target.chatId}` });
+      return;
+    }
+    const { replyToMessageId: _r, ...plain } = target;
+    await this.host.platform(target.platform)?.send(plain, text).catch((e) => this.log.error("send failed", { e: String(e) }));
   }
 
   private async notifyFailure(origin: Origin | undefined, text: string) {
