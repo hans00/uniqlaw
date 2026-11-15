@@ -80,16 +80,28 @@ export interface ApiResult<T> {
   description?: string;
 }
 
+/** Default deadline of one Bot API request: an unresponsive Telegram must not hang startup, shutdown or a send. */
+export const TG_CALL_TIMEOUT_MS = 30_000;
+/** Uploads move more data. */
+export const TG_UPLOAD_TIMEOUT_MS = 120_000;
+
+/** `signal` plus a deadline: whichever fires first aborts the request. */
+function deadline(timeoutMs: number, signal?: AbortSignal | null): AbortSignal {
+  const t = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, t]) : t;
+}
+
 export class TelegramApi {
   constructor(private readonly apiBase: string, private readonly token: string) {}
 
-  /** POST a Bot API method. Never throws on HTTP/API errors; network errors do throw. */
-  async call<T = unknown>(method: string, body: Record<string, unknown> = {}, signal?: AbortSignal): Promise<ApiResult<T>> {
+  /** POST a Bot API method. Never throws on HTTP/API errors; network errors and the deadline (`timeoutMs`, default
+   *  TG_CALL_TIMEOUT_MS) do throw. */
+  async call<T = unknown>(method: string, body: Record<string, unknown> = {}, signal?: AbortSignal | null, timeoutMs = TG_CALL_TIMEOUT_MS): Promise<ApiResult<T>> {
     const res = await fetch(`${this.apiBase}/bot${this.token}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal,
+      signal: deadline(timeoutMs, signal),
     });
     type Body = { ok?: boolean; result?: T; description?: string };
     const data = (await res.json().catch(() => null)) as Body | null; // non-JSON error body → null
@@ -101,7 +113,7 @@ export class TelegramApi {
     const form = new FormData();
     for (const [k, v] of Object.entries(fields)) if (v !== undefined) form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
     form.append(field, Bun.file(path), name);
-    const res = await fetch(`${this.apiBase}/bot${this.token}/${method}`, { method: "POST", body: form });
+    const res = await fetch(`${this.apiBase}/bot${this.token}/${method}`, { method: "POST", body: form, signal: deadline(TG_UPLOAD_TIMEOUT_MS) });
     type Body = { ok?: boolean; result?: T; description?: string };
     const data = (await res.json().catch(() => null)) as Body | null;
     return { ok: res.ok && !!data?.ok, result: data?.result, status: res.status, description: data?.description };

@@ -3,11 +3,12 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { PlatformStartError } from "@uniqlaw/core";
 import type {
   Attachment, ChoiceRequest, InboundMessage, InboundSink, Logger, MsgRef, PlatformAdapter,
-  OutboundFile, PlatformCapabilities, PlatformCommand, Target,
+  OutboundFile, PlatformCapabilities, PlatformCommand, PlatformHealth, Target,
 } from "@uniqlaw/core";
-import { TelegramApi, type TgCallbackQuery, type TgFile, type TgMessage, type TgUpdate, type TgUser } from "./api.ts";
+import { TelegramApi, type ApiResult, type TgCallbackQuery, type TgFile, type TgMessage, type TgUpdate, type TgUser } from "./api.ts";
 import {
   chunkHtml, chunkText, escapeHtml, htmlToPlain, markdownToTelegramHtml, normalizeCommandName, normalizeEmoji,
   TG_HTML_LIMIT, TG_MSG_LIMIT, TG_REACTION_EMOJIS,
@@ -54,11 +55,14 @@ export class TelegramAdapter implements PlatformAdapter {
   private paired = new Set<string>();
   setPairedUsers(userIds: string[]) { this.paired = new Set(userIds); }
   private offset = 0;
+  /** The offset stop() already confirmed (a second stop() doesn't wait on Telegram again). */
+  private confirmedOffset = 0;
   private running = false;
   private abort: AbortController | null = null;
   private loopPromise: Promise<void> | null = null;
   private bot: TgUser | null = null;
   private readonly pending = new Map<string, PendingChoice>();
+  private readonly healthState: PlatformHealth = { consecutiveFailures: 0 };
 
   constructor(private readonly opts: TelegramAdapterOptions) {
     this.api = new TelegramApi(opts.apiBase, opts.token);
@@ -71,11 +75,47 @@ export class TelegramAdapter implements PlatformAdapter {
   /** Bot identity from getMe (available after start()). */
   get botUser(): TgUser | null { return this.bot; }
 
-  async start(sink: InboundSink): Promise<void> {
+  health(): PlatformHealth { return { ...this.healthState }; }
+
+  private noteOk(kind: "poll" | "send") {
+    this.healthState.consecutiveFailures = 0;
+    if (kind === "poll") this.healthState.lastPollAt = Date.now(); else this.healthState.lastSendAt = Date.now();
+  }
+
+  private noteFail(error: string) {
+    this.healthState.consecutiveFailures++;
+    this.healthState.lastError = error;
+    this.healthState.lastErrorAt = Date.now();
+  }
+
+  /** api.call that records the outcome in health(). Outbound calls only (the poll loop records its own). */
+  private async call<T = unknown>(method: string, body: Record<string, unknown> = {}): Promise<ApiResult<T>> {
+    try {
+      const r = await this.api.call<T>(method, body);
+      // 4xx other than 429 is about this request (bad entity, message gone), not the connection.
+      if (r.ok || (r.status >= 400 && r.status < 500 && r.status !== 429)) this.noteOk("send");
+      else this.noteFail(`${method}: ${r.status} ${r.description ?? ""}`.trim());
+      return r;
+    } catch (e) {
+      this.noteFail(`${method}: ${e instanceof Error ? e.message : String(e)}`);
+      throw e;
+    }
+  }
+
+  async start(sink: InboundSink, signal?: AbortSignal): Promise<void> {
     if (this.running) return;
     this.sink = sink;
-    const me = await this.api.call<TgUser>("getMe");
-    if (!me.ok || !me.result) throw new Error(`telegram getMe failed (${me.status}): ${me.description ?? "no response"}`);
+    let me: ApiResult<TgUser>;
+    try { me = await this.api.call<TgUser>("getMe", {}, signal); }
+    catch (e) { this.noteFail(`getMe: ${e instanceof Error ? e.message : String(e)}`); throw e; }
+    if (!me.ok || !me.result) {
+      const msg = `telegram getMe failed (${me.status}): ${me.description ?? "no response"}`;
+      this.noteFail(msg);
+      // Wrong / revoked token: retrying won't help.
+      if (me.status === 401 || me.status === 404) throw new PlatformStartError(msg);
+      throw new Error(msg);
+    }
+    this.noteOk("poll");
     this.bot = me.result;
     this.running = true;
     this.abort = new AbortController();
@@ -90,7 +130,11 @@ export class TelegramAdapter implements PlatformAdapter {
     this.loopPromise = null;
     // Telegram only forgets updates once a later getUpdates passes a higher offset. Confirm what we handled,
     // or a restarted daemon receives the last message(s) again. Anything returned here stays unconfirmed.
-    if (this.offset > 0) await this.api.call("getUpdates", { offset: this.offset, timeout: 0, limit: 1 }).catch(() => {});
+    // Bounded: an unresponsive Telegram must not hold up a restart (at worst the last update comes again).
+    if (this.offset > 0 && this.offset !== this.confirmedOffset) {
+      this.confirmedOffset = this.offset;
+      await this.api.call("getUpdates", { offset: this.offset, timeout: 0, limit: 1 }, null, 5000).catch(() => {});
+    }
     for (const [token, p] of this.pending) {
       clearTimeout(p.timer);
       this.pending.delete(token);
@@ -107,14 +151,14 @@ export class TelegramAdapter implements PlatformAdapter {
     let first: MsgRef | undefined;
     for (let i = 0; i < chunks.length; i++) {
       const base = this.targetFields(target, i === 0);
-      let r = await this.api.call<{ message_id: number }>("sendMessage", {
+      let r = await this.call<{ message_id: number }>("sendMessage", {
         ...base, text: chunks[i], parse_mode: "HTML", link_preview_options: { is_disabled: true },
       });
       if (!r.ok) {
         // HTML payload probably broke the parser — retry the same chunk as plain text.
         this.log.warn(`telegram: sendMessage HTML failed (${r.status}): ${r.description ?? ""}; retrying as plain text`);
         for (const plain of chunkText(htmlToPlain(chunks[i]!), TG_MSG_LIMIT)) {
-          r = await this.api.call<{ message_id: number }>("sendMessage", {
+          r = await this.call<{ message_id: number }>("sendMessage", {
             ...base, text: plain, link_preview_options: { is_disabled: true },
           });
           if (!r.ok) this.log.error(`telegram: plain fallback failed (${r.status}): ${r.description ?? ""}`);
@@ -132,7 +176,7 @@ export class TelegramAdapter implements PlatformAdapter {
     if (!Number.isFinite(id)) return false;
     const chunks = chunkHtml(markdownToTelegramHtml(markdown), TG_HTML_LIMIT);
     if (chunks.length !== 1) return false; // multi-chunk edits unsupported → caller sends instead
-    const r = await this.api.call("editMessageText", {
+    const r = await this.call("editMessageText", {
       chat_id: ref.chatId, message_id: id, text: chunks[0], parse_mode: "HTML", link_preview_options: { is_disabled: true },
     });
     if (r.ok || r.description?.includes("message is not modified")) return true;
@@ -143,7 +187,7 @@ export class TelegramAdapter implements PlatformAdapter {
   async delete(ref: MsgRef): Promise<boolean> {
     const id = Number(ref.messageId);
     if (!Number.isFinite(id)) return false;
-    const r = await this.api.call("deleteMessage", { chat_id: ref.chatId, message_id: id });
+    const r = await this.call("deleteMessage", { chat_id: ref.chatId, message_id: id });
     if (r.ok || r.description?.includes("message to delete not found")) return true;
     this.log.warn(`telegram: deleteMessage failed (${r.status}): ${r.description ?? ""}`);
     return false;
@@ -155,7 +199,7 @@ export class TelegramAdapter implements PlatformAdapter {
     const dropped = emojis.filter((e) => !TG_REACTION_EMOJIS.has(normalizeEmoji(e)));
     if (dropped.length) this.log.warn(`telegram: dropping unsupported reactions: ${dropped.join(" ")}`);
     if (!supported.length && emojis.length) return;
-    const r = await this.api.call("setMessageReaction", {
+    const r = await this.call("setMessageReaction", {
       chat_id: ref.chatId, message_id: Number(ref.messageId),
       reaction: supported.map((emoji) => ({ type: "emoji", emoji })), is_big: false,
     });
@@ -164,7 +208,7 @@ export class TelegramAdapter implements PlatformAdapter {
 
   async typing(target: Target): Promise<void> {
     try {
-      await this.api.call("sendChatAction", {
+      await this.call("sendChatAction", {
         chat_id: target.chatId, action: "typing",
         ...(target.threadId ? { message_thread_id: Number(target.threadId) } : {}),
       });
@@ -178,7 +222,7 @@ export class TelegramAdapter implements PlatformAdapter {
       : `<b>${escapeHtml(req.title)}</b>`;
     const text = chunkHtml(html, TG_HTML_LIMIT)[0] ?? escapeHtml(req.title);
     const keyboard = req.options.map((label, i) => [{ text: label.slice(0, 64), callback_data: `c:${token}:${i}` }]);
-    const r = await this.api.call<{ message_id: number }>("sendMessage", {
+    const r = await this.call<{ message_id: number }>("sendMessage", {
       ...this.targetFields(target, true), text, parse_mode: "HTML",
       link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: keyboard },
     });
@@ -218,7 +262,7 @@ export class TelegramAdapter implements PlatformAdapter {
       commands.push({ command: name, description: (c.description || "-").slice(0, 256) });
       if (commands.length >= 100) break; // Telegram limit
     }
-    const r = await this.api.call("setMyCommands", { commands });
+    const r = await this.call("setMyCommands", { commands });
     if (r.ok) this.log.info(`telegram: registered ${commands.length} command(s)`);
     else this.log.warn(`telegram: setMyCommands failed (${r.status}): ${r.description ?? ""}`);
   }
@@ -247,8 +291,9 @@ export class TelegramAdapter implements PlatformAdapter {
       try {
         const r = await this.api.call<TgUpdate[]>("getUpdates", {
           offset: this.offset, timeout: this.opts.pollSeconds, allowed_updates: ALLOWED_UPDATES,
-        }, this.abort?.signal);
+        }, this.abort?.signal, this.opts.pollSeconds * 1000 + 15_000);
         if (!r.ok || !Array.isArray(r.result)) {
+          this.noteFail(`getUpdates: ${r.status} ${r.description ?? ""}`.trim());
           if (r.status === 409) this.log.error("telegram: getUpdates 409 — another poller is using this bot token");
           else this.log.warn(`telegram: getUpdates failed (${r.status}): ${r.description ?? ""}`);
           await sleep(backoff, this.abort?.signal);
@@ -256,6 +301,7 @@ export class TelegramAdapter implements PlatformAdapter {
           continue;
         }
         backoff = 1000;
+        this.noteOk("poll");
         for (const update of r.result) {
           this.offset = Math.max(this.offset, update.update_id + 1);
           try { await this.handleUpdate(update); }
@@ -263,6 +309,7 @@ export class TelegramAdapter implements PlatformAdapter {
         }
       } catch (err) {
         if (this.abort?.signal.aborted) break;
+        this.noteFail(`getUpdates: ${err instanceof Error ? err.message : String(err)}`);
         this.log.warn("telegram: poll loop error", { err });
         await sleep(backoff, this.abort?.signal);
         backoff = Math.min(backoff * 2, 30_000);
@@ -376,7 +423,7 @@ export class TelegramAdapter implements PlatformAdapter {
   /** Replace the prompt (removing its keyboard) with the outcome line on top. */
   private async finishChoice(chatId: string, messageId: number, html: string, outcome: string): Promise<void> {
     const text = `${escapeHtml(outcome)}\n\n${html}`;
-    const r = await this.api.call("editMessageText", {
+    const r = await this.call("editMessageText", {
       chat_id: chatId, message_id: messageId, text: text.length > TG_HTML_LIMIT ? escapeHtml(outcome) : text,
       parse_mode: "HTML", link_preview_options: { is_disabled: true },
     });
@@ -385,7 +432,7 @@ export class TelegramAdapter implements PlatformAdapter {
 
   private async answer(callbackQueryId: string, text?: string): Promise<void> {
     try {
-      await this.api.call("answerCallbackQuery", { callback_query_id: callbackQueryId, ...(text ? { text } : {}) });
+      await this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, ...(text ? { text } : {}) });
     } catch { /* must not throw from the poll loop */ }
   }
 
@@ -415,13 +462,13 @@ export class TelegramAdapter implements PlatformAdapter {
 
   private async download(file: TgFile, kind: Attachment["kind"], scope: string, prefix: string): Promise<Attachment | null> {
     try {
-      const meta = await this.api.call<{ file_path?: string }>("getFile", { file_id: file.file_id });
+      const meta = await this.call<{ file_path?: string }>("getFile", { file_id: file.file_id });
       const filePath = meta.result?.file_path;
       if (!meta.ok || !filePath) {
         this.log.warn(`telegram: getFile failed for ${kind} (${meta.status}): ${meta.description ?? "no file_path"}`);
         return null;
       }
-      const res = await fetch(this.api.fileUrl(filePath));
+      const res = await fetch(this.api.fileUrl(filePath), { signal: AbortSignal.timeout(120_000) });
       if (!res.ok) {
         this.log.warn(`telegram: file download failed (${res.status})`);
         return null;

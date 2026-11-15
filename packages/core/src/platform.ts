@@ -103,10 +103,31 @@ export interface InboundSink {
   unknownSender?(s: UnknownSender): void;
 }
 
+/** What an adapter knows about its own connection (docs §11.4): the daemon's channel supervisor merges it into the
+ *  channel's health. Times are epoch ms. */
+export interface PlatformHealth {
+  /** Last successful receive (poll / event / socket message). */
+  lastPollAt?: number;
+  /** Last successful outbound API call (send, edit, react…). */
+  lastSendAt?: number;
+  lastError?: string;
+  lastErrorAt?: number;
+  /** API calls that failed in a row (any success resets it). */
+  consecutiveFailures: number;
+}
+
+/** Thrown by start() for an error retrying won't fix (bad token: 401/404). The channel is marked failed. */
+export class PlatformStartError extends Error {
+  readonly permanent = true;
+  constructor(message: string) { super(message); this.name = "PlatformStartError"; }
+}
+
 export interface PlatformAdapter {
   readonly name: string;
   readonly capabilities: PlatformCapabilities;
-  start(sink: InboundSink): Promise<void>;
+  /** Connect and begin receiving. The daemon calls it in the background with a deadline (and an abort signal) and
+   *  retries with backoff; it must not block on the platform beyond the signal. */
+  start(sink: InboundSink, signal?: AbortSignal): Promise<void>;
   stop(): Promise<void>;
   /** Send markdown text (adapter converts + chunks). Returns ref of the FIRST chunk. */
   send(target: Target, markdown: string): Promise<MsgRef | undefined>;
@@ -122,6 +143,8 @@ export interface PlatformAdapter {
   setCommands?(cmds: PlatformCommand[]): Promise<void>;
   /** Users approved by pairing: accepted like allowedUserIds, but never operators. Replaces the previous set. */
   setPairedUsers?(userIds: string[]): void;
+  /** Connection health (optional; without it only the supervisor's own start state is shown). */
+  health?(): PlatformHealth;
   /** Default targets for operator notifications (e.g. allowed DM user ids). */
   operatorTargets(): Target[];
   /** Resolve a v2-style target string ("telegram:<chatId>") into a Target. */
