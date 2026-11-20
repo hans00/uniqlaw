@@ -134,6 +134,19 @@ function parseSurvey(pane: string): PermissionDialog | null {
   };
 }
 
+/** Lines the TUI rewrites while one dialog sits open: the rotating `Tip:` hint, and auto mode's countdown
+ *  ("Claude Code will automatically block this request in 0:42") or any other ticking timer. They are left out of
+ *  the parsed dialog, so a tick is a redraw of the same request, not a new one (each new one is a prompt to the
+ *  operator, and each replaced one a "Cancelled" edit). */
+export function isVolatileLine(line: string): boolean {
+  const t = line.trim();
+  if (/^Tip:/i.test(t)) return true;
+  // Narrow on purpose: a request's own text ("timeout 30s curl …", "make git automatically run hooks") must stay.
+  if (/^Claude(?: Code)? will (?:be )?automatically\b/i.test(t)) return true;
+  if (/\bwill (?:be )?automatically \w+\b.*\b(?:in|within) \d/i.test(t)) return true;
+  return /\b(?:auto[- ]?(?:deny|block|reject|approve|allow)\w*|times? out|expires?)\s+in\s+\d{1,2}(?::\d{2}\b|\s*s\b)/i.test(t);
+}
+
 /** A numbered option row, optionally carrying the `❯` cursor. */
 const BLOCK_OPTION_RE = /^\s*(?:❯\s*)?\d+\.\s+(.+?)\s*$/;
 
@@ -157,6 +170,7 @@ function parseBlockDialog(pane: string): PermissionDialog | null {
       continue;
     }
     const t = line.trim();
+    if (t && isVolatileLine(t)) continue;
     if (!t || /\b(?:esc|enter|tab) to\b/i.test(t) || /^[─▔╌]{3,}/.test(t) || !options.length) break;
     options[options.length - 1] += ` ${t}`;
   }
@@ -168,6 +182,7 @@ function parseBlockDialog(pane: string): PermissionDialog | null {
     const raw = beforeLines[i];
     const trimmed = raw.trim();
     if (/^─+$/.test(trimmed)) break;
+    if (isVolatileLine(trimmed)) continue;
     ctx.unshift(raw);
     if (ctx.length >= 20) break;
   }
@@ -197,7 +212,7 @@ function parseBlockDialog(pane: string): PermissionDialog | null {
 function stableQuestion(question: string): string {
   return question
     .split("\n")
-    .filter((l) => !/^\s*Tip:/i.test(l))
+    .filter((l) => !isVolatileLine(l))
     .join("\n");
 }
 
@@ -231,6 +246,7 @@ function parseQuestionDialog(pane: string): PermissionDialog | null {
     const t = lines[i].trim();
     if (!t) continue;
     if (/^[─▔╌—_-]{3,}$/.test(t)) break;
+    if (isVolatileLine(t)) continue;
     ctx.unshift(t.replace(/^☐\s*/, ""));
   }
   const question = ctx.join("\n").trim();

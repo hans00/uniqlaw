@@ -832,6 +832,10 @@ that hides it briefly, or redraws the same tool and request with other option te
 replaced by a different one; the Agent SDK aborted `canUseTool`), when the turn ends, or when the session closes, detaches or is reset, the chat prompt is cancelled
 ("↩️ Cancelled — resolved elsewhere", buttons removed, the adapter's pending entry dropped) and nothing is answered.
 So `timeoutSec: 0` can't freeze a turn or a graceful restart's drain. This applies with the judge off too.
+claude-tmux forwards a new dialog only once it has stayed on screen for 2 s (`timings.dialogGraceMs`): in auto mode
+Claude Code draws the dialog while its classifier decides, and one settled within that time is never asked. Lines the
+TUI rewrites while the dialog sits open (the `Tip:` hint, auto mode's "will automatically block this request in 0:42"
+countdown) are not part of the dialog's identity, so a tick is a redraw, not a new request.
 
 **claude-tmux: the `PermissionRequest` hook.** With a judge on (and `ask-operator`), claude-tmux writes its settings
 (native memory and an HTTP hook) to `<stateDir>/claude-tmux/<session>/settings.json` (mode 0600) and passes

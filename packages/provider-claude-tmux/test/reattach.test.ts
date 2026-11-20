@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { silentLogger, type AgentEvent } from "@uniqlaw/core";
 import { ClaudeTmuxSession } from "../src/session.ts";
+import { isVolatileLine } from "../src/dialogs.ts";
 import type { Tmux } from "../src/tmux.ts";
 
 const DIALOG = readFileSync(join(import.meta.dir, "fixtures", "permission-dialog-2.1.319.txt"), "utf8");
@@ -15,7 +16,8 @@ class FakeTmux {
   pane = READY;
   keys: string[] = [];
   alive = true;
-  async capture() { if (!this.alive) throw new Error("no session"); return this.pane; }
+  captures = 0;
+  async capture() { if (!this.alive) throw new Error("no session"); this.captures++; return this.pane; }
   async paneDead() { return false; }
   async hasSession() { return this.alive; }
   async sendKeys(_n: string, ...k: string[]) { this.keys.push(...k); }
@@ -31,10 +33,10 @@ afterEach(async () => {
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
-function make(tmux: FakeTmux, extra: { respawn?: () => Promise<void> } = {}) {
+function make(tmux: FakeTmux, extra: { respawn?: () => Promise<void> } = {}, timings: { dialogGraceMs?: number } = {}) {
   dir = mkdtempSync(join(tmpdir(), "uq-tmux-"));
   const s = new ClaudeTmuxSession({ tmux: tmux as unknown as Tmux, name: "t", providerSessionId: "00000000-0000-0000-0000-000000000001",
-    cwd: dir, env: { CLAUDE_CONFIG_DIR: dir }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10, dialogWithdrawnMs: 300 }, readyTimeoutMs: 2000, ...extra }, "end");
+    cwd: dir, env: { CLAUDE_CONFIG_DIR: dir }, log: silentLogger, timings: { pollRunningMs: 10, pollIdleMs: 10, dialogWithdrawnMs: 300, dialogGraceMs: 50, ...timings }, readyTimeoutMs: 2000, ...extra }, "end");
   sessions.push(s);
   const events: AgentEvent[] = [];
   void (async () => { for await (const ev of s.events) events.push(ev); })();
@@ -189,6 +191,102 @@ test("a different request replacing the dialog withdraws the old one at once", a
   tmux.pane = DIALOG.replaceAll('FOO=$(date +%s); echo "$FOO" > out.txt', "rm -rf build");
   await until(() => events.filter((e) => e.type === "permission_request").length === 2);
   expect(events.some((e) => e.type === "permission_withdrawn")).toBe(true);
+});
+
+// Auto mode draws a dialog while its classifier decides; most are settled within a second. Forwarding each one
+// would send the operator a prompt and then a "Cancelled — resolved elsewhere" edit (a burst of them hit Telegram 429).
+const OTHER = DIALOG.replaceAll('FOO=$(date +%s); echo "$FOO" > out.txt', "rm -rf build");
+const nextPoll = async (tmux: FakeTmux) => { const n = tmux.captures; await until(() => tmux.captures > n); };
+const asked = (events: AgentEvent[]) => events.filter((e) => e.type === "permission_request") as Extract<AgentEvent, { type: "permission_request" }>[];
+
+test("grace period: a dialog gone after one poll is never forwarded (no prompt, no withdrawal)", async () => {
+  const tmux = new FakeTmux();
+  const { s, events } = make(tmux, {}, { dialogGraceMs: 2000 });
+  await s.start({ reattach: true });
+  tmux.pane = DIALOG;
+  await nextPoll(tmux);
+  tmux.pane = READY;
+  await Bun.sleep(2500);
+  expect(asked(events)).toHaveLength(0);
+  expect(events.some((e) => e.type === "permission_withdrawn")).toBe(false);
+}, 10_000);
+
+test("grace period: a dialog that stays on screen past it is forwarded once, and only then", async () => {
+  const tmux = new FakeTmux();
+  const { s, events } = make(tmux, {}, { dialogGraceMs: 2000 });
+  await s.start({ reattach: true });
+  const shown = Date.now();
+  tmux.pane = DIALOG;
+  await Bun.sleep(1500);
+  expect(asked(events)).toHaveLength(0);
+  await until(() => asked(events).length === 1, 3000);
+  expect(Date.now() - shown).toBeGreaterThanOrEqual(1990);
+  await Bun.sleep(500);
+  expect(asked(events)).toHaveLength(1);
+  // Typing waits while it is open; our answer reaches it.
+  await s.respondPermission!(asked(events)[0]!.id, { behavior: "allow" }, 1);
+  expect(tmux.keys.length).toBeGreaterThan(0);
+}, 10_000);
+
+test("grace period: a dialog replaced within it is not forwarded; the replacement is, only if it stays", async () => {
+  const tmux = new FakeTmux();
+  const { s, events } = make(tmux, {}, { dialogGraceMs: 2000 });
+  await s.start({ reattach: true });
+  tmux.pane = DIALOG;
+  await Bun.sleep(1000);
+  tmux.pane = OTHER; // the first one was settled; another request took its place
+  await Bun.sleep(1500); // past the first one's grace, not the second's
+  expect(asked(events)).toHaveLength(0);
+  await until(() => asked(events).length === 1, 3000);
+  expect(String(asked(events)[0]!.input)).toContain("rm -rf build");
+  expect(events.some((e) => e.type === "permission_withdrawn")).toBe(false);
+
+  // A replacement that is itself settled within its grace period: nothing at all.
+  const tmux2 = new FakeTmux();
+  const second = make(tmux2, {}, { dialogGraceMs: 2000 });
+  await second.s.start({ reattach: true });
+  tmux2.pane = DIALOG;
+  await Bun.sleep(800);
+  tmux2.pane = OTHER;
+  await Bun.sleep(800);
+  tmux2.pane = READY;
+  await Bun.sleep(2500);
+  expect(asked(second.events)).toHaveLength(0);
+  expect(second.events.some((e) => e.type === "permission_withdrawn")).toBe(false);
+}, 15_000);
+
+// Auto mode's dialog carries a countdown ("Claude Code will automatically block this request in 0:42") that ticks
+// every second. Taken into the dialog's identity, each tick read as a new request replacing the old one: a withdrawal
+// plus another prompt per second (a burst of askChoice + "Cancelled" edits, then Telegram 429).
+const countdown = (where: "question" | "footer", secs: number) => {
+  const line = ` Claude Code will automatically block this request in 0:${String(secs).padStart(2, "0")}`;
+  return where === "question"
+    ? DIALOG.replace(" Do you want to proceed?", `${line}\n\n Do you want to proceed?`)
+    : DIALOG.replace("   3. No\n", `   3. No\n${line}\n`);
+};
+for (const where of ["question", "footer"] as const) {
+  test(`a ticking auto-mode countdown (${where}) is the same dialog: asked once, never withdrawn`, async () => {
+    const tmux = new FakeTmux();
+    const { s, events } = make(tmux);
+    await s.start({ reattach: true });
+    tmux.pane = countdown(where, 59);
+    await until(() => asked(events).length === 1);
+    for (let secs = 58; secs > 50; secs--) { tmux.pane = countdown(where, secs); await Bun.sleep(100); }
+    expect(asked(events)).toHaveLength(1);
+    expect(events.some((e) => e.type === "permission_withdrawn")).toBe(false);
+    const req = asked(events)[0]!;
+    expect(String(req.input)).not.toContain("automatically block");
+    expect(req.options).toEqual(["Yes", "Yes, and switch to auto mode · auto mode handles these prompts for you", "No"]);
+    await s.respondPermission!(req.id, { behavior: "allow" }, 1);
+    expect(tmux.keys.length).toBeGreaterThan(0);
+  });
+}
+
+test("countdown filter keeps a request's own text", () => {
+  for (const l of ["timeout 30s curl https://x", "Configure git to automatically run hooks", "sleep 5s && echo left in 3"])
+    expect(isVolatileLine(l)).toBe(false);
+  for (const l of [" Tip: auto mode handles these prompts", "Claude Code will automatically block this request in 0:42", "Auto-deny in 30s"])
+    expect(isVolatileLine(l)).toBe(true);
 });
 
 test("processRoot is claude's pane pid (the approval judge checks process ownership against it)", async () => {

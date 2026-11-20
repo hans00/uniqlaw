@@ -14,7 +14,7 @@ import {
 import { answerStartupPrompt, classifyBlocker, closeMcpDialog, reconnectMcp as driveMcpReconnect } from "./mcp.ts";
 import type { Tmux } from "./tmux.ts";
 import { AsyncQueue } from "./queue.ts";
-import { hasReadyPrompt, isLoggedOut, parseLoginPrompt, parsePermissionDialog, type PermissionDialog } from "./dialogs.ts";
+import { hasReadyPrompt, isLoggedOut, isVolatileLine, parseLoginPrompt, parsePermissionDialog, type PermissionDialog } from "./dialogs.ts";
 import { isReady, looksActivelyBusy, isRecoverableApiError, parseUsageLimit, normalizePaneForLiveness, waitForReady, type UsageLimitInfo } from "./pane.ts";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -61,6 +61,9 @@ export interface Timings {
   dialogGonePolls: number;
   /** A dialog must stay gone this long before it is reported withdrawn (a redraw or resize can hide it briefly). */
   dialogWithdrawnMs: number;
+  /** A new dialog is forwarded only once it has stayed on screen this long: in auto mode Claude Code draws the
+   *  dialog while its classifier decides, and most are settled within a second. 0 = forward on first sight. */
+  dialogGraceMs: number;
 }
 
 export const DEFAULT_TIMINGS: Timings = {
@@ -79,6 +82,7 @@ export const DEFAULT_TIMINGS: Timings = {
   modelEchoMs: 5000,
   dialogGonePolls: 3,
   dialogWithdrawnMs: 3000,
+  dialogGraceMs: 2000,
 };
 
 /** Nothing but a limit message and Claude Code's hint lines under it ("/upgrade to increase your usage limit."). */
@@ -160,6 +164,10 @@ export class ClaudeTmuxSession implements AgentSession {
   /** A dialog that left the pane without our answer: reported withdrawn once it stays gone for dialogWithdrawnMs;
    *  if the same request comes back first (redraw, resize), it is the same dialog again. */
   private goneDialog: { id: string; dialog: PermissionDialog; since: number } | null = null;
+  /** A new dialog on screen but not forwarded yet (dialogGraceMs). It still blocks typing, as any dialog does. */
+  private candidateDialog: { id: string; dialog: PermissionDialog; since: number } | null = null;
+  /** A dialog is on the pane (forwarded or still in its grace period): typing would answer it. */
+  private get dialogOpen(): boolean { return !!(this.activeDialog || this.candidateDialog); }
   private pendingSteers: TurnInput[] = [];
 
   // login
@@ -278,7 +286,7 @@ export class ClaudeTmuxSession implements AgentSession {
     const pane = await this.tmux.capture(this.name).catch(() => "");
     const blocker = classifyBlocker(pane);
     return { process: "alive", ...(blocker ? { blocker } : {}), cwd: this.init.cwd,
-      idle: this.state === "idle" && !this.activeDialog && !blocker && isReady(pane) && !looksActivelyBusy(pane) };
+      idle: this.state === "idle" && !this.dialogOpen && !blocker && isReady(pane) && !looksActivelyBusy(pane) };
   }
 
   /** Hold input (state "starting", poller paused) while `fn` drives the pane; afterwards pick up whatever the pane
@@ -305,7 +313,7 @@ export class ClaudeTmuxSession implements AgentSession {
     if (this.closed || this.state === "dead") return "session closed";
     if (this.respawning || this.maintaining) return "already busy with a repair";
     if (this.state !== "idle") return `session is ${this.state}`;
-    if (this.activeDialog) return "a dialog is open";
+    if (this.dialogOpen) return "a dialog is open";
     if (this.pendingSteers.length) return "input is waiting";
     return undefined;
   }
@@ -370,7 +378,7 @@ export class ClaudeTmuxSession implements AgentSession {
   async steer(input: TurnInput): Promise<void> {
     await this.waitReady();
     if (this.state === "idle") return this.send(input);
-    if (this.activeDialog) {
+    if (this.dialogOpen) {
       // Typing now would answer the dialog. Hold until it resolves.
       this.pendingSteers.push(input);
       return;
@@ -382,7 +390,8 @@ export class ClaudeTmuxSession implements AgentSession {
     if (this.state !== "running") return;
     this.interruptAt = Date.now();
     await this.tmux.sendKeys(this.name, "Escape");
-    if (this.activeDialog) { this.activeDialog = null; }
+    this.activeDialog = null;
+    this.candidateDialog = null;
   }
 
   async setModel(model: string): Promise<void> {
@@ -512,6 +521,7 @@ export class ClaudeTmuxSession implements AgentSession {
     this.tentativeAt = 0;
     this.interruptAt = 0;
     this.activeDialog = null;
+    this.candidateDialog = null;
     this.emit({ type: "turn_end", turnId: this.turnId, reason, ...(error ? { error } : {}), ...(limit ? { limit } : {}) });
     this.setIdle();
   }
@@ -619,7 +629,7 @@ export class ClaudeTmuxSession implements AgentSession {
     this.clearTimer("slashTimer");
     this.slashTimer = setTimeout(async () => {
       this.slashTimer = null;
-      if (this.state !== "running" || this.activeDialog) return;
+      if (this.state !== "running" || this.dialogOpen) return;
       const pane = await this.tmux.capture(this.name).catch(() => "");
       if (!looksActivelyBusy(pane) && isReady(pane)) this.endTurn("done");
       else this.armSlashIdle();
@@ -684,14 +694,14 @@ export class ClaudeTmuxSession implements AgentSession {
     const ready = isReady(pane);
 
     // Confirmed end_turn / stop hook: wait for an idle pane (or give up waiting on the heuristic).
-    if (this.pendingEndAt && !this.activeDialog) {
+    if (this.pendingEndAt && !this.dialogOpen) {
       if ((!busy && ready) || now - Math.max(this.pendingEndAt, this.lastActivityAt) > this.t.endConfirmMaxMs) {
         this.endTurn("done");
         return;
       }
     }
     // Tentative (thinking-only) end: only close it if the pane is quiet.
-    if (this.tentativeAt && !this.pendingEndAt && now - this.tentativeAt > this.t.tentativeEndMs && !busy && ready && !this.activeDialog) {
+    if (this.tentativeAt && !this.pendingEndAt && now - this.tentativeAt > this.t.tentativeEndMs && !busy && ready && !this.dialogOpen) {
       this.endTurn("done");
       return;
     }
@@ -715,7 +725,7 @@ export class ClaudeTmuxSession implements AgentSession {
     // nothing to the jsonl, but the pane shows it busy or changing, so it is not a stall.
     const live = this.livenessSignals(now, pane, busy, ready);
     if (live.jsonlQuietMs <= this.t.stallMs) return;
-    const alive = busy || !!this.activeDialog || live.paneQuietMs < this.t.stallMs || (this.toolsInFlight.size > 0 && !ready);
+    const alive = busy || this.dialogOpen || live.paneQuietMs < this.t.stallMs || (this.toolsInFlight.size > 0 && !ready);
     const capped = this.t.busyHardCapMs > 0 && live.jsonlQuietMs >= this.t.busyHardCapMs;
     if (alive && !capped) return;
     if (capped || ready || live.jsonlQuietMs > this.t.stallMaxMs) {
@@ -729,7 +739,7 @@ export class ClaudeTmuxSession implements AgentSession {
   private livenessSignals(now: number, pane: string, busy = looksActivelyBusy(pane), ready = isReady(pane)) {
     const jsonlAt = Math.max(this.stallAt, this.tailer.lastActivityAt);
     return { jsonlQuietMs: now - jsonlAt, paneQuietMs: now - this.paneChangedAt, paneBusy: busy, ready,
-      dialog: !!this.activeDialog, toolsInFlight: this.toolsInFlight.size, jsonlAt, paneChangedAt: this.paneChangedAt };
+      dialog: this.dialogOpen, toolsInFlight: this.toolsInFlight.size, jsonlAt, paneChangedAt: this.paneChangedAt };
   }
 
   /** What core's stall watchdog checks before abandoning a quiet turn (see AgentSession.liveness). */
@@ -743,6 +753,10 @@ export class ClaudeTmuxSession implements AgentSession {
 
   private async checkDialogs(pane: string) {
     const d = parsePermissionDialog(pane);
+    if (!d || d.kind === "login" || d.kind === "survey" || d.kind === "model-switch") {
+      // Gone within its grace period: settled without us (auto mode's classifier, the terminal). Nothing was asked.
+      this.candidateDialog = null;
+    }
     if (!d) {
       if (this.activeDialog && this.dialogMiss++ === 0) this.dialogMissSince = Date.now();
       if (this.activeDialog && this.dialogMiss >= this.t.dialogGonePolls) {
@@ -781,18 +795,30 @@ export class ClaudeTmuxSession implements AgentSession {
     if (prev && (prev.id === d.fingerprint || sameRequest(prev.dialog, d))) {
       this.activeDialog = { id: prev.id, dialog: d };
       this.goneDialog = null;
+      this.candidateDialog = null;
       return;
     }
     // A different dialog replaced the one still waiting for us: that one was settled elsewhere.
-    if (prev) this.emit({ type: "permission_withdrawn", id: prev.id });
-    this.goneDialog = null;
+    if (prev) {
+      this.emit({ type: "permission_withdrawn", id: prev.id });
+      this.activeDialog = null;
+      this.goneDialog = null;
+    }
+    // A new request is forwarded only once it has stayed on screen for dialogGraceMs; one that leaves or changes
+    // before then (auto mode's classifier settled it) is never asked, so the operator sees neither prompt nor cancel.
+    const c = this.candidateDialog;
+    if (c && (c.id === d.fingerprint || sameRequest(c.dialog, d))) c.dialog = d;
+    else this.candidateDialog = { id: d.fingerprint, dialog: d, since: Date.now() };
+    const cand = this.candidateDialog!;
+    if (Date.now() - cand.since < this.t.dialogGraceMs) return;
+    this.candidateDialog = null;
     if (this.state !== "running") { this.state = "running"; this.beginTurn(true); }
-    this.activeDialog = { id: d.fingerprint, dialog: d };
+    this.activeDialog = { id: cand.id, dialog: d };
     this.clearTimer("slashTimer");
     this.clearTimer("denyTimer");
     this.emit({
       type: "permission_request",
-      id: d.fingerprint,
+      id: cand.id,
       tool: guessTool(d.question),
       input: d.question,
       title: dialogTitle(d),
@@ -887,8 +913,8 @@ function dialogTitle(d: PermissionDialog): string {
 
 export function newProviderSessionId(): string { return randomUUID(); }
 
-/** Same tool and same request text (whitespace and rotating `Tip:` lines ignored): a redraw, not a new dialog. */
+/** Same tool and same request text (whitespace, the rotating `Tip:` hint and countdowns ignored): a redraw, not a new dialog. */
 function sameRequest(a: PermissionDialog, b: PermissionDialog): boolean {
-  const norm = (q: string) => q.split("\n").filter((l) => !/^\s*Tip:/i.test(l)).join("").replace(/\s+/g, "");
+  const norm = (q: string) => q.split("\n").filter((l) => !isVolatileLine(l)).join("").replace(/\s+/g, "");
   return a.kind === b.kind && guessTool(a.question) === guessTool(b.question) && norm(a.question) === norm(b.question);
 }
