@@ -97,6 +97,18 @@ describe("outbound", () => {
     expect(post).toMatchObject({ content: "song", message_reference: { message_id: "42" }, files: [{ field: "files[0]", name: "a.mp3", size: 4 }] });
   });
 
+  test("a rate-limited edit waits out retry_after (several times) and lands; edits are paced by editIntervalMs", async () => {
+    expect(adapter.capabilities.editIntervalMs).toBe(1500);
+    const ref = await adapter.send({ platform: "discord", chatId: CH }, "status");
+    fake.rateLimitNext(3, 0.05);
+    const t0 = Date.now();
+    expect(await adapter.edit(ref!, "status 2")).toBe(true);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(140);
+    expect(fake.callsTo("PATCH", /messages\/\d+$/)).toHaveLength(4);
+    fake.rateLimitNext(4, 0.01); // beyond the retries: reported failed (core retries later, never posts anew)
+    expect(await adapter.edit(ref!, "status 3")).toBe(false);
+  });
+
   test("send chunks at the limit, replies to the first chunk; edit/delete/react/typing", async () => {
     const ref = await adapter.send({ platform: "discord", chatId: CH, replyToMessageId: "42" }, "a".repeat(2500));
     const posts = fake.callsTo("POST", /\/channels\/1001\/messages$/);

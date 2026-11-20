@@ -69,6 +69,14 @@ function entryFor(channels: Settings["channels"], channelKey: string): ChannelPo
   return undefined;
 }
 
+/** Tool-status mode for a chat: its settings.channels entry (exact key, prefixes, "defaults"), else output.toolStatus. */
+export function resolveToolStatus(settings: Pick<Settings, "channels" | "output">, channelKey: string): "on" | "off" | "auto" {
+  const set = entryFor(settings.channels, channelKey)?.toolStatus ?? settings.channels.defaults?.toolStatus;
+  if (set) return set;
+  const g = settings.output.toolStatus;
+  return g === true ? "auto" : g === false ? "off" : g;
+}
+
 /**
  * Effective policy for a chat channel. undefined = unrestricted (no entry and no "defaults": installs from before
  * settings.channels keep every tool). Missing fields of an entry fall back to "defaults", then to "*".

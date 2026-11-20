@@ -13,6 +13,8 @@ export function startFakeDiscord(opts: { botId?: string; appId?: string } = {}) 
   let seq = 0;
   let nextId = 5000;
   const files = new Map<string, Uint8Array>();
+  /** The next N REST calls answer 429 with this retry_after (seconds). */
+  let limited = 0, retryAfter = 0.05;
 
   const server = Bun.serve({
     port: 0, hostname: "127.0.0.1",
@@ -38,6 +40,7 @@ export function startFakeDiscord(opts: { botId?: string; appId?: string } = {}) 
         body = text ? JSON.parse(text) : undefined;
       }
       calls.push({ method: req.method, path, body });
+      if (limited > 0) { limited--; return Response.json({ message: "You are being rate limited.", retry_after: retryAfter, global: false }, { status: 429 }); }
       if (req.method === "POST" && /^\/channels\/\d+\/messages$/.test(path)) return Response.json({ id: String(nextId++), channel_id: path.split("/")[2] });
       if (req.method === "POST" && path === "/users/@me/channels") return Response.json({ id: `77${body.recipient_id}`, type: 1 });
       return new Response(null, { status: 204 });
@@ -64,6 +67,7 @@ export function startFakeDiscord(opts: { botId?: string; appId?: string } = {}) 
     sendOp(op: number, d: unknown = null) { socket?.send(JSON.stringify({ op, d })); },
     apiBase: `${base}/api`, gatewayUrl: `ws://127.0.0.1:${server.port}/gateway`, cdnBase: `${base}/cdn`, fileBase: `${base}/files`,
     addFile(name: string, data: Uint8Array) { files.set(name, data); },
+    rateLimitNext(n: number, after = 0.05) { limited = n; retryAfter = after; },
     dispatch(t: string, d: unknown) { socket?.send(JSON.stringify({ op: 0, t, s: ++seq, d })); },
     callsTo: (method: string, re: RegExp) => calls.filter((c) => c.method === method && re.test(c.path)),
     stop: () => server.stop(true),

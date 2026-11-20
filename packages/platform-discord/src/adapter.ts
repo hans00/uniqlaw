@@ -44,6 +44,8 @@ export class DiscordAdapter implements PlatformAdapter {
   readonly name = "discord";
   readonly capabilities: PlatformCapabilities = {
     edit: true, delete: true, reactions: true, buttons: true, typing: true, maxMessageLength: DISCORD_MSG_LIMIT,
+    // Message edits share the channel's rate-limit bucket (5 per 5 s): core coalesces tool-status edits to this pace.
+    editIntervalMs: 1500,
   };
 
   private readonly log: Logger;
@@ -507,7 +509,8 @@ export class DiscordAdapter implements PlatformAdapter {
     return id;
   }
 
-  private async rest(method: string, path: string, body?: unknown, retry = true): Promise<{ ok: boolean; status: number; json: any; text: string }> {
+  /** A 429 is retried after its retry_after (up to 3 times, at most 10 s each): a rate-limited edit still lands. */
+  private async rest(method: string, path: string, body?: unknown, retries = 3): Promise<{ ok: boolean; status: number; json: any; text: string }> {
     try {
       const res = await fetch(`${this.opts.apiBase}${path}`, {
         method,
@@ -517,10 +520,10 @@ export class DiscordAdapter implements PlatformAdapter {
       const text = await res.text().catch(() => "");
       let json: any = null;
       try { json = text ? JSON.parse(text) : null; } catch {}
-      if (res.status === 429 && retry) {
-        const wait = Math.min(Number(json?.retry_after ?? 1) * 1000, 10_000);
-        await sleep(wait);
-        return this.rest(method, path, body, false);
+      if (res.status === 429 && retries > 0) {
+        const after = Number(json?.retry_after ?? res.headers.get("retry-after") ?? 1);
+        await sleep(Math.min(Math.max(Number.isFinite(after) ? after : 1, 0.05) * 1000, 10_000));
+        return this.rest(method, path, body, retries - 1);
       }
       return { ok: res.ok, status: res.status, json, text };
     } catch (err) {

@@ -47,6 +47,7 @@ export class TelegramAdapter implements PlatformAdapter {
   readonly name = "telegram";
   readonly capabilities: PlatformCapabilities = {
     edit: true, delete: true, reactions: true, buttons: true, typing: true, maxMessageLength: TG_MSG_LIMIT,
+    editIntervalMs: 1000,
   };
 
   private readonly api: TelegramApi;

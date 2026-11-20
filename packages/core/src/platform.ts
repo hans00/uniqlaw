@@ -97,6 +97,8 @@ export interface PlatformCapabilities {
   buttons: boolean;
   typing: boolean;
   maxMessageLength: number;
+  /** Minimum gap between edits of one message (rate limits). Tool-status edits are coalesced to this pace. */
+  editIntervalMs?: number;
 }
 
 export interface PlatformCommand {

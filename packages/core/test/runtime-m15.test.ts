@@ -252,7 +252,7 @@ test("stream off: deltas are ignored, finals posted as usual", async () => {
   await until(() => platform.sent.length === 1);
 });
 
-test("tool status bubbles are removed once the reply is delivered; kept on error or silent turns", async () => {
+test("tool status bubbles are removed when the turn ends: with a reply, on error, and on a silent turn", async () => {
   const tool = (id: string) => ({ type: "tool_start" as const, id, name: "Bash", input: { command: "ls" } });
   let turnNo = 0;
   const { mgr, platform } = setup((_i, s) => {
@@ -268,11 +268,9 @@ test("tool status bubbles are removed once the reply is delivered; kept on error
   expect(platform.deletes[0]!.messageId).toBe(String(bubble + 1)); // the (edited-in-place) tool bubble
   expect(platform.sent.some((m) => m.text === "answer")).toBe(true);
 
-  const before = platform.deletes.length;
   await mgr.handleInbound(inbound("two"));
-  await Bun.sleep(100);
+  await until(() => platform.deletes.length === 2);
   await mgr.handleInbound(inbound("three"));
-  await Bun.sleep(100);
-  expect(platform.deletes.length).toBe(before); // error turn and silent turn keep their bubbles
-  expect(platform.sent.filter((m) => m.text.includes("ls")).length).toBe(3); // turns 2 and 3 really posted bubbles
+  await until(() => platform.deletes.length === 3);
+  expect(platform.sent.filter((m) => m.text.includes("ls")).length).toBe(3); // one bubble per turn, each deleted
 });

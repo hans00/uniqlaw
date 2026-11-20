@@ -8,7 +8,7 @@ import type { Settings } from "./config.ts";
 import type { StateStore } from "./state.ts";
 import type { RuntimeEvent, TranscriptKind, TranscriptStore } from "./transcript.ts";
 import { ModelRouter, agenticSchema } from "./model-router.ts";
-import { restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
+import { resolveToolStatus, restrictsNativeTools, type ToolPolicy } from "./channel-policy.ts";
 import { isA2ASession } from "./a2a-policy.ts";
 import { describeTargets, SessionLedger, type TargetReport } from "./targets.ts";
 import { requestDialect } from "./shell.ts";
@@ -116,9 +116,14 @@ interface TurnState {
   stalled?: boolean;
   startedAt: number;
   texts: string[];
+  /** The turn's tool-status message, edited in place (one per turn). */
   toolBubble?: MsgRef;
-  /** Every tool-status message posted this turn: deleted once the turn ends with a delivered reply. */
+  /** Every tool-status message posted this turn (several only on platforms without edits): deleted when the turn
+   *  ends, however it ends. */
   toolBubbles?: MsgRef[];
+  /** Coalesced edits of toolBubble (platform editIntervalMs). closed: the turn is over, nothing more is shown. */
+  status?: { lastEdit: number; shown?: string; timer?: ReturnType<typeof setTimeout>; editing?: boolean; dirty?: boolean;
+    sending?: boolean; closed?: boolean; fails: number };
   /** A reply (not just tool status) reached the chat this turn. */
   delivered?: boolean;
   toolLines: string[];
@@ -525,6 +530,7 @@ export class ChannelRuntime {
       clearTimeout(this.stallTimer);
       clearTimeout(this.resumeTimer);
       this.state = "closed";
+      this.clearToolStatus(this.turn);
       this.turn = undefined;
       s.detach!();
       return;
@@ -545,6 +551,7 @@ export class ChannelRuntime {
     this.cancelPermissions();
     this.hookEscalated = [];
     this.state = "closed";
+    this.clearToolStatus(this.turn);
     this.turn = undefined;
     if (s) await s.close().catch((e) => this.log.warn("close failed", { e: String(e) }));
   }
@@ -911,7 +918,7 @@ export class ChannelRuntime {
         this.observeTool(ev);
         this.record("tool", formatToolStatus(ev.name, ev.input));
         this.noteProgress({ line: `tool: ${ev.name}` }); // name only: inputs may belong to another asker's work
-        if (this.host.settings.output.toolStatus) await this.postToolStatus(formatToolStatus(ev.name, ev.input));
+        await this.postToolStatus(formatToolStatus(ev.name, ev.input));
         return;
       case "tool_end":
         this.observeTool(ev);
@@ -986,7 +993,6 @@ export class ChannelRuntime {
       if (!seg.ref) {
         seg.target = st.target;
         seg.ref = await st.platform.send(st.target, text).catch(() => undefined);
-        if (this.turn) this.turn.toolBubble = undefined;
       } else {
         await st.platform.edit!(seg.ref, text).catch(() => false);
       }
@@ -1070,7 +1076,6 @@ export class ChannelRuntime {
       const ref = await p.send(t, markdown).catch((e) => { this.log.error("send failed", { e: String(e) }); return undefined; });
       if (ref && this.turn) this.turn.delivered = true;
     }
-    if (this.turn) this.turn.toolBubble = undefined; // next tool status starts a new bubble
   }
 
   private isBackgroundTurn() {
@@ -1078,25 +1083,92 @@ export class ChannelRuntime {
     return o.length === 0 || o.every((x) => x.kind === "system" || (x.kind === "peer" && x.mode === "result") || (x.kind === "scheduler" && !x.deliverTo && !x.silent));
   }
 
+  /** Tool status for this turn? Per chat (settings.channels.<key>.toolStatus), else output.toolStatus; "auto" shows it
+   *  only for a turn a human message started, outside group chats. */
+  private toolStatusOn(turn: TurnState): boolean {
+    const mode = resolveToolStatus(this.host.settings, this.channelKey);
+    if (mode !== "auto") return mode === "on";
+    return !this.multiparty && !turn.external && turn.origins.some((o) => o.kind === "human");
+  }
+
+  /** One tool-status message per turn, edited in place. Edits are coalesced to the platform's pace
+   *  (capabilities.editIntervalMs) and a failed edit is retried later, never replaced by a new message: on Discord a
+   *  burst of tool calls used to hit 429 and fall back to one new message per call. */
   private async postToolStatus(line: string) {
-    const target = this.visibleTarget();
     // Hold on to this turn: it may end (or the daemon may detach) while we await the platform.
     const turn = this.turn;
-    if (!target || !turn) return;
-    const p = this.host.platform(target.platform);
-    if (!p) return;
+    if (!turn || turn.status?.closed || !this.toolStatusOn(turn)) return;
+    const target = this.visibleTarget();
+    const p = target && this.host.platform(target.platform);
+    if (!target || !p) return;
     turn.toolLines.push(line);
-    const stream = this.host.settings.output.stream;
-    if (turn.toolBubble && p.edit && stream !== "off") {
-      const lines = turn.toolLines.slice(-8);
-      const ok = await p.edit(turn.toolBubble, lines.join("\n")).catch(() => false);
-      if (ok) return;
-    }
+    if (turn.toolLines.length > 40) turn.toolLines.splice(0, turn.toolLines.length - 40);
+    const st = (turn.status ??= { lastEdit: 0, fails: 0 });
     const { replyToMessageId: _r, ...plain } = target;
-    const bubble = await p.send(plain, line).catch(() => undefined);
-    turn.toolBubble = stream === "replace" ? bubble : undefined;
-    if (bubble) (turn.toolBubbles ??= []).push(bubble);
-    turn.toolLines = [line];
+    if (!p.edit || !p.capabilities.edit) {
+      const ref = await p.send(plain, line).catch(() => undefined);
+      if (ref) this.keepBubble(turn, ref, false);
+      return;
+    }
+    if (turn.toolBubble || st.sending) return this.scheduleStatusEdit(turn, p);
+    st.sending = true;
+    const text = toolStatusText(turn.toolLines);
+    const ref = await p.send(plain, text).catch(() => undefined);
+    st.sending = false;
+    if (!ref) return; // the next tool call tries again
+    st.shown = text;
+    st.lastEdit = Date.now();
+    if (!this.keepBubble(turn, ref, true)) return;
+    if (toolStatusText(turn.toolLines) !== text) this.scheduleStatusEdit(turn, p);
+  }
+
+  /** Track a posted status message; false when the turn ended meanwhile (then it is deleted at once). */
+  private keepBubble(turn: TurnState, ref: MsgRef, edited: boolean): boolean {
+    if (turn.status?.closed) { this.deleteBubble(ref); return false; }
+    if (edited) turn.toolBubble = ref;
+    (turn.toolBubbles ??= []).push(ref);
+    return true;
+  }
+
+  private scheduleStatusEdit(turn: TurnState, p: PlatformAdapter) {
+    const st = turn.status!;
+    if (st.closed) return;
+    if (st.timer || st.editing || st.sending) { st.dirty = true; return; }
+    const wait = Math.max(0, st.lastEdit + (p.capabilities.editIntervalMs ?? 0) * (1 + Math.min(st.fails, 4)) - Date.now());
+    st.timer = setTimeout(() => void this.runStatusEdit(turn, p), wait);
+  }
+
+  private async runStatusEdit(turn: TurnState, p: PlatformAdapter) {
+    const st = turn.status!;
+    st.timer = undefined;
+    st.dirty = false;
+    if (st.closed || !turn.toolBubble) return;
+    const text = toolStatusText(turn.toolLines);
+    if (text === st.shown) return;
+    st.editing = true;
+    const ok = await p.edit!(turn.toolBubble, text).catch(() => false);
+    st.editing = false;
+    st.lastEdit = Date.now();
+    if (ok) { st.shown = text; st.fails = 0; } else st.fails++;
+    // Rate limited (or a transient error): try again, slower. A message that is gone for good stops after a few.
+    if ((st.dirty || !ok) && st.fails < 5) this.scheduleStatusEdit(turn, p);
+  }
+
+  /** The turn is over (any outcome, or the session detaches/closes): no more status, and its messages go. */
+  private clearToolStatus(turn: TurnState | undefined) {
+    if (!turn) return;
+    const st = (turn.status ??= { lastEdit: 0, fails: 0 });
+    st.closed = true;
+    clearTimeout(st.timer);
+    st.timer = undefined;
+    for (const ref of turn.toolBubbles ?? []) this.deleteBubble(ref);
+    turn.toolBubbles = [];
+    turn.toolBubble = undefined;
+  }
+
+  private deleteBubble(ref: MsgRef) {
+    const p = this.host.platform(ref.platform);
+    if (p?.delete && p.capabilities.delete) void p.delete(ref).catch(() => false); // don't hold up the next turn
   }
 
   /** Origins of a turn that was in flight when the daemon detached (once, shortly after reopening). */
@@ -1193,14 +1265,9 @@ export class ChannelRuntime {
     const turn = this.turn;
     this.turn = undefined;
     if (turn) await this.carryTaint(turn);
-    // Tool status is progress, not content: once the reply is in the chat, remove it (like OpenClaw).
-    // Kept when the turn failed or produced no visible reply, so the human can see what it was doing.
-    if (turn?.toolBubbles?.length && reason === "done" && turn.delivered) {
-      for (const ref of turn.toolBubbles) {
-        const p = this.host.platform(ref.platform);
-        if (p?.delete && p.capabilities.delete) void p.delete(ref).catch(() => false); // don't hold up the next turn
-      }
-    }
+    // Tool status is progress, not content: it goes when the turn ends, whatever the outcome (reply, NO_REPLY or
+    // nothing, error, interrupt). Errors are reported in their own message.
+    this.clearToolStatus(turn);
     if (turn) {
       this.record("turn_end", reason + (error ? `: ${error}` : ""), { reason, error });
       this.host.emit?.({ type: "turn_end", channelKey: this.channelKey, reason, error, at: Date.now() });
@@ -1737,4 +1804,9 @@ export function cleanDialogText(s: string): string {
     .map((l) => l.trim())
     .filter((l) => l && !/^[─━╌┄┈═\-_]{3,}$/.test(l) && !/^tip:/i.test(l) && !/^do you want to (proceed|make this edit|create)/i.test(l))
     .join("\n");
+}
+
+/** The tool-status message: the latest calls, newest last. */
+function toolStatusText(lines: string[]): string {
+  return lines.slice(-8).join("\n");
 }

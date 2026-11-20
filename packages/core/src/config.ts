@@ -133,6 +133,9 @@ const channelPolicySchema = z.object({
   tools: z.union([z.literal("*"), z.array(toolGroup)]).optional(),
   /** Groups subtracted from `tools`. */
   deny: z.array(toolGroup).optional(),
+  /** Tool-status message for this chat ("🔧 Bash: ls", edited in place, removed when the turn ends).
+   *  auto: only for turns a human message started, and not in group chats. Default: output.toolStatus. */
+  toolStatus: z.enum(["on", "off", "auto"]).optional(),
 });
 export type ChannelPolicyConfig = z.infer<typeof channelPolicySchema>;
 
@@ -176,7 +179,11 @@ export const settingsSchema = z.object({
   }).prefault({}),
   backgroundNotify: z.object({ mode: z.enum(["last", "all", "off"]).default("last") }).prefault({}),
   output: z.object({
-    toolStatus: z.boolean().default(true),
+    /** Tool-status message ("🔧 Bash: ls"), one per turn, edited in place and removed when the turn ends.
+     *  auto (default): only for turns a human message started (not cron, agent_ask/agent_trigger, worker results,
+     *  heartbeats or system notices), and not in group chats. on: every turn with a chat to show it in. off: never.
+     *  `true` is the old default and means auto; `false` means off. Per chat: channels.<key>.toolStatus. */
+    toolStatus: z.union([z.boolean(), z.enum(["on", "off", "auto"])]).default("auto"),
     thinking: z.boolean().default(false),
     /** Edit-in-place streaming for platforms that support edits. */
     stream: z.enum(["replace", "keep", "off"]).default("replace"),

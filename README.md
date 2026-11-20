@@ -116,8 +116,11 @@ All commands take `--project DIR` (default: current directory). The daemon's HTT
   "channels": {
     "defaults": { "tools": ["chat", "memory"] },
     "telegram:123456789": { "tools": "*" },
-    "discord:5678": { "tools": ["chat", "memory", "web", "files.read"] }
+    "discord:5678": { "tools": ["chat", "memory", "web", "files.read"], "toolStatus": "on" }
   },
+  // Tool-status message ("🔧 Bash: ls"): one per turn, edited in place, deleted when the turn ends.
+  // "auto" (default): only for turns a human message started, and not in group chats. Per chat: channels.<key>.toolStatus.
+  "output": { "toolStatus": "auto" },
   "workers": { "roots": ["~/Projects"], "profiles": ["main", "coder"] },
   "plugins": {
     "telegram": { "token": { "env": "TELEGRAM_BOT_TOKEN" }, "allowedUserIds": ["123456789"] },
