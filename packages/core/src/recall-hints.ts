@@ -74,9 +74,9 @@ interface FileEntry {
    *  letters with digits), `plain` = all lower case. Sentence-initial capitals, headings, front matter, code spans,
    *  URLs, paths and snake_case identifiers count as neither: case there says nothing about the word. */
   named: Map<string, number>; plain: Map<string, number>;
-  /** What the file says it is about: CJK text of its path, headings and front matter `name:` / `description:` /
-   *  `title:`, and that front matter alone (lower case); for words, the words of its headings and that front matter. */
-  title: string; front: string; titleWords: Set<string>; frontWords: Set<string>;
+  /** What the file says it is about: CJK runs of its path, headings and front matter `name:` / `description:` /
+   *  `title:`, and of that front matter alone (lower case); for words, the words of its headings and that front matter. */
+  titleRuns: string[]; frontRuns: string[]; titleWords: Set<string>; frontWords: Set<string>;
 }
 
 /** Text before a word that makes it sentence-initial: list marker / number / time stamp at line start, or a
@@ -124,7 +124,8 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
   // Words of headings and front matter (not of the path, not inside identifiers like project_uniqlaw: file-name
   // prefixes such as project_, ref_, ops_ are generic).
   const proseWords = (t: string) => t.toLowerCase().split(/\s+/).filter((c) => !CODE_CHUNK.test(c)).flatMap((c) => c.match(WORD_RUN) ?? []);
-  return { words, cjk: (lower.match(CJK_RUN) ?? []).join("\n"), named, plain, title, front: front.toLowerCase(),
+  return { words, cjk: (lower.match(CJK_RUN) ?? []).join("\n"), named, plain,
+    titleRuns: title.match(CJK_RUN) ?? [], frontRuns: front.toLowerCase().match(CJK_RUN) ?? [],
     titleWords: new Set(proseWords(`${headings.join("\n")}\n${front.replace(/^\s*\w+\s*:/gm, " ")}`)), frontWords: new Set(proseWords(front.replace(/^\s*\w+\s*:/gm, " "))) };
 }
 
@@ -134,6 +135,13 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
  *  capitalised wherever they appear but are now and then written in lower case (clairic 0.67, snac 1.00 there).
  *  0.5 sits between the two: a name may be lower case as often as not. */
 export const NAME_SHARE = 0.5;
+
+/** A heading / path / front-matter CJK run names `token` when the token is at least half of it: 克立淨 in
+ *  「克立淨空清機」 (two names run together) yes, 話說 in 「用自己的話換句話說」 (a phrase that happens to contain it) no. */
+function namesCjk(runs: string[], token: string): boolean {
+  const n = [...token].length;
+  return runs.some((r) => r.includes(token) && [...r].length <= 2 * n);
+}
 
 function countIn(hay: string, needle: string): number {
   let n = 0;
@@ -210,14 +218,14 @@ export class RecallHinter {
       for (const [path, f] of this.files) {
         const c = tok.cjk ? (f.cjk.includes(tok.token) ? countIn(f.cjk, tok.token) : 0) : (f.words.get(tok.token) ?? 0);
         if (!c) continue;
-        hits.push({ path, f, count: c, front: tok.cjk ? f.front.includes(tok.token) : f.frontWords.has(tok.token),
-          title: tok.cjk ? f.title.includes(tok.token) : f.titleWords.has(tok.token) });
+        hits.push({ path, f, count: c, front: tok.cjk ? namesCjk(f.frontRuns, tok.token) : f.frontWords.has(tok.token),
+          title: tok.cjk ? namesCjk(f.titleRuns, tok.token) : f.titleWords.has(tok.token) });
         if (hits.length > maxDf) break; // common: not a hit
       }
       if (!hits.length || hits.length > maxDf) continue;
       // The name signal (see below the loop).
       if (tok.cjk) {
-        // CJK has no case: the target file must name it in its path, a heading or its front matter.
+        // CJK has no case: a run of the target file's path, headings or front matter must be at least half this token (namesCjk).
         if (!hits.some((h) => h.title)) continue;
       } else {
         const nameLike = hits.reduce((a, h) => a + (h.f.named.get(tok.token) ?? 0), 0);
@@ -237,7 +245,7 @@ export class RecallHinter {
     //  - Latin words: at least NAME_SHARE of their prose occurrences across memory are written like a name; with no
     //    telling occurrence at all (only at sentence starts, in headings or code), a file holding it names it in its
     //    path, a heading or its front matter.
-    //  - CJK: the best file's path, headings or front matter contain it. A CJK name that is only in note bodies is
+    //  - CJK: a run of the best file's path, headings or front matter that it makes up at least half of (namesCjk). A CJK name that is only in note bodies is
     //    not found: without case or word boundaries it looks like any rare pair of words.
     // Adjacent CJK trigrams of one run with the same best file are joined into one phrase.
     type Label = { text: string; path: string; df: number; first: number; run?: number; end?: number };

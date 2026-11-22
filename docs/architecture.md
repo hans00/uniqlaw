@@ -470,7 +470,7 @@ UniQlaw has its own long-term memory so it survives provider changes (Claude Cod
     - Latin words: over all files holding the word, at least half (`NAME_SHARE`) of its uses in running prose must be written like a name: capitalised mid-sentence, mixed case, all caps, or letters with digits.
     - The rest of the prose uses (all lower case) count against. Sentence-initial capitals (after a list marker, time stamp or sentence end), headings, front matter, code spans, URLs, paths and snake_case identifiers count for neither side, because case there says nothing about the word.
     - The measured shares are 0.00 for *message/request/history/reply* and 0.67 / 1.00 for *clairic* / *snac* in a corpus built to mirror the real failures. A word with no prose use either way counts if a file holding it names it in a heading or its front matter.
-    - CJK has no case: the best file's path, a heading or its front matter must contain it.
+    - CJK has no case: the best file's path, a heading or its front matter must contain it as at least half of a CJK run there. 克立淨 in 「克立淨空清機」 counts; 話說 in 「用自己的話換句話說」 (a phrase that happens to contain it) does not.
 
   Each hit gives one pointer line, at most `maxHits` 3, rarest first. The best file is the one whose front matter (`name:`, `description:`, `title:`) names the word, then one whose path or heading does, then topic files before daily notes, then the most occurrences. Several words of one file share a line. "+N more files" counts the other files holding the most widespread word of the line. The lines sit between the source line and `Message:`:
   ```

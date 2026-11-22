@@ -135,6 +135,12 @@ describe("recall hints", () => {
     expect(hinter.lookup("林志遠 下週會來嗎")).toEqual([{ path: "topics/people_lin.md", df: 1, spread: 1, tokens: ["林志遠"] }]);
     expect(hinter.lookup("明天跟林志遠約了")).toEqual([{ path: "topics/people_lin.md", df: 1, spread: 1, tokens: ["林志遠"] }]);
     expect(hinter.lookup("那個語音轉寫服務還在跑嗎")).toEqual([]);
+    // A heading run that merely contains the token (a phrase, not a name) is no signal: the token must be at least
+    // half of the run. 話說 in 「用自己的話換句話說」 no; 林志遠 in 「林志遠」 and 克立淨 in 「克立淨空清機」 yes.
+    writeFileSync(join(dir, "topics", "ref_lecture_forgetting.md"), "# Post-training\n\n### (3) Paraphrase（用自己的話換句話說）\n\n- 話說回來，這招有用。\n");
+    expect(hinter.lookup("話說 clairic 發佈了")).toEqual([{ path: "ref_paper_261023_clairic_extraction.md", df: 3, spread: 3, tokens: ["clairic"] }]);
+    writeFileSync(join(dir, "topics", "proj_air.md"), "# 克立淨空清機 逆向\n\n- 克立淨的空清機連線不穩。\n");
+    expect(hinter.lookup("克立淨的空清機又連不上了")).toEqual([{ path: "topics/proj_air.md", df: 1, spread: 1, tokens: ["克立淨", "空清機"] }]);
     // Only in body text (no heading, no path): without case or a dictionary it looks like any rare pair of words.
     expect(hinter.lookup("王大明 來了嗎")).toEqual([]);
     expect(hinter.lookup("明天跟王大明約了")).toEqual([]);
