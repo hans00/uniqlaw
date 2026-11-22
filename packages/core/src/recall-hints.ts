@@ -1,8 +1,8 @@
 // Memory recall hints (docs §8.7): before a turn, words of the incoming message that are rare in memory get a
 // one-line pointer to the memory file that has them, so the agent knows to look before answering as if it never
 // discussed them. No list of names or words: a token is a hit only when few memory files contain it (common words
-// are in many files; names never written to memory are in none) and, unless it is a CJK phrase of ≥ 4 characters,
-// memory writes it like a name somewhere (see lookup). Nothing is added when nothing matches.
+// are in many files; names never written to memory are in none) and memory consistently treats it as a name (see
+// lookup). Words already in MEMORY.md (the prompt) are skipped. Nothing is added when nothing matches.
 import { readFileSync, statSync } from "node:fs";
 import { MEMORY_FILE, type MemoryStore } from "./memory.ts";
 import type { Origin } from "./origin.ts";
@@ -52,8 +52,9 @@ export function messageTokens(text: string): MessageToken[] {
   const out: MessageToken[] = [];
   const seen = new Set<string>();
   const add = (t: MessageToken) => { if (out.length < MAX_MESSAGE_TOKENS && !seen.has(t.token)) { seen.add(t.token); out.push(t); } };
-  // A URL's scheme and host name a site, not the subject: only its path counts (huggingface.co/Cloudflare/clairic → cloudflare, clairic).
-  const lower = text.toLowerCase().replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/?#]*/g, " ");
+  // A URL's scheme and host name a site, not the subject: only its path counts (huggingface.co/Cloudflare/clairic →
+  // cloudflare, clairic). A local path (/tmp/…, ~/…, ./…) names a place on disk: none of it counts.
+  const lower = text.toLowerCase().replace(/(^|\s)[~.]{0,2}\/\S*/g, " ").replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/?#]*/g, " ");
   for (const m of lower.matchAll(WORD_RUN)) if ([...m[0]].length >= 3 && !/^\p{N}+$/u.test(m[0])) add({ token: m[0], cjk: false });
   let run = 0;
   for (const m of lower.matchAll(CJK_RUN)) {
@@ -69,35 +70,70 @@ interface FileEntry {
   mtime: number; size: number;
   /** Word counts, and the CJK text (runs joined by "\n") for n-gram lookup. */
   words: Map<string, number>; cjk: string;
-  /** Name signals. Words: `strong` = written like a name at least once (capitalised mid-sentence, mixed case, all
-   *  caps, letters with digits, in `backticks`); `caps` = how often written capitalised anywhere. CJK has no case:
-   *  the CJK text of the file's path and headings. */
-  strong: Set<string>; caps: Map<string, number>; namedCjk: string;
+  /** How each word is written in running prose: `named` = like a name (capitalised mid-sentence, mixed case, all caps,
+   *  letters with digits), `plain` = all lower case. Sentence-initial capitals, headings, front matter, code spans,
+   *  URLs, paths and snake_case identifiers count as neither: case there says nothing about the word. */
+  named: Map<string, number>; plain: Map<string, number>;
+  /** What the file says it is about: CJK text of its path, headings and front matter `name:` / `description:` /
+   *  `title:`, and that front matter alone (lower case); for words, the words of its headings and that front matter. */
+  title: string; front: string; titleWords: Set<string>; frontWords: Set<string>;
 }
 
-/** Sentence or line start before a capital: no name signal (The, Weekly…). */
-const SENTENCE_START = /(^|[.!?。！？:：\n#>*"'“「(\[-])\s*$/u;
+/** Text before a word that makes it sentence-initial: list marker / number / time stamp at line start, or a
+ *  sentence-ending or opening punctuation mark. */
+const INITIAL_PREFIX = /^\s*(?:[-*+]|\d+[.)])?\s*(?:\d{1,2}:\d{2}\s*)?(?:\*\*|__)?\s*$/u;
+const INITIAL_PUNCT = /[.!?。！？:：>"'“「（(\[—–-]\s*$/u;
+/** A whitespace-separated chunk that is a path, URL, file name or identifier. */
+const CODE_CHUNK = /[\/\\_]|:\/\/|\p{L}\.\p{L}/u;
+
+function frontMatter(text: string): string {
+  const m = text.match(/^---\n([\s\S]*?)\n---/);
+  return m ? m[1]!.split("\n").filter((l) => /^\s*(name|description|title)\s*:/i.test(l)).join("\n") : "";
+}
 
 function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"> {
   const text = content.replace(/<!--[\s\S]*?-->/g, " ");
   const lower = text.toLowerCase();
   const words = new Map<string, number>();
   for (const m of lower.matchAll(WORD_RUN)) words.set(m[0], (words.get(m[0]) ?? 0) + 1);
-  const strong = new Set<string>();
-  const caps = new Map<string, number>();
-  for (const m of text.matchAll(WORD_RUN)) {
-    const w = m[0];
-    if (!/^\p{Lu}/u.test(w) && !/\p{N}/u.test(w)) continue;
-    const k = w.toLowerCase();
-    const rest = w.slice(1);
-    if (/^\p{Lu}/u.test(w)) caps.set(k, (caps.get(k) ?? 0) + 1);
-    if ((/\p{Lu}/u.test(rest) && /\p{Ll}/u.test(rest)) || (/^\p{Lu}/u.test(w) && !/\p{Ll}/u.test(w)) || (/\p{L}/u.test(w) && /\p{N}/u.test(w))
-      || (/^\p{Lu}/u.test(w) && !SENTENCE_START.test(text.slice(Math.max(0, m.index! - 8), m.index!)))) strong.add(k);
+  const front = frontMatter(text);
+  const body = (front ? text.replace(/^---\n[\s\S]*?\n---/, "") : text)
+    .replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, " ");
+  const named = new Map<string, number>();
+  const plain = new Map<string, number>();
+  const headings: string[] = [];
+  for (const line of body.split("\n")) {
+    if (/^\s*#/.test(line)) { headings.push(line); continue; }
+    for (const m of line.matchAll(WORD_RUN)) {
+      const w = m[0];
+      const i = m.index!;
+      let a = i, z = i + w.length;
+      while (a > 0 && !/\s/.test(line[a - 1]!)) a--;
+      while (z < line.length && !/\s/.test(line[z]!)) z++;
+      if (CODE_CHUNK.test(line.slice(a, z))) continue;
+      const k = w.toLowerCase();
+      if (w === k) { if (/\p{L}/u.test(w)) plain.set(k, (plain.get(k) ?? 0) + 1); continue; }
+      const rest = w.slice(1);
+      const before = line.slice(0, i);
+      const nameLike = (/\p{Lu}/u.test(rest) && /\p{Ll}/u.test(rest)) || (w.length >= 2 && !/\p{Ll}/u.test(w)) || (/\p{L}/u.test(w) && /\p{N}/u.test(w))
+        || !(INITIAL_PREFIX.test(before) || INITIAL_PUNCT.test(before));
+      if (nameLike) named.set(k, (named.get(k) ?? 0) + 1);
+    }
   }
-  for (const m of text.matchAll(/`([^`\n]{1,60})`/g)) for (const w of m[1]!.toLowerCase().match(WORD_RUN) ?? []) strong.add(w);
-  const headings = text.split("\n").filter((l) => /^\s*#/.test(l)).join("\n");
-  return { words, cjk: (lower.match(CJK_RUN) ?? []).join("\n"), strong, caps, namedCjk: (`${path}\n${headings}`.toLowerCase().match(CJK_RUN) ?? []).join("\n") };
+  const title = `${path}\n${headings.join("\n")}\n${front}`.toLowerCase();
+  // Words of headings and front matter (not of the path, not inside identifiers like project_uniqlaw: file-name
+  // prefixes such as project_, ref_, ops_ are generic).
+  const proseWords = (t: string) => t.toLowerCase().split(/\s+/).filter((c) => !CODE_CHUNK.test(c)).flatMap((c) => c.match(WORD_RUN) ?? []);
+  return { words, cjk: (lower.match(CJK_RUN) ?? []).join("\n"), named, plain, title, front: front.toLowerCase(),
+    titleWords: new Set(proseWords(`${headings.join("\n")}\n${front.replace(/^\s*\w+\s*:/gm, " ")}`)), frontWords: new Set(proseWords(front.replace(/^\s*\w+\s*:/gm, " "))) };
 }
+
+/** Share of a word's prose occurrences, over all memory files that hold it, that must be written like a name.
+ *  Everyday words are lower case in running prose and capitalised mostly at sentence starts, which don't count:
+ *  their share sits near 0 (message, request, history, reply: 0.00 in the English-notes test corpus). Names are
+ *  capitalised wherever they appear but are now and then written in lower case (clairic 0.67, snac 1.00 there).
+ *  0.5 sits between the two: a name may be lower case as often as not. */
+export const NAME_SHARE = 0.5;
 
 function countIn(hay: string, needle: string): number {
   let n = 0;
@@ -116,21 +152,34 @@ export class RecallHinter {
   constructor(private memory: Pick<MemoryStore, "dir" | "files" | "rel">, private opts: RecallHintOptions = DEFAULT_RECALL_HINTS,
     private now: () => number = Date.now) {}
 
-  /** Re-read changed files, drop deleted ones. MEMORY.md is left out: it is in the prompt already. */
+  /** Words and CJK text of MEMORY.md: already in the agent's prompt, so never pointed out. */
+  private inPrompt: { mtime: number; size: number; words: Set<string>; cjk: string } | undefined;
+
+  /** Re-read changed files, drop deleted ones. MEMORY.md is not a target: it is in the prompt already. */
   refresh(): void {
     const seen = new Set<string>();
+    let memSeen = false;
     for (const abs of this.memory.files()) {
       const path = this.memory.rel(abs);
-      if (path === MEMORY_FILE) continue;
       let st;
       try { st = statSync(abs); } catch { continue; }
       if (st.size > MAX_FILE_BYTES) continue;
+      const mtime = Math.floor(st.mtimeMs);
+      if (path === MEMORY_FILE) {
+        memSeen = true;
+        if (this.inPrompt?.mtime === mtime && this.inPrompt.size === st.size) continue;
+        try {
+          const lower = readFileSync(abs, "utf8").toLowerCase();
+          this.inPrompt = { mtime, size: st.size, words: new Set(lower.match(WORD_RUN) ?? []), cjk: (lower.match(CJK_RUN) ?? []).join("\n") };
+        } catch { this.inPrompt = undefined; }
+        continue;
+      }
       seen.add(path);
       const k = this.files.get(path);
-      const mtime = Math.floor(st.mtimeMs);
       if (k && k.mtime === mtime && k.size === st.size) continue;
       try { this.files.set(path, { mtime, size: st.size, ...digest(path, readFileSync(abs, "utf8")) }); } catch { this.files.delete(path); }
     }
+    if (!memSeen) this.inPrompt = undefined;
     for (const p of this.files.keys()) if (!seen.has(p)) this.files.delete(p);
   }
 
@@ -142,7 +191,7 @@ export class RecallHinter {
     const n = this.files.size;
     if (!n) return [];
     const maxDf = Math.max(this.opts.maxDf, Math.floor(this.opts.maxDfRatio * n));
-    type Found = { tok: MessageToken; df: number; best: string; named: boolean };
+    type Found = { tok: MessageToken; df: number; best: string };
     const found: Found[] = [];
     const dfOf = (gram: string) => {
       let d = 0;
@@ -150,40 +199,48 @@ export class RecallHinter {
       return d;
     };
     for (const tok of toks) {
+      // Already in the prompt (MEMORY.md): the hint would say "not in your context" about something that is.
+      if (tok.cjk ? this.inPrompt?.cjk.includes(tok.token) : this.inPrompt?.words.has(tok.token)) continue;
       // A trigram that contains a common word (今天天 ⊃ 今天) is a phrase around that word, not a name.
       if (tok.cjk && [...tok.token].length === 3) {
         const c = [...tok.token];
         if (dfOf(c[0]! + c[1]!) > maxDf || dfOf(c[1]! + c[2]!) > maxDf) continue;
       }
-      const hits: { path: string; count: number }[] = [];
+      const hits: { path: string; f: FileEntry; count: number; front: boolean; title: boolean }[] = [];
       for (const [path, f] of this.files) {
         const c = tok.cjk ? (f.cjk.includes(tok.token) ? countIn(f.cjk, tok.token) : 0) : (f.words.get(tok.token) ?? 0);
         if (!c) continue;
-        hits.push({ path, count: c });
+        hits.push({ path, f, count: c, front: tok.cjk ? f.front.includes(tok.token) : f.frontWords.has(tok.token),
+          title: tok.cjk ? f.title.includes(tok.token) : f.titleWords.has(tok.token) });
         if (hits.length > maxDf) break; // common: not a hit
       }
       if (!hits.length || hits.length > maxDf) continue;
-      // Topic files before daily notes, then most occurrences, then name.
-      hits.sort((a, b) => Number(DAILY_RE.test(a.path)) - Number(DAILY_RE.test(b.path)) || b.count - a.count || a.path.localeCompare(b.path));
-      let named: boolean;
-      if (tok.cjk) named = hits.some((h) => this.files.get(h.path)!.namedCjk.includes(tok.token));
-      else {
-        const fs = hits.map((h) => this.files.get(h.path)!);
-        const capCount = fs.reduce((a, f) => a + (f.caps.get(tok.token) ?? 0), 0);
-        const all = hits.reduce((a, h) => a + h.count, 0);
-        named = fs.some((f) => f.strong.has(tok.token)) || (capCount >= 2 && capCount * 2 >= all);
+      // The name signal (see below the loop).
+      if (tok.cjk) {
+        // CJK has no case: the target file must name it in its path, a heading or its front matter.
+        if (!hits.some((h) => h.title)) continue;
+      } else {
+        const nameLike = hits.reduce((a, h) => a + (h.f.named.get(tok.token) ?? 0), 0);
+        const plain = hits.reduce((a, h) => a + (h.f.plain.get(tok.token) ?? 0), 0);
+        // No prose occurrence that tells (only sentence starts, headings, code): the file's title decides.
+        if (!nameLike && !plain) { if (!hits.some((h) => h.title)) continue; }
+        else if (nameLike < NAME_SHARE * (nameLike + plain)) continue;
       }
-      found.push({ tok, df: hits.length, best: hits[0]!.path, named });
+      // Best file: front matter names it, then path/heading names it, then topic files before daily notes, then
+      // most occurrences, then path.
+      hits.sort((a, b) => Number(b.front) - Number(a.front) || Number(b.title) - Number(a.title)
+        || Number(DAILY_RE.test(a.path)) - Number(DAILY_RE.test(b.path)) || b.count - a.count || a.path.localeCompare(b.path));
+      found.push({ tok, df: hits.length, best: hits[0]!.path });
     }
-    // Labels: a word, or adjacent CJK trigrams of one run with the same best file joined into one phrase.
-    //  - A CJK phrase of ≥ 4 characters counts on rarity alone: a verbatim phrase shared with one note.
-    //  - A lone trigram inside a longer run counts only with the CJK name signal below: otherwise it is mostly the end
-    //    of one word plus the start of the next (麼改比, 近還好), and those are rare in any corpus too.
-    //  - Anything else (a word, a 2-3 character CJK run) counts only if memory writes it like a name: a word capitalised
-    //    mid-sentence, in mixed case, all caps, with digits or in backticks somewhere, or capitalised at least twice
-    //    and at least as often as not; a CJK run in a file's path or a heading. Rarity alone is not enough there: in a
-    //    mostly-Chinese memory, everyday English words (check, project) and short chat words (收到, 好的) are rare too.
-    type Label = { text: string; path: string; df: number; first: number; run?: number; end?: number; named: boolean };
+    // A token is a hit when it is rare (df ≤ maxDf) and memory treats it as a name. Rarity alone is not enough: a
+    // memory of a few hundred files has many everyday words in ≤ 5% of them (message, request, 話說, 專有名詞).
+    //  - Latin words: at least NAME_SHARE of their prose occurrences across memory are written like a name; with no
+    //    telling occurrence at all (only at sentence starts, in headings or code), a file holding it names it in its
+    //    path, a heading or its front matter.
+    //  - CJK: the best file's path, headings or front matter contain it. A CJK name that is only in note bodies is
+    //    not found: without case or word boundaries it looks like any rare pair of words.
+    // Adjacent CJK trigrams of one run with the same best file are joined into one phrase.
+    type Label = { text: string; path: string; df: number; first: number; run?: number; end?: number };
     const labels: Label[] = [];
     found.forEach((f, i) => {
       const last = labels.at(-1);
@@ -193,14 +250,10 @@ export class RecallHinter {
         last.df = Math.min(last.df, f.df);
         return;
       }
-      labels.push({ text: f.tok.token, path: f.best, df: f.df, first: i, named: f.named,
-        ...(f.tok.cjk ? { run: f.tok.run!, end: f.tok.at! } : {}) });
+      labels.push({ text: f.tok.token, path: f.best, df: f.df, first: i, ...(f.tok.cjk ? { run: f.tok.run!, end: f.tok.at! } : {}) });
     });
     const groups = new Map<string, { labels: Label[]; df: number; spread: number; first: number }>();
     for (const l of labels) {
-      const long = l.run !== undefined && [...l.text].length >= 4;
-      // CJK: a lone trigram in a longer run counts too when a file's path or heading has it (明天跟林志遠約了, people_林志遠.md).
-      if (!long && !l.named) continue;
       const g = groups.get(l.path) ?? { labels: [], df: l.df, spread: l.df, first: l.first };
       g.labels.push(l);
       g.df = Math.min(g.df, l.df);

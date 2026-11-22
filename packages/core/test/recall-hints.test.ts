@@ -4,11 +4,11 @@ import { mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ChannelManager, DEFAULT_RECALL_HINTS, MemoryStore, RECALL_HINT_HEADER, RecallHinter, StateStore, messageTokens, parseSettings, silentLogger,
+  ChannelManager, DEFAULT_RECALL_HINTS, MemoryStore, NAME_SHARE, RECALL_HINT_HEADER, RecallHinter, StateStore, messageTokens, parseSettings, silentLogger,
   type InboundMessage, type Origin, type Profile, type RecallHintOptions,
 } from "../src/index.ts";
 import { FakePlatform, FakeProvider } from "./fakes.ts";
-import { GENERIC_MESSAGES, HOLDOUT_GENERIC, HOLDOUT_NAMED, writeHoldoutFixture, writeRecallFixture } from "./recall-fixture.ts";
+import { GENERIC_MESSAGES, HOLDOUT_GENERIC, HOLDOUT_NAMED, REAL_MESSAGES, writeHoldoutFixture, writeRealShapeFixture, writeRecallFixture } from "./recall-fixture.ts";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
@@ -38,8 +38,8 @@ function setup(opts: Partial<RecallHintOptions> = {}) {
 }
 
 describe("tokens", () => {
-  test("words lower-cased, split at URL and file-name punctuation, ≥ 3 chars, no pure numbers, no URL scheme/host; CJK 2/3-char runs whole, longer runs as trigrams", () => {
-    const t = messageTokens("話說 Clairic v2 發佈了 https://huggingface.co/Cloudflare/clairic ref_paper_261023 林志遠").map((x) => x.token);
+  test("words lower-cased, split at URL and file-name punctuation, ≥ 3 chars, no pure numbers, no URL scheme/host, no local paths; CJK 2/3-char runs whole, longer runs as trigrams", () => {
+    const t = messageTokens("話說 Clairic v2 發佈了 https://huggingface.co/Cloudflare/clairic ref_paper_261023 林志遠 /tmp/claude-1000/-home-hans-Projects/ ~/notes x").map((x) => x.token);
     expect(t).toEqual(["clairic", "cloudflare", "ref", "paper", "話說", "發佈了", "林志遠"]);
     expect(messageTokens("今天天氣如何").map((x) => x.token)).toEqual(["今天天", "天天氣", "天氣如", "氣如何"]);
   });
@@ -49,10 +49,10 @@ describe("recall hints", () => {
   test("regression: a name only in topic files → exactly one pointer, to the topic file", () => {
     const { hinter } = setup();
     const block = show(hinter, "tg:1", human, CLAIRIC_MSG);
-    // "Clairic" is in 3 of 30 files (MEMORY.md, which names it too, is left out); the paper note wins over the
-    // daily note and topics/ref_models.md by being a topic file with the most occurrences. "Cloudflare" (from the
-    // URL path) is only in the paper note's model-card link: same file, same line. huggingface.co is a host: no token.
-    expect(block).toBe(`${RECALL_HINT_HEADER}\n- cloudflare, clairic → memory/ref_paper_261023_clairic_extraction.md (+2 more files)`);
+    // "Clairic" is in 3 of 30 files; the paper note wins over the daily note and topics/ref_models.md: its heading
+    // names it. "Cloudflare" is only inside the model-card URL (no prose use: case there says nothing, and the
+    // heading doesn't name it); huggingface.co is a host: no token.
+    expect(block).toBe(`${RECALL_HINT_HEADER}\n- clairic → memory/ref_paper_261023_clairic_extraction.md (+2 more files)`);
   });
 
   test("a generic message adds nothing at all", () => {
@@ -60,11 +60,24 @@ describe("recall hints", () => {
     expect(show(hinter, "tg:1", human, "今天天氣如何，幫我看一下")).toBeUndefined();
   });
 
-  test("false hits on everyday messages stay rare: 1 of 24 (all-bigram CJK tokens without the name signal: 17)", () => {
+  test("no false hit on 24 everyday messages (all-bigram CJK tokens without the name signal: 17)", () => {
     const { hinter } = setup();
-    const hits = GENERIC_MESSAGES.filter((m) => hinter.lookup(m).length);
-    // The one left is a verbatim 4-character phrase from a single note ("九點開會改成十點").
-    expect(hits).toEqual(["提醒我明天早上九點開會"]);
+    expect(GENERIC_MESSAGES.filter((m) => hinter.lookup(m).length)).toEqual([]);
+  });
+
+  test("real failure shapes: the 20 operator messages give only the name hits, each to the right file", () => {
+    const root = mkdtempSync(join(tmpdir(), "uq-recall-real-"));
+    const store = new StateStore(join(root, "state.db"));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }), () => store.close());
+    writeRealShapeFixture(root);
+    // maxDf 6 of 40 files: everyday words in a few files pass the rarity test, as with df ≤ 15 of 304 on the real memory.
+    const hinter = new RecallHinter(new MemoryStore(root, store), { ...DEFAULT_RECALL_HINTS, maxDf: 6 });
+    for (const [m, want] of REAL_MESSAGES) expect([m, hinter.lookup(m).map((h) => h.path)]).toEqual([m, want]);
+    expect(hinter.lookup("克立淨的空清機又連不上了")[0]!.tokens).toEqual(["克立淨", "空清機"]);
+    // SNAC: most occurrences are in the lecture note; the codec project's front matter names it, so it wins.
+    expect(hinter.lookup("SNAC")[0]!.path).toBe("project_codec_cpp.md");
+    // Words of MEMORY.md (in the prompt) are never pointed out, even when rare and name-like elsewhere.
+    expect(hinter.lookup("Gemini 的 Codex 設定")).toEqual([]);
   });
 
   test("held-out notes and messages: no false hit, every name found", () => {
@@ -77,21 +90,34 @@ describe("recall hints", () => {
     for (const [m, path] of HOLDOUT_NAMED) expect(hinter.lookup(m).map((h) => h.path)).toEqual([path]);
   });
 
-  test("short words need a name signal: everyday English and chat words rare in memory are no hit", () => {
-    const { dir, hinter } = setup();
-    writeFileSync(join(dir, "topics", "ops_extra.md"), "# Extra\n\n- the deploy check was green.\n- 收到了新的硬碟。\n");
-    expect(hinter.lookup("check 收到")).toEqual([]);
-    writeFileSync(join(dir, "topics", "ops_extra.md"), "# Extra\n\n- ran `check` on the box.\n");
-    utimesSync(join(dir, "topics", "ops_extra.md"), new Date(), new Date(Date.now() + 5000));
-    expect(hinter.lookup("check").map((h) => h.path)).toEqual(["topics/ops_extra.md"]); // in backticks: a name
+  test("name signal: the share of prose uses written like a name, over all of memory", () => {
+    const { dir, hinter } = setup({ maxDf: 6 });
+    // Everyday words: sentence-initial capitals, NO_REPLY, paths and code spans don't count; lower-case prose does.
+    writeFileSync(join(dir, "n1.md"), "- 10:00 Message from the operator: the reply was late.\n- 11:00 Cleaned /tmp/x and `tmp`; the message queue is fine.\n");
+    writeFileSync(join(dir, "n2.md"), "- 10:00 The NO_REPLY turn left a message behind.\n- Request: check the history.\n- History was kept; the request went through.\n");
+    // Names: capitalised wherever they appear (one lower-case use is fine), mixed case, all caps, letters with digits.
+    writeFileSync(join(dir, "n3.md"), "- 10:00 Read about Zorblax today; zorblax has two stages.\n- Ported it to GitHub; the ABCD codec and the E2B eval.\n- Asked Zorblax people.\n");
+    writeFileSync(join(dir, "n4.md"), "# Kestrel\n\n- Kestrel is the budget app.\n");
+    expect(hinter.lookup("message reply tmp request history check")).toEqual([]);
+    expect(hinter.lookup("zorblax github abcd e2b").flatMap((h) => h.tokens).sort()).toEqual(["abcd", "e2b", "github", "zorblax"]);
+    // Only sentence-initial or in a heading: no prose use tells, so the heading decides.
+    expect(hinter.lookup("kestrel").map((h) => h.path)).toEqual(["n4.md"]);
+    // 收到 is rare here but only in body text: CJK needs the target file's heading, path or front matter.
+    writeFileSync(join(dir, "n5.md"), "- 收到了新的硬碟。\n");
+    expect(hinter.lookup("收到")).toEqual([]);
+    expect(NAME_SHARE).toBe(0.5);
   });
 
-  test("a word in most files is no hit; a word not in memory is no hit; MEMORY.md is not a target", () => {
+  test("a word in most files is no hit; a word not in memory is no hit; MEMORY.md is not a target and its words are skipped", () => {
     const { dir, hinter } = setup();
     expect(hinter.lookup("uniqlaw 使用者")).toEqual([]);
     expect(hinter.lookup("zebracorn quokkafish")).toEqual([]);
-    writeFileSync(join(dir, "MEMORY.md"), "# Memory\n\n- only-here word: florbinate\n");
+    writeFileSync(join(dir, "MEMORY.md"), "# Memory\n\n- only-here word: Florbinate\n");
     expect(hinter.lookup("florbinate")).toEqual([]);
+    expect(hinter.lookup("clairic")).toHaveLength(1);
+    writeFileSync(join(dir, "MEMORY.md"), "# Memory\n\n- Clairic: see ref_paper_261023_clairic_extraction.md\n");
+    utimesSync(join(dir, "MEMORY.md"), new Date(), new Date(Date.now() + 5000));
+    expect(hinter.lookup("clairic")).toEqual([]);
   });
 
   test("the rarity threshold scales with the number of files (max(maxDf, ratio × files))", () => {
@@ -101,15 +127,15 @@ describe("recall hints", () => {
     expect(h2.lookup("clairic").map((h) => h.path)).toEqual(["ref_paper_261023_clairic_extraction.md"]);
   });
 
-  test("several words of one file share a line; CJK: ≥ 4 matching characters, or a name in a heading/path", () => {
+  test("CJK: the best file's heading or path must name it; a name only in note bodies is not found", () => {
     const { dir, hinter } = setup();
     writeFileSync(join(dir, "topics", "people_lin.md"), "# 林志遠\n\n- 林志遠負責語音轉寫服務的部署，常和王大明一起。\n");
     // "做法" is rare in this memory but only in body text: no name signal, no hit.
     expect(hinter.lookup("clairic 的做法")).toEqual([{ path: "ref_paper_261023_clairic_extraction.md", df: 3, spread: 3, tokens: ["clairic"] }]);
     expect(hinter.lookup("林志遠 下週會來嗎")).toEqual([{ path: "topics/people_lin.md", df: 1, spread: 1, tokens: ["林志遠"] }]);
     expect(hinter.lookup("明天跟林志遠約了")).toEqual([{ path: "topics/people_lin.md", df: 1, spread: 1, tokens: ["林志遠"] }]);
-    expect(hinter.lookup("那個語音轉寫服務還在跑嗎")).toEqual([{ path: "topics/people_lin.md", df: 1, spread: 1, tokens: ["語音轉寫服務"] }]);
-    // A CJK name only in body text (no heading, no path) is not found: without a dictionary it looks like any rare pair.
+    expect(hinter.lookup("那個語音轉寫服務還在跑嗎")).toEqual([]);
+    // Only in body text (no heading, no path): without case or a dictionary it looks like any rare pair of words.
     expect(hinter.lookup("王大明 來了嗎")).toEqual([]);
     expect(hinter.lookup("明天跟王大明約了")).toEqual([]);
   });
@@ -195,7 +221,7 @@ describe("in a turn", () => {
     const next = async (n: number) => { for (let i = 0; i < 400 && seen.length < n; i++) await Bun.sleep(5); expect(seen.length).toBe(n); return seen[n - 1]!; };
 
     await mgr.handleInbound(msg("tg:1", CLAIRIC_MSG));
-    expect(await next(1)).toContain(`[Tg from Hans (1)]\n${RECALL_HINT_HEADER}\n- cloudflare, clairic → memory/ref_paper_261023_clairic_extraction.md (+2 more files)\nMessage: 話說 clairic`);
+    expect(await next(1)).toContain(`[Tg from Hans (1)]\n${RECALL_HINT_HEADER}\n- clairic → memory/ref_paper_261023_clairic_extraction.md (+2 more files)\nMessage: 話說 clairic`);
     await mgr.handleInbound(msg("tg:1", "clairic 還有什麼？"));
     expect(await next(2)).not.toContain("Memory recall hint");
     await mgr.handleInbound(msg("tg:1", "今天天氣如何，幫我看一下"));
@@ -242,9 +268,10 @@ test("a message steered into a running turn gets its hint; a failed steer leaves
   expect(session.steered[0]!.text).toContain("- clairic → memory/ref_paper_261023_clairic_extraction.md");
 
   // Steer fails → the input is queued and the next turn carries the hint (it was not marked as shown).
+  writeFileSync(join(root, "memory", "proj_zephyrine.md"), "# Box\n\n- the backup box is called Zephyrine.\n");
   session.steer = async () => { throw new Error("no steer now"); };
-  await mgr.handleInbound(msg("and Kestrel? no: cloudflare"));
+  await mgr.handleInbound(msg("and zephyrine?"));
   finish();
   await wait(() => sent.length === 2);
-  expect(sent[1]).toContain("- cloudflare → memory/ref_paper_261023_clairic_extraction.md");
+  expect(sent[1]).toContain("- zephyrine → memory/proj_zephyrine.md");
 });

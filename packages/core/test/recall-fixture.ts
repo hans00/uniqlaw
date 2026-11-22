@@ -86,8 +86,8 @@ export function writeRecallFixture(root: string): string {
     "- Model card: https://huggingface.co/Cloudflare/clairic",
     "",
   ].join("\n"));
-  // MEMORY.md is in the prompt already: never a hint target, even though it names Clairic.
-  writeFileSync(join(dir, "MEMORY.md"), "# Memory\n\n- 使用者 likes short answers. Clairic paper notes: see ref_paper_261023_clairic_extraction.md\n");
+  // MEMORY.md is in the prompt already: never a hint target, and its words are never pointed out.
+  writeFileSync(join(dir, "MEMORY.md"), "# Memory\n\n- 使用者 likes short answers. Backups: see topics/ops_backup.md\n");
   return dir;
 }
 
@@ -149,4 +149,49 @@ export const HOLDOUT_GENERIC = ["最近有什麼好看的書嗎", "幫我查一�
 export const HOLDOUT_NAMED: [string, string][] = [
   ["kestrel 的圖表做了嗎", "topics/proj_kestrel.md"], ["陳柏宇 最近怎樣", "topics/people_陳柏宇.md"], ["orvane 要更新韌體了嗎", "topics/ref_orvane.md"],
   ["the Orvane router is acting up again", "topics/ref_orvane.md"], ["跟陳柏宇約了吃飯", "topics/people_陳柏宇.md"],
+];
+
+/** The shapes behind the false hits seen on a real memory (304 files, mostly English daily notes): everyday words
+ *  rare enough to pass the df test (each in ≤ 3 of 40 files) written sentence-initially ("Message from …"), in
+ *  NO_REPLY, in /tmp/ and Projects paths, in code spans; a 2-character CJK word (話說) and a 4-character phrase
+ *  (專有名詞) only in note bodies. Names: Clairic (one lower-case use), SNAC (most often in a lecture note, named in
+ *  the codec project's front matter), 克立淨 / 空清機 (in a project heading). Written for these tests. */
+export function writeRealShapeFixture(root: string): string {
+  const dir = join(root, "memory");
+  mkdirSync(dir, { recursive: true });
+  const filler = ["Checked the daemon logs, nothing unusual.", "Ran the test suite; all green.", "Updated the settings docs.", "使用者今天比較忙，回覆簡短。",
+    "Looked at the queue debounce again.", "Reviewed the worker roots.", "整理了一下排程。", "Wrote the weekly summary."];
+  const rare = [
+    "Message from the operator: the cron job ran twice.", "Request timed out; retried it.", "History of the session was handed over.",
+    "The tool-status bubble stayed after a NO_REPLY turn.", "Cleaned /tmp/claude-1000/-home-hans-Projects/ worker dirs.", "Ran `tmp` cleanup and checked `message_id`.",
+    "話說回來，這個設定之前討論過。", "討論了專有名詞要不要翻譯。", "the reply went to the wrong chat.", "Read the request log and the history file.",
+    "Each message edits one bubble now.", "Moved ~/Projects/old to the archive.",
+  ];
+  for (let i = 0; i < 40; i++) {
+    const day = `2026-08-${String(1 + (i % 28)).padStart(2, "0")}${i >= 28 ? `-${i}` : ""}`;
+    const body = [filler[i % filler.length]!, filler[(i + 3) % filler.length]!, ...(i < 36 ? [rare[i % rare.length]!] : [])];
+    if (i === 7) body.push("Read the Clairic paper; the clairic pipeline has two stages.");
+    if (i === 9) body.push("Compared Clairic and SNAC tokens for the speech model.");
+    writeFileSync(join(dir, `${day}.md`), [`# ${day}`, "", ...body.map((l, j) => `- ${10 + j}:00 ${l}`), ""].join("\n"));
+  }
+  writeFileSync(join(dir, "ref_paper_261023_clairic_extraction.md"), "# Clairic extraction paper\n\n- The paper behind Clairic splits layout analysis and field extraction.\n- Model card: https://huggingface.co/Cloudflare/clairic\n");
+  writeFileSync(join(dir, "ref_lecture_L12_speech_lm.md"), "# Lecture 12: speech LMs\n\n- Codec tokens such as SNAC, EnCodec and Mimi.\n- SNAC uses three scales; SNAC tokens are interleaved.\n");
+  writeFileSync(join(dir, "project_codec_cpp.md"), "---\nname: codec.cpp\ndescription: C++ port of neural audio codecs (SNAC first)\n---\n\n# codec.cpp\n\n- Started with the decoder.\n");
+  writeFileSync(join(dir, "project_ecover_cleanstation_re.md"), "# 克立淨空清機 (ecover cleanstation) 逆向\n\n- 克立淨的空清機用雲端 API，連線不穩。\n");
+  writeFileSync(join(dir, "MEMORY.md"), "# Memory\n\n- Operator prefers short answers. Workers: Codex and Gemini profiles.\n");
+  return dir;
+}
+
+/** The 20 real operator messages the real-memory run used, with the hit (file) each should give. */
+export const REAL_MESSAGES: [string, string[]][] = [
+  ["話說 clairic 發佈了，請看一下他們是怎麼做的 https://huggingface.co/Cloudflare/clairic", ["ref_paper_261023_clairic_extraction.md"]],
+  ["手機解鎖了", []], ["直接開工修正... 這還需要問？", []], ["Google 新出了 Neon，看看能不能再補上", []], ["怎麼突然都說英文了", []], ["Hydrogen 有的話也加", []],
+  ["話說你應該有幾個 worker 的暫存目錄在 /tmp/claude-1000/-home-hans-Projects/ ，可以刪除嗎？", []], ["為什麼跳了一大堆權限確認又取消掉？", []],
+  ["看起來應該是系統對於「Claude Code will automatically block this request in XX:XX」的偵測問題", []],
+  ["對了，目前 Discord channel 上有發現一些問題 1. 執行指令之類的非最終訊息會大量洗頻 2. 最終沒有發出訊息的 cron 或 \"NO_REPLY\" 會導致前面發的 tool call history message 殘留", []],
+  ["是說，妳要反省一下如何避免以後又出現記憶搜尋的問題", []],
+  ["我這次並沒有說是「新發布」誒 然後妳長期工作下來 Clairic 本來就只是小小的一件事情，不值得永久在長期記憶", ["ref_paper_261023_clairic_extraction.md"]],
+  ["如何定義「專有名詞」，實際上新名稱永遠做不完", []], ["可以", []], ["Jevling 的 E2B 那邊 eval 跑完了嗎", []], ["BRICKS 的 ctor-bench 資安題再跑一次", []],
+  ["小金老師今天的影片看了嗎", []], ["克立淨的空清機又連不上了", ["project_ecover_cleanstation_re.md"]],
+  ["codec.cpp 的 SNAC 支援做到哪", ["project_codec_cpp.md"]], ["火箭那個 PoC 的顫振還沒做吧", []],
 ];

@@ -463,23 +463,32 @@ UniQlaw has its own long-term memory so it survives provider changes (Claude Cod
   - Any other `*.md` (topic files, `imports/…`) is indexed for search. `.history/` keeps pre-images of `MEMORY.md`.
 - **Tools** (MCP gateway, every provider): `memory_write(text, importance?)` appends to today's note (identical text the same day is not repeated; the `dream` session can't write); `memory_search(query)`; `memory_get(path, from?, lines?)` (cannot leave the memory directory).
 - **Search**: SQLite FTS5 with the `trigram` tokenizer in `state.db`, so substring matching works for Chinese/Japanese; queries shorter than 3 characters fall back to `LIKE`. Ranked by bm25 (normalised within the result set) × recency (30-day half-life) × importance. Files edited by hand are re-indexed by mtime/size on the next search.
-- **Recall hints** (`memory.recallHints`): the agent has `MEMORY.md` in its prompt but often does not search topic files or daily notes when a message names something only they hold. So before a chat message reaches the agent, its words are looked up in an in-memory index of the memory files (`RecallHinter`, `recall-hints.ts`; `MEMORY.md` and `DREAMS.md` left out, re-read by mtime/size on each lookup, about 12 ms for 400 files / 2 MB). No list of names or words is kept. A word is a **hit** when two things hold:
-  - *Rare*: 1 ≤ df ≤ max(`maxDf` 3, `maxDfRatio` 0.05 × files). Common words are in many files and drop out; a name never written to memory is in none, and there is nothing to recall.
-  - *Written like a name* somewhere in memory. In a mostly-Chinese memory, rarity alone also passes everyday English (check, project) and short chat words (收到, 好的). A Latin word must appear capitalised mid-sentence, in mixed case, in all caps, with digits or in `backticks`, or be capitalised at least twice and at least as often as not. A CJK token (no case) must appear in a file's path or a heading. A CJK phrase of ≥ 4 matching characters is exempt: a verbatim phrase shared with one note.
+- **Recall hints** (`memory.recallHints`): the agent has `MEMORY.md` in its prompt but often does not search topic files or daily notes when a message names something only they hold. So before a chat message reaches the agent, its words are looked up in an in-memory index of the memory files (`RecallHinter`, `recall-hints.ts`). The index leaves out `DREAMS.md` and is re-read by mtime/size on each lookup. A first build over 400 files / 2 MB takes about 40 ms and a lookup about 12 ms (synthetic corpus). No list of names or words is kept. A word is a **hit** when all of these hold:
+  - *Not in `MEMORY.md`*: it is in the prompt already. `MEMORY.md` is never a target either.
+  - *Rare*: 1 ≤ df ≤ max(`maxDf` 3, `maxDfRatio` 0.05 × files). Common words are in many files and drop out; a name never written to memory is in none.
+  - *Treated as a name by memory.* Rarity alone is not enough: a few hundred files have many everyday words in ≤ 5% of them. On the real memory, *message*, *request*, *history*, *reply*, *tmp*, *話說* and *專有名詞* all passed the rarity test.
+    - Latin words: over all files holding the word, at least half (`NAME_SHARE`) of its uses in running prose must be written like a name: capitalised mid-sentence, mixed case, all caps, or letters with digits.
+    - The rest of the prose uses (all lower case) count against. Sentence-initial capitals (after a list marker, time stamp or sentence end), headings, front matter, code spans, URLs, paths and snake_case identifiers count for neither side, because case there says nothing about the word.
+    - The measured shares are 0.00 for *message/request/history/reply* and 0.67 / 1.00 for *clairic* / *snac* in a corpus built to mirror the real failures. A word with no prose use either way counts if a file holding it names it in a heading or its front matter.
+    - CJK has no case: the best file's path, a heading or its front matter must contain it.
 
-  Each hit gives one pointer line. The best file is a topic file before a daily note, then the one with the most occurrences. Several words of one file share a line, lines are rarest first, at most `maxHits` 3, and "+N more files" counts the other files holding the most widespread word of the line. The lines sit between the source line and `Message:`:
+  Each hit gives one pointer line, at most `maxHits` 3, rarest first. The best file is the one whose front matter (`name:`, `description:`, `title:`) names the word, then one whose path or heading does, then topic files before daily notes, then the most occurrences. Several words of one file share a line. "+N more files" counts the other files holding the most widespread word of the line. The lines sit between the source line and `Message:`:
   ```
   [Memory recall hint: words in this message appear in memory files that are not in your context. Check them with memory_get / memory_search before answering, if relevant.]
-  - cloudflare, clairic → memory/ref_paper_261023_clairic_extraction.md (+2 more files)
+  - clairic → memory/ref_paper_261023_clairic_extraction.md (+2 more files)
   ```
   With no hit, nothing is added.
 
   **Tokens.**
-  - *Words*: non-CJK letters and digits, split at `_ - . /`, so URL paths and file names come apart. Lower case, ≥ 3 characters, not all digits. A URL's scheme and host are dropped: they name a site, not the subject.
-  - *CJK*: there are no word boundaries. A run of 2–3 characters set off by spaces, punctuation or Latin text is taken whole. A longer run gives character trigrams: adjacent matches into the same file are joined, and a lone trigram counts only with the name signal. A trigram that contains a common bigram (今天天 ⊃ 今天) is dropped.
-  - *Why not bigrams*: overlapping bigrams and lone trigrams of long runs mostly straddle two words, and such pairs are rare in any corpus, so rarity lets them through.
-  - *Measured* on synthetic test corpora (`recall-fixture.ts`, Chinese and English notes with a long tail of one-off sentences): 1 of 24 everyday messages gets a false hit, a verbatim 4-character phrase from one note. All-bigram tokens without the name signal gave 17. On a held-out set written after tuning: 0 of 20 false hits and 5 of 5 names, with one rule (heading/path for lone trigrams) added after that run.
-  - *Cost*: a CJK name that is only in note bodies, never in a heading or file name, is not found unless the message quotes ≥ 4 characters around it. A Latin name always written in lower case and never in backticks is not found either.
+  - *Words*: non-CJK letters and digits, split at `_ - . /`. Lower case, ≥ 3 characters, not all digits.
+  - *Dropped from the message*: a URL's scheme and host (they name a site; the path stays, e.g. `…/Cloudflare/clairic`), and local paths (`/tmp/…`, `~/…`, which name places on disk).
+  - *CJK* has no word boundaries. A run of 2–3 characters set off by spaces, punctuation or Latin text is taken whole. A longer run gives character trigrams; adjacent matches into the same file are joined into one phrase. A trigram containing a common bigram (今天天 ⊃ 今天) is dropped.
+  - *Why not bigrams*: bigrams of long runs mostly straddle two words, and such pairs are rare in any corpus.
+
+  **Measured.**
+  - The 20 real operator messages, on the real-memory shape fixture (`writeRealShapeFixture`): only the 4 name hits, each to the right file. The previous rules gave 6 false lines there.
+  - 0 of 24 everyday messages (`writeRecallFixture`). 0 of 20 on the held-out set, 5 of 5 names.
+  - *Cost*: a CJK name that no heading, path or front matter contains is not found. Neither is a Latin name that memory writes in lower case more often than not.
 
   **Scope.**
   - Messages from chats only by default (`sources: ["human"]`); `"scheduler"` and `"peer"` opt in cron/heartbeat and agent messages.
