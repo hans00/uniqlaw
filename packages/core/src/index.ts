@@ -14,6 +14,7 @@ export * from "./gateway.ts";
 export * from "./model-router.ts";
 export * from "./transcript.ts";
 export * from "./memory.ts";
+export * from "./recall-hints.ts";
 export * from "./dreaming.ts";
 export * from "./pairing.ts";
 export * from "./channel-policy.ts";

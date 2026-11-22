@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   BRAND_PROMPT, ChannelManager, channelPolicyWarnings, ISOLATED_SCOPE_PROMPT, McpGateway, REACTION_PROMPT, SILENT_REPLY_PROMPT, StateStore, TranscriptStore, busToolsPrompt, internalSessionPrompt, expandHome, workerSessionPrompt, workersPrompt,
-  createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, RestartCoordinator, type MemoryOriginKind, type RestartKind,
+  createLogger, dirScopePrompt, memoryPrompt, runDreamSweep, DEFAULT_DREAMING, parseSettings, resolveSecret, MemoryStore, RecallHinter, RestartCoordinator, type MemoryOriginKind, type RestartKind,
   ApprovalAudit, type ApprovalJudge, type ApprovalJudgeConfig, ChannelSupervisor, withDeadline, type SupervisorOptions,
   HealthMonitor, type HealthOptions,
   type AgentProvider, type Credential, type Logger, type PlatformAdapter, type PluginContext, type PluginDef,
@@ -182,6 +182,7 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
     const memory = settings.memory.enabled
       ? new MemoryStore(projectDir, store, { dir: settings.memory.dir, maxInjectBytes: settings.memory.maxInjectBytes, timezone: settings.timezone })
       : undefined;
+    const recall = memory && settings.memory.recallHints.enabled ? new RecallHinter(memory, settings.memory.recallHints) : undefined;
 
     // ── gateway tools + manager ──
     if (memory) {
@@ -205,6 +206,8 @@ export async function startDaemon(projectDirIn: string, opts: DaemonOptions = {}
       approvalJudge: (profile) => judges.get(profile.name),
       approvalAudit,
       systemPrompt: (profile, multiparty, toolNames, session) => buildSystemPrompt(projectDir, settings, profile, multiparty, toolNames, session, memory),
+      // The dream session reads memory as data; hints are for sessions that talk to someone.
+      ...(recall ? { recall: { hint: (k, o, t) => (k === DREAM_SESSION ? undefined : recall.hint(k, o, t)), forget: (k) => recall.forget(k) } } : {}),
       providerEnv: async () => {
         const env: Record<string, string> = {};
         for (const k of BASE_ENV_KEYS) if (process.env[k]) env[k] = process.env[k]!;

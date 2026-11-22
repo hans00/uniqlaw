@@ -100,6 +100,10 @@ export interface RuntimeHost {
   transcript?: TranscriptStore;
   /** Optional: live runtime events (dashboard SSE). */
   emit?(ev: RuntimeEvent): void;
+  /** Memory recall hints (docs §8.7): `hint` returns a block to put in front of a message (undefined = nothing);
+   *  `forget` = the session's context was reset, so things may be pointed out again. Only asked for sessions
+   *  that have memory_search (not workers, not inbound A2A). */
+  recall?: { hint(channelKey: string, origin: Origin, text: string): { block: string; commit(): void } | undefined; forget(channelKey: string): void };
 }
 
 interface TurnState {
@@ -297,6 +301,8 @@ export class ChannelRuntime {
   openedAt = 0;
   /** The current session was given a gateway endpoint. */
   mcpEnabled = false;
+  /** This session has UniQlaw memory (memory_search, not a worker or inbound A2A): recall hints apply. */
+  private recallHints = false;
   /** beforeFirstTurn: running (drain waits) / done for the current session. */
   private firstTurnGate?: Promise<void>;
   private firstTurnChecked = false;
@@ -452,13 +458,15 @@ export class ChannelRuntime {
     // running / interrupting
     const mode = this.host.settings.queue.mode;
     if (this.state === "running" && mode === "steer" && !slash && this.session?.steer && this.capabilities.steer) {
-      const prompt = mergeQueued([input.item], this.host.settings.timezone);
+      const hinted = this.withRecallHint(input);
+      const prompt = mergeQueued([hinted.item], this.host.settings.timezone);
       this.turn?.origins.push(input.origin);
       this.noteJoined(input.origin);
       this.turn?.inputs?.push(input);
       this.steerLog.push({ origin: input.origin, at: Date.now() });
       try {
         await this.session.steer({ text: prompt, attachments: input.attachments });
+        hinted.commit(); // a failed steer queues the input: the hint goes with the next turn instead
         this.release([input]); // a replayed input is consumed now: its deferred row goes
         return;
       } catch (e) {
@@ -507,6 +515,7 @@ export class ChannelRuntime {
     await this.close();
     this.ledger = new SessionLedger(Date.now(), { processRoot: () => this.session?.processRoot?.() });
     this.clearTaint();
+    this.host.recall?.forget(this.channelKey);
     this.host.store.patchSession(this.channelKey, { providerSessionId: null, adapterState: null });
   }
 
@@ -692,6 +701,9 @@ export class ChannelRuntime {
       this.session = session;
       this.openedAt = Date.now();
       this.mcpEnabled = !!gw;
+      this.recallHints = !!this.host.recall && !!gw?.toolNames.includes("memory_search") && !worker && !iso;
+      // A new provider session starts with an empty context: what was pointed out before is gone with it.
+      if (!cur.providerSessionId) this.host.recall?.forget(this.channelKey);
       this.firstTurnChecked = false;
       this.died = undefined;
       this.state = "idle";
@@ -746,7 +758,7 @@ export class ChannelRuntime {
       this.queue.shift();
       this.release([first]);
       // /clear, /compact, /new, /reset: what earlier turns read leaves the context (compaction keeps only a summary).
-      if (/^\/(clear|compact|new|reset)\b/i.test(first.item.text.trim())) this.clearTaint();
+      if (/^\/(clear|compact|new|reset)\b/i.test(first.item.text.trim())) { this.clearTaint(); this.host.recall?.forget(this.channelKey); }
       return this.startTurn([first.origin], { text: first.item.text.trim(), attachments: [], slashCommand: true }, 0, [first]);
     }
     const batch: QueuedInput[] = [];
@@ -757,10 +769,26 @@ export class ChannelRuntime {
     const pending = notes.filter((n) => !n.raw);
     await this.scheduledModel(batch);
     await this.routeModel(batch);
-    const body = mergeQueued(batch.map((b) => b.item), tz, this.dropped.splice(0));
+    const hinted = batch.map((b) => this.withRecallHint(b));
+    for (const h of hinted) h.commit();
+    const body = mergeQueued(hinted.map((h) => h.item), tz, this.dropped.splice(0));
     const text = [...handoff, formatPendingForPrompt(pending, tz), body].filter(Boolean).join("\n\n");
     this.release(batch);
     await this.startTurn(batch.map((b) => b.origin), { text, attachments: batch.flatMap((b) => b.attachments) }, 0, batch);
+  }
+
+  /** The item as the agent sees it, with a memory recall hint in front of the message when one applies. Added
+   *  only here, when the turn text is built: a queued input can be persisted and replayed (restart), and must not
+   *  carry a hint from before. A raw human item is a re-send of an earlier turn's text (profile switch), hint included. */
+  private withRecallHint(q: QueuedInput): { item: PromptItem; commit(): void } {
+    const it = q.item;
+    const none = { item: it, commit: () => {} };
+    if (!this.recallHints || (it.raw && q.origin.kind === "human") || (q.origin.kind === "scheduler" && q.origin.taskId)) return none;
+    let h: { block: string; commit(): void } | undefined;
+    try { h = this.host.recall!.hint(this.channelKey, q.origin, it.text); }
+    catch (e) { this.log.warn("recall hint failed", { e: String(e) }); }
+    if (!h) return none;
+    return { item: it.raw ? { ...it, text: `${h.block}\n\n${it.text}` } : { ...it, context: [...(it.context ?? []), h.block] }, commit: h.commit };
   }
 
   /** Scheduled turns may run on their own model (job/heartbeat `model`); the next turn without

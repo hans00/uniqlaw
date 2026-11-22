@@ -262,6 +262,20 @@ export const settingsSchema = z.object({
     maxInjectBytes: z.number().int().positive().default(24_000),
     /** Keep provider-native memory too (Claude Code auto-memory / auto-dream). Off = UniQlaw memory only. */
     nativeMemory: z.boolean().default(false),
+    /** Recall hints (docs §8.7): words of an incoming message that only a few memory files contain get a one-line
+     *  pointer to the file, in front of the message. Nothing is added when nothing matches. */
+    recallHints: z.object({
+      enabled: z.boolean().default(true),
+      /** Pointer lines per message at most. */
+      maxHits: z.number().int().min(1).max(10).default(3),
+      /** A token is rare when at most max(maxDf, maxDfRatio × memory files) files contain it. */
+      maxDf: z.number().int().min(1).default(3),
+      maxDfRatio: z.number().min(0).max(1).default(0.05),
+      /** Which messages get hints: chat messages ("human"), cron/heartbeat ("scheduler"), other agent sessions ("peer"). */
+      sources: z.array(z.enum(["human", "scheduler", "peer"])).default(["human"]),
+      /** The same word is not pointed out again in a session for this long (also reset by /new, /clear, /compact). */
+      repeatAfterMinutes: z.number().int().min(0).default(240),
+    }).prefault({}),
   }).prefault({}),
   mcpGateway: z.object({ host: z.string().default("127.0.0.1"), port: z.number().int().nonnegative().default(0) }).prefault({}),
   web: z.object({

@@ -149,8 +149,8 @@ export class MemoryStore {
     return `${cut.slice(0, cut.lastIndexOf("\n"))}\n\n[MEMORY.md truncated at ${this.maxInjectBytes} bytes — read the rest with memory_get("MEMORY.md")]`;
   }
 
-  /** Indexed files: every .md under the memory dir except DREAMS.md and hidden dirs. */
-  private files(): string[] {
+  /** Indexed files (absolute paths): every .md under the memory dir except DREAMS.md and hidden dirs. */
+  files(): string[] {
     if (!existsSync(this.dir)) return [];
     const out: string[] = [];
     const walk = (d: string) => {

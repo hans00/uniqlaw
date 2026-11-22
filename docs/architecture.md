@@ -463,6 +463,30 @@ UniQlaw has its own long-term memory so it survives provider changes (Claude Cod
   - Any other `*.md` (topic files, `imports/…`) is indexed for search. `.history/` keeps pre-images of `MEMORY.md`.
 - **Tools** (MCP gateway, every provider): `memory_write(text, importance?)` appends to today's note (identical text the same day is not repeated; the `dream` session can't write); `memory_search(query)`; `memory_get(path, from?, lines?)` (cannot leave the memory directory).
 - **Search**: SQLite FTS5 with the `trigram` tokenizer in `state.db`, so substring matching works for Chinese/Japanese; queries shorter than 3 characters fall back to `LIKE`. Ranked by bm25 (normalised within the result set) × recency (30-day half-life) × importance. Files edited by hand are re-indexed by mtime/size on the next search.
+- **Recall hints** (`memory.recallHints`): the agent has `MEMORY.md` in its prompt but often does not search topic files or daily notes when a message names something only they hold. So before a chat message reaches the agent, its words are looked up in an in-memory index of the memory files (`RecallHinter`, `recall-hints.ts`; `MEMORY.md` and `DREAMS.md` left out, re-read by mtime/size on each lookup, about 12 ms for 400 files / 2 MB). No list of names or words is kept. A word is a **hit** when two things hold:
+  - *Rare*: 1 ≤ df ≤ max(`maxDf` 3, `maxDfRatio` 0.05 × files). Common words are in many files and drop out; a name never written to memory is in none, and there is nothing to recall.
+  - *Written like a name* somewhere in memory. In a mostly-Chinese memory, rarity alone also passes everyday English (check, project) and short chat words (收到, 好的). A Latin word must appear capitalised mid-sentence, in mixed case, in all caps, with digits or in `backticks`, or be capitalised at least twice and at least as often as not. A CJK token (no case) must appear in a file's path or a heading. A CJK phrase of ≥ 4 matching characters is exempt: a verbatim phrase shared with one note.
+
+  Each hit gives one pointer line. The best file is a topic file before a daily note, then the one with the most occurrences. Several words of one file share a line, lines are rarest first, at most `maxHits` 3, and "+N more files" counts the other files holding the most widespread word of the line. The lines sit between the source line and `Message:`:
+  ```
+  [Memory recall hint: words in this message appear in memory files that are not in your context. Check them with memory_get / memory_search before answering, if relevant.]
+  - cloudflare, clairic → memory/ref_paper_261023_clairic_extraction.md (+2 more files)
+  ```
+  With no hit, nothing is added.
+
+  **Tokens.**
+  - *Words*: non-CJK letters and digits, split at `_ - . /`, so URL paths and file names come apart. Lower case, ≥ 3 characters, not all digits. A URL's scheme and host are dropped: they name a site, not the subject.
+  - *CJK*: there are no word boundaries. A run of 2–3 characters set off by spaces, punctuation or Latin text is taken whole. A longer run gives character trigrams: adjacent matches into the same file are joined, and a lone trigram counts only with the name signal. A trigram that contains a common bigram (今天天 ⊃ 今天) is dropped.
+  - *Why not bigrams*: overlapping bigrams and lone trigrams of long runs mostly straddle two words, and such pairs are rare in any corpus, so rarity lets them through.
+  - *Measured* on synthetic test corpora (`recall-fixture.ts`, Chinese and English notes with a long tail of one-off sentences): 1 of 24 everyday messages gets a false hit, a verbatim 4-character phrase from one note. All-bigram tokens without the name signal gave 17. On a held-out set written after tuning: 0 of 20 false hits and 5 of 5 names, with one rule (heading/path for lone trigrams) added after that run.
+  - *Cost*: a CJK name that is only in note bodies, never in a heading or file name, is not found unless the message quotes ≥ 4 characters around it. A Latin name always written in lower case and never in backticks is not found either.
+
+  **Scope.**
+  - Messages from chats only by default (`sources: ["human"]`); `"scheduler"` and `"peer"` opt in cron/heartbeat and agent messages.
+  - Only sessions that have `memory_search`: not workers, inbound A2A or `dream`. Group chats and paired users count as chats.
+  - A voice transcript's label is not tokenized. A re-sent turn (profile switch) is not hinted again.
+
+  **No repeats.** A word pointed out in a session is not pointed out again for `repeatAfterMinutes` (240), or until `/new`, `/clear`, `/compact` or a fresh provider session. Provider-side auto-compaction can't be seen, hence the timeout. The state is in memory, so after a daemon restart a word can be pointed out once more. The hint is added when the turn text is built (queue drain or steer) and counts as shown only once it was handed over: a failed steer leaves it for the queued turn, and input persisted across a restart never carries one.
 - **Signals** (`state.db`): `memory_meta` records who wrote each entry (origin: `chat` = one-to-one chat with an allowed user, `group` = multiparty chat, `internal`, `worker`, `remote`; plus the session key and importance). `memory_recall` records each search hit made by a one-to-one chat session: count, distinct queries, days.
 - **Provider-native memory**: with UniQlaw memory on (default), sessions get `SessionSpec.nativeMemory: false`; the Claude adapters pass `autoMemoryEnabled: false, autoDreamEnabled: false` (`--settings` / SDK `settings`) so there is one memory, not two. `memory.nativeMemory: true` keeps Claude's as well. Memory MCP servers from user settings (e.g. claude-mem) are unaffected (§13 #9).
 - **Dreaming** (`plugins.dreaming`, opt-in because it costs a model call or two per night; default `0 3 * * *` in `settings.timezone`). The engine (`core/src/dreaming.ts`) runs three phases:
