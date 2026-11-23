@@ -4,11 +4,13 @@ import { mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ChannelManager, DEFAULT_RECALL_HINTS, MemoryStore, NAME_SHARE, RECALL_HINT_HEADER, RecallHinter, StateStore, messageTokens, parseSettings, silentLogger,
+  ChannelManager, DEFAULT_RECALL_HINTS, DICTIONARY_NAME_SHARE, MemoryStore, NAME_SHARE, RECALL_HINT_HEADER, RecallHinter, StateStore, isDictionaryWord, messageTokens, parseSettings, silentLogger,
   type InboundMessage, type Origin, type Profile, type RecallHintOptions,
 } from "../src/index.ts";
 import { FakePlatform, FakeProvider } from "./fakes.ts";
-import { GENERIC_MESSAGES, HOLDOUT_GENERIC, HOLDOUT_NAMED, REAL_MESSAGES, writeHoldoutFixture, writeRealShapeFixture, writeRecallFixture } from "./recall-fixture.ts";
+import {
+  GENERIC_MESSAGES, HOLDOUT_GENERIC, HOLDOUT_NAMED, PRECISION_MESSAGES, REAL_MESSAGES, writeHoldoutFixture, writePrecisionFixture, writeRealShapeFixture, writeRecallFixture,
+} from "./recall-fixture.ts";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
@@ -42,6 +44,11 @@ describe("tokens", () => {
     const t = messageTokens("話說 Clairic v2 發佈了 https://huggingface.co/Cloudflare/clairic ref_paper_261023 林志遠 /tmp/claude-1000/-home-hans-Projects/ ~/notes x").map((x) => x.token);
     expect(t).toEqual(["clairic", "cloudflare", "ref", "paper", "話說", "發佈了", "林志遠"]);
     expect(messageTokens("今天天氣如何").map((x) => x.token)).toEqual(["今天天", "天天氣", "天氣如", "氣如何"]);
+  });
+
+  test("a URL path segment joined by - _ . is one token (an org or repo slug); query and fragment are left out", () => {
+    const t = messageTokens("看 https://github.com/vercel-labs/skills/pull/2470?utm_source=feed#issuecomment-1 和 mybigday-bricks");
+    expect(t.map((x) => [x.token, !!x.compound])).toEqual([["vercel-labs", true], ["skills", false], ["pull", false], ["mybigday", false], ["bricks", false]]);
   });
 });
 
@@ -78,6 +85,35 @@ describe("recall hints", () => {
     expect(hinter.lookup("SNAC")[0]!.path).toBe("project_codec_cpp.md");
     // Words of MEMORY.md (in the prompt) are never pointed out, even when rare and name-like elsewhere.
     expect(hinter.lookup("Gemini 的 Codex 設定")).toEqual([]);
+  });
+
+  test("production false hits (2026-11-23): everyday English words and URL slug parts; names still found", () => {
+    const root = mkdtempSync(join(tmpdir(), "uq-recall-prec-"));
+    const store = new StateStore(join(root, "state.db"));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }), () => store.close());
+    const dir = writePrecisionFixture(root);
+    const hinter = new RecallHinter(new MemoryStore(root, store));
+    for (const [m, want] of PRECISION_MESSAGES) expect([m, hinter.lookup(m).map((h) => h.path)]).toEqual([m, want]);
+    // Each false line, and which rule stops it. labs / contribution / overview: dictionary words, capitalised in a
+    // lab's name, a title-case phrase, an "## Overview" heading; no file's H1 or front matter name is about them.
+    expect(["labs", "contribution", "overview", "activity", "tunnel"].map(isDictionaryWord)).toEqual([true, true, true, true, true]);
+    expect(hinter.lookup("labs contribution overview activity")).toEqual([]);
+    // vercel: not a dictionary word, capitalised in a note; written as a word it still points. In the URL it is
+    // part of the slug vercel-labs, which memory doesn't have.
+    expect(isDictionaryWord("vercel")).toBe(false);
+    expect(hinter.lookup("vercel 的預覽壞了").map((h) => h.path)).toEqual(["project_bricks_evidence_plane.md"]);
+    expect(hinter.lookup("https://github.com/vercel-labs/skills")).toEqual([]);
+    // A slug memory has, whole, points (no name signal needed); one made only of everyday words doesn't.
+    writeFileSync(join(dir, "ref_skills_cli.md"), "# skills CLI\n\n- 來源：vercel-labs/skills，open-source 的 skills 安裝器。\n");
+    expect(hinter.lookup("https://github.com/vercel-labs/skills/pull/2470").map((h) => [h.tokens, h.path])).toEqual([[["vercel-labs"], "ref_skills_cli.md"]]);
+    expect(hinter.lookup("https://example.com/docs/open-source")).toEqual([]);
+    // Names: not dictionary words (cloudflare, clairic, snac); a product named by one (Ember) points through its
+    // front matter name and H1, capitalised in all prose uses (≥ DICTIONARY_NAME_SHARE).
+    expect(["cloudflare", "clairic", "snac", "bestrand"].map(isDictionaryWord)).toEqual([false, false, false, false]);
+    expect(isDictionaryWord("ember")).toBe(true);
+    expect(DICTIONARY_NAME_SHARE).toBe(0.9);
+    writeFileSync(join(dir, "2026-10-02.md"), "# 2026-10-02\n\n- 10:00 the ember of the fire, and the ember glow.\n");
+    expect(hinter.lookup("ember 的圖表")).toEqual([]); // its only telling prose uses are lower case
   });
 
   test("held-out notes and messages: no false hit, every name found", () => {

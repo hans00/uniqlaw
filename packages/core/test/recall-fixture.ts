@@ -195,3 +195,41 @@ export const REAL_MESSAGES: [string, string[]][] = [
   ["小金老師今天的影片看了嗎", []], ["克立淨的空清機又連不上了", ["project_ecover_cleanstation_re.md"]],
   ["codec.cpp 的 SNAC 支援做到哪", ["project_codec_cpp.md"]], ["火箭那個 PoC 的顫振還沒做吧", []],
 ];
+
+/** The shapes behind two production false hits (2026-11-23) in a mostly-Chinese memory: dictionary words that
+ *  English prose capitalises (a lab's name "Airun Intelligence Labs", title case "Contribution guide", "Activity
+ *  Overview", an "## Overview" heading) and a GitHub org in a URL path (vercel-labs) whose part "Vercel" is
+ *  capitalised in a note. Each word is in ≤ 3 files, so it passes the rarity test. Written for these tests. */
+export function writePrecisionFixture(root: string): string {
+  const dir = join(root, "memory");
+  mkdirSync(dir, { recursive: true });
+  const filler = ["今天整理了排程，沒有異常。", "使用者問了天氣，回覆簡短。", "跑了一次測試，全部通過。", "幫忙改了一段文件。", "討論了下週的行程。",
+    "檢查了 daemon 的日誌。", "看了一下佇列的設定。", "寫了每週摘要。"];
+  for (let i = 0; i < 36; i++) {
+    const day = `2026-10-${String(1 + (i % 28)).padStart(2, "0")}${i >= 28 ? `-${i}` : ""}`;
+    writeFileSync(join(dir, `${day}.md`), `# ${day}\n\n- 10:00 ${filler[i % filler.length]}\n- 11:00 ${filler[(i + 3) % filler.length]}\n`);
+  }
+  writeFileSync(join(dir, "project_bricks_evidence_plane.md"), "---\nname: bricks evidence plane\ndescription: 證據平面的設計與部署\n---\n\n# Evidence plane\n\n- 預覽環境放在 Vercel 上，正式環境另外部署。\n- 下一步：補上權限檢查。\n");
+  writeFileSync(join(dir, "ref_paper_261102_glance_generator_reranker.md"), "# Glance: generator + reranker\n\n- 作者來自 Airun Intelligence Labs，方法是先生成再重排。\n- 實驗用了三個資料集。\n");
+  writeFileSync(join(dir, "feedback_bricks_oss_practices.md"), "# 開源專案的做法\n\n- 發 PR 前先讀對方的 Contribution guide，照格式寫描述。\n- 不要一次改太多檔案。\n");
+  writeFileSync(join(dir, "ref_stanford_cs329a_self_improving_agents.md"), "# CS329A self-improving agents\n\n## Overview\n\n- 課程的 Activity Overview 頁面列了每週主題。\n- 期末專題要做 agent 的自我改進。\n");
+  writeFileSync(join(dir, "ref_course_notes.md"), "# 課程筆記\n\n## Overview\n\n- 這門課的 Overview 寫得很清楚。\n");
+  // Names that must keep working: not dictionary words, capitalised in prose; one only in a URL path elsewhere.
+  writeFileSync(join(dir, "ref_clairic.md"), "# Clairic\n\n- Clairic 把版面分析和欄位擷取分開。\n- 模型卡：https://huggingface.co/Cloudflare/clairic\n");
+  writeFileSync(join(dir, "project_codec_cpp.md"), "---\nname: codec.cpp\ndescription: C++ port of neural audio codecs (SNAC first)\n---\n\n# codec.cpp\n\n- 先做 SNAC 的 decoder，之後是 Mimi。\n");
+  writeFileSync(join(dir, "ops_cloudflare_tunnel.md"), "# 對外連線\n\n- 用 Cloudflare Tunnel 把 webhook 接出去。\n");
+  // A product named with a dictionary word: its front matter names it, so it still points.
+  writeFileSync(join(dir, "project_ember.md"), "---\nname: Ember\ndescription: 個人記帳 app\n---\n\n# Ember\n\n- Ember 用 SQLite，下一步加圖表。\n");
+  writeFileSync(join(dir, "MEMORY.md"), "# Memory\n\n- 使用者偏好簡短回答。\n");
+  return dir;
+}
+
+/** The two production messages (false lines: vercel, labs; contribution, overview) and named controls. */
+export const PRECISION_MESSAGES: [string, string[]][] = [
+  ["https://github.com/vercel-labs/skills/pull/2470 之前我對 skills 套件發的 PR 被拒絕了，他們要求要支援通用的 skills 路徑。幫我轉成 mybigday-bricks 內部的 issue — 支援通用 skills 路徑", []],
+  ["下面有 Activity overview 跟 Contribution activity ，雖然沒有展開的資料", []],
+  ["clairic 的論文看完了嗎", ["ref_clairic.md"]],
+  ["SNAC 的 decoder 做到哪", ["project_codec_cpp.md"]],
+  ["cloudflare tunnel 又斷了", ["ops_cloudflare_tunnel.md"]],
+  ["ember 的圖表做了嗎", ["project_ember.md"]],
+];

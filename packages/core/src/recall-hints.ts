@@ -1,9 +1,13 @@
 // Memory recall hints (docs §8.7): before a turn, words of the incoming message that are rare in memory get a
 // one-line pointer to the memory file that has them, so the agent knows to look before answering as if it never
-// discussed them. No list of names or words: a token is a hit only when few memory files contain it (common words
-// are in many files; names never written to memory are in none) and memory consistently treats it as a name (see
-// lookup). Words already in MEMORY.md (the prompt) are skipped. Nothing is added when nothing matches.
+// discussed them. No list of names: a token is a hit only when few memory files contain it (common words are in
+// many files; names never written to memory are in none) and memory consistently treats it as a name (see lookup).
+// Everyday English words (a fixed dictionary, assets/english-words.txt.gz) need more: English prose capitalises them
+// in titles and in names of things ("Airun Intelligence Labs", "Activity Overview"), and in a memory written mostly
+// in another language they are rare. Words already in MEMORY.md (the prompt) are skipped. Nothing is added when
+// nothing matches.
 import { readFileSync, statSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
 import { MEMORY_FILE, type MemoryStore } from "./memory.ts";
 import type { Origin } from "./origin.ts";
 
@@ -30,20 +34,39 @@ const CJK_RUN = new RegExp(`[${CJK}]+`, "gu");
 /** Letter/digit runs that are not CJK (Latin, Cyrillic, Greek…). Splits on `_ - . /` too, so URL slugs and
  *  file names come apart: huggingface.co/Cloudflare/clairic → huggingface, cloudflare, clairic. */
 const WORD_RUN = new RegExp(`(?:(?![${CJK}])[\\p{L}\\p{N}\\p{M}])+`, "gu");
+/** A word run joined to more by `-`, `_` or `.` (vercel-labs, codec.cpp): indexed whole as well, for URL path
+ *  segments, which are matched whole. */
+const COMPOUND_RUN = new RegExp(`(?:(?![${CJK}])[\\p{L}\\p{N}\\p{M}])+(?:[-_.](?:(?![${CJK}])[\\p{L}\\p{N}\\p{M}])+)+`, "gu");
+const URL_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/?#]*([^\s?#]*)\S*/g;
+const LOCAL_PATH_RE = /(^|\s)[~.]{0,2}\/\S*/g;
 const MAX_MESSAGE_TOKENS = 200;
 const MAX_FILE_BYTES = 2_000_000;
+
+let dictionary: Set<string> | undefined;
+/** Whether `word` (lower case) is an everyday English word: SCOWL size 35, see assets/english-words.COPYRIGHT.
+ *  Loaded once, on first use. If the asset can't be read, no word is (the rules fall back to case and rarity). */
+export function isDictionaryWord(word: string): boolean {
+  if (!dictionary) {
+    try { dictionary = new Set(gunzipSync(readFileSync(new URL("../assets/english-words.txt.gz", import.meta.url))).toString("utf8").split("\n")); }
+    catch { dictionary = new Set(); }
+  }
+  return dictionary.has(word);
+}
 
 export interface MessageToken {
   token: string;
   cjk: boolean;
+  /** A whole URL path segment with `-`, `_` or `.` in it (vercel-labs): matched only whole. */
+  compound?: boolean;
   /** CJK n-grams: run index and offset in the run (adjacent grams of a run are joined). */
   run?: number;
   at?: number;
 }
 
 /**
- * Tokens of a message, in order, unique. Words: lower case, ≥ 3 characters, not all digits; a URL's scheme and host
- * are left out. CJK (Han, kana, Hangul; no word boundaries): a run of 2 or 3 characters set off by spaces,
+ * Tokens of a message, in order, unique. Words: lower case, ≥ 3 characters, not all digits; a URL's scheme, host,
+ * query and fragment are left out, and a path segment joined by `-`, `_` or `.` is one token (github.com/vercel-labs/
+ * skills → vercel-labs, skills: an org or repo slug names that, not its parts). CJK (Han, kana, Hangul; no word boundaries): a run of 2 or 3 characters set off by spaces,
  * punctuation or Latin text gives itself; a longer run gives its character trigrams. Overlapping bigrams of long runs
  * are not used: most straddle two words, and such pairs are rare in any corpus, so the rarity test lets them through.
  * Which matches count is decided in lookup().
@@ -52,10 +75,30 @@ export function messageTokens(text: string): MessageToken[] {
   const out: MessageToken[] = [];
   const seen = new Set<string>();
   const add = (t: MessageToken) => { if (out.length < MAX_MESSAGE_TOKENS && !seen.has(t.token)) { seen.add(t.token); out.push(t); } };
+  const word = (w: string) => { if ([...w].length >= 3 && !/^\p{N}+$/u.test(w)) add({ token: w, cjk: false }); };
+  // Plain text: a local path (/tmp/…, ~/…, ./…) names a place on disk, none of it counts.
+  const words = (t: string) => { for (const m of t.replace(LOCAL_PATH_RE, " ").matchAll(WORD_RUN)) word(m[0]); };
   // A URL's scheme and host name a site, not the subject: only its path counts (huggingface.co/Cloudflare/clairic →
-  // cloudflare, clairic). A local path (/tmp/…, ~/…, ./…) names a place on disk: none of it counts.
-  const lower = text.toLowerCase().replace(/(^|\s)[~.]{0,2}\/\S*/g, " ").replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/?#]*/g, " ");
-  for (const m of lower.matchAll(WORD_RUN)) if ([...m[0]].length >= 3 && !/^\p{N}+$/u.test(m[0])) add({ token: m[0], cjk: false });
+  // cloudflare, clairic).
+  const urlPath = (path: string) => {
+    for (const seg of path.split("/")) {
+      if (!/[-_.]/.test(seg)) { for (const m of seg.matchAll(WORD_RUN)) word(m[0]); continue; }
+      const whole = seg.match(COMPOUND_RUN)?.[0];
+      if (whole && whole.split(/[-_.]/).some((p) => [...p].length >= 3 && /\p{L}/u.test(p))) add({ token: whole, cjk: false, compound: true });
+    }
+  };
+  const all = text.toLowerCase();
+  let rest = "";
+  let from = 0;
+  for (const m of all.matchAll(URL_RE)) {
+    const before = all.slice(from, m.index);
+    words(before);
+    urlPath(m[1]!);
+    rest += `${before} `;
+    from = m.index! + m[0].length;
+  }
+  words(all.slice(from));
+  const lower = `${rest}${all.slice(from)}`.replace(LOCAL_PATH_RE, " ");
   let run = 0;
   for (const m of lower.matchAll(CJK_RUN)) {
     const ch = [...m[0]];
@@ -77,6 +120,8 @@ interface FileEntry {
   /** What the file says it is about: CJK runs of its path, headings and front matter `name:` / `description:` /
    *  `title:`, and of that front matter alone (lower case); for words, the words of its headings and that front matter. */
   titleRuns: string[]; frontRuns: string[]; titleWords: Set<string>; frontWords: Set<string>;
+  /** Words of a title that is about one thing: the H1 or front matter `name:` / `title:`, when it has at most 2 words. */
+  standalone: Set<string>;
 }
 
 /** Text before a word that makes it sentence-initial: list marker / number / time stamp at line start, or a
@@ -96,6 +141,7 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
   const lower = text.toLowerCase();
   const words = new Map<string, number>();
   for (const m of lower.matchAll(WORD_RUN)) words.set(m[0], (words.get(m[0]) ?? 0) + 1);
+  for (const m of lower.matchAll(COMPOUND_RUN)) words.set(m[0], (words.get(m[0]) ?? 0) + 1);
   const front = frontMatter(text);
   const body = (front ? text.replace(/^---\n[\s\S]*?\n---/, "") : text)
     .replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, " ");
@@ -124,7 +170,10 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
   // Words of headings and front matter (not of the path, not inside identifiers like project_uniqlaw: file-name
   // prefixes such as project_, ref_, ops_ are generic).
   const proseWords = (t: string) => t.toLowerCase().split(/\s+/).filter((c) => !CODE_CHUNK.test(c)).flatMap((c) => c.match(WORD_RUN) ?? []);
+  const titles = [...headings.filter((h) => /^\s*#\s/.test(h)).map((h) => h.replace(/^\s*#/, "")),
+    ...front.split("\n").filter((l) => /^\s*(name|title)\s*:/i.test(l)).map((l) => l.replace(/^\s*\w+\s*:/, ""))];
   return { words, cjk: (lower.match(CJK_RUN) ?? []).join("\n"), named, plain,
+    standalone: new Set(titles.map(proseWords).filter((ws) => ws.length <= 2).flat()),
     titleRuns: title.match(CJK_RUN) ?? [], frontRuns: front.toLowerCase().match(CJK_RUN) ?? [],
     titleWords: new Set(proseWords(`${headings.join("\n")}\n${front.replace(/^\s*\w+\s*:/gm, " ")}`)), frontWords: new Set(proseWords(front.replace(/^\s*\w+\s*:/gm, " "))) };
 }
@@ -135,6 +184,10 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
  *  capitalised wherever they appear but are now and then written in lower case (clairic 0.67, snac 1.00 there).
  *  0.5 sits between the two: a name may be lower case as often as not. */
 export const NAME_SHARE = 0.5;
+/** The same share for an everyday English word (isDictionaryWord), which also needs a file whose H1 or front matter
+ *  name/title is about it (FileEntry.standalone). Title case and names of things capitalise such words now and then
+ *  ("Activity Overview", "Airun Intelligence Labs"); a product named by one (Ember) is capitalised nearly always. */
+export const DICTIONARY_NAME_SHARE = 0.9;
 
 /** A heading / path / front-matter CJK run names `token` when the token is at least half of it: 克立淨 in
  *  「克立淨空清機」 (two names run together) yes, 話說 in 「用自己的話換句話說」 (a phrase that happens to contain it) no. */
@@ -178,7 +231,7 @@ export class RecallHinter {
         if (this.inPrompt?.mtime === mtime && this.inPrompt.size === st.size) continue;
         try {
           const lower = readFileSync(abs, "utf8").toLowerCase();
-          this.inPrompt = { mtime, size: st.size, words: new Set(lower.match(WORD_RUN) ?? []), cjk: (lower.match(CJK_RUN) ?? []).join("\n") };
+          this.inPrompt = { mtime, size: st.size, words: new Set([...(lower.match(WORD_RUN) ?? []), ...(lower.match(COMPOUND_RUN) ?? [])]), cjk: (lower.match(CJK_RUN) ?? []).join("\n") };
         } catch { this.inPrompt = undefined; }
         continue;
       }
@@ -224,15 +277,20 @@ export class RecallHinter {
       }
       if (!hits.length || hits.length > maxDf) continue;
       // The name signal (see below the loop).
-      if (tok.cjk) {
+      if (tok.compound) {
+        // A whole slug (vercel-labs) found as such is specific enough, unless all its parts are everyday words.
+        if (!tok.token.split(/[-_.]/).some((p) => [...p].length >= 3 && /\p{L}/u.test(p) && !isDictionaryWord(p))) continue;
+      } else if (tok.cjk) {
         // CJK has no case: a run of the target file's path, headings or front matter must be at least half this token (namesCjk).
         if (!hits.some((h) => h.title)) continue;
       } else {
         const nameLike = hits.reduce((a, h) => a + (h.f.named.get(tok.token) ?? 0), 0);
         const plain = hits.reduce((a, h) => a + (h.f.plain.get(tok.token) ?? 0), 0);
+        const dict = isDictionaryWord(tok.token);
+        if (dict && !hits.some((h) => h.f.standalone.has(tok.token))) continue;
         // No prose occurrence that tells (only sentence starts, headings, code): the file's title decides.
         if (!nameLike && !plain) { if (!hits.some((h) => h.title)) continue; }
-        else if (nameLike < NAME_SHARE * (nameLike + plain)) continue;
+        else if (nameLike < (dict ? DICTIONARY_NAME_SHARE : NAME_SHARE) * (nameLike + plain)) continue;
       }
       // Best file: front matter names it, then path/heading names it, then topic files before daily notes, then
       // most occurrences, then path.
@@ -244,7 +302,9 @@ export class RecallHinter {
     // memory of a few hundred files has many everyday words in ≤ 5% of them (message, request, 話說, 專有名詞).
     //  - Latin words: at least NAME_SHARE of their prose occurrences across memory are written like a name; with no
     //    telling occurrence at all (only at sentence starts, in headings or code), a file holding it names it in its
-    //    path, a heading or its front matter.
+    //    path, a heading or its front matter. An everyday English word also needs a file whose H1 or front matter
+    //    name/title is about it (at most 2 words), and DICTIONARY_NAME_SHARE.
+    //  - A URL slug (vercel-labs): found whole, with a part that is not an everyday word.
     //  - CJK: a run of the best file's path, headings or front matter that it makes up at least half of (namesCjk). A CJK name that is only in note bodies is
     //    not found: without case or word boundaries it looks like any rare pair of words.
     // Adjacent CJK trigrams of one run with the same best file are joined into one phrase.
