@@ -31,13 +31,15 @@ export const DEFAULT_RECALL_HINTS: RecallHintOptions = { enabled: true, maxHits:
 const DAILY_RE = /(^|\/)\d{4}-\d{2}-\d{2}(-[a-z0-9._-]+)?\.md$/;
 const CJK = "\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Hangul}ー々";
 const CJK_RUN = new RegExp(`[${CJK}]+`, "gu");
+const HAS_CJK = new RegExp(`[${CJK}]`, "u");
 /** Letter/digit runs that are not CJK (Latin, Cyrillic, Greek…). Splits on `_ - . /` too, so URL slugs and
  *  file names come apart: huggingface.co/Cloudflare/clairic → huggingface, cloudflare, clairic. */
 const WORD_RUN = new RegExp(`(?:(?![${CJK}])[\\p{L}\\p{N}\\p{M}])+`, "gu");
 /** A word run joined to more by `-`, `_` or `.` (vercel-labs, codec.cpp): indexed whole as well, for URL path
  *  segments, which are matched whole. */
 const COMPOUND_RUN = new RegExp(`(?:(?![${CJK}])[\\p{L}\\p{N}\\p{M}])+(?:[-_.](?:(?![${CJK}])[\\p{L}\\p{N}\\p{M}])+)+`, "gu");
-const URL_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/?#]*([^\s?#]*)\S*/g;
+/** A URL: printable ASCII only, so it ends at a CJK character or full-width punctuation glued to it. */
+const URL_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/?#\u0080-￿]*([^\s?#\u0080-￿]*)[^\s\u0080-￿]*/g;
 const LOCAL_PATH_RE = /(^|\s)[~.]{0,2}\/\S*/g;
 const MAX_MESSAGE_TOKENS = 200;
 const MAX_FILE_BYTES = 2_000_000;
@@ -81,7 +83,8 @@ export function messageTokens(text: string): MessageToken[] {
   // A URL's scheme and host name a site, not the subject: only its path counts (huggingface.co/Cloudflare/clairic →
   // cloudflare, clairic).
   const urlPath = (path: string) => {
-    for (const seg of path.split("/")) {
+    // A file name's extension (README.md, package.json, clairic.cpp) says what kind of file it is: dropped.
+    for (const seg of path.split("/").map((s) => s.replace(/\.[^.]*$/, ""))) {
       if (!/[-_.]/.test(seg)) { for (const m of seg.matchAll(WORD_RUN)) word(m[0]); continue; }
       const whole = seg.match(COMPOUND_RUN)?.[0];
       if (whole && whole.split(/[-_.]/).some((p) => [...p].length >= 3 && /\p{L}/u.test(p))) add({ token: whole, cjk: false, compound: true });
@@ -120,7 +123,7 @@ interface FileEntry {
   /** What the file says it is about: CJK runs of its path, headings and front matter `name:` / `description:` /
    *  `title:`, and of that front matter alone (lower case); for words, the words of its headings and that front matter. */
   titleRuns: string[]; frontRuns: string[]; titleWords: Set<string>; frontWords: Set<string>;
-  /** Words of a title that is about one thing: the H1 or front matter `name:` / `title:`, when it has at most 2 words. */
+  /** The word an H1 or front matter `name:` / `title:` consists of, when it is exactly one word (no CJK either). */
   standalone: Set<string>;
 }
 
@@ -173,7 +176,7 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
   const titles = [...headings.filter((h) => /^\s*#\s/.test(h)).map((h) => h.replace(/^\s*#/, "")),
     ...front.split("\n").filter((l) => /^\s*(name|title)\s*:/i.test(l)).map((l) => l.replace(/^\s*\w+\s*:/, ""))];
   return { words, cjk: (lower.match(CJK_RUN) ?? []).join("\n"), named, plain,
-    standalone: new Set(titles.map(proseWords).filter((ws) => ws.length <= 2).flat()),
+    standalone: new Set(titles.filter((t) => !HAS_CJK.test(t)).map(proseWords).filter((ws) => ws.length === 1).flat()),
     titleRuns: title.match(CJK_RUN) ?? [], frontRuns: front.toLowerCase().match(CJK_RUN) ?? [],
     titleWords: new Set(proseWords(`${headings.join("\n")}\n${front.replace(/^\s*\w+\s*:/gm, " ")}`)), frontWords: new Set(proseWords(front.replace(/^\s*\w+\s*:/gm, " "))) };
 }
@@ -185,7 +188,7 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
  *  0.5 sits between the two: a name may be lower case as often as not. */
 export const NAME_SHARE = 0.5;
 /** The same share for an everyday English word (isDictionaryWord), which also needs a file whose H1 or front matter
- *  name/title is about it (FileEntry.standalone). Title case and names of things capitalise such words now and then
+ *  name/title is that word alone (FileEntry.standalone). Title case and names of things capitalise such words now and then
  *  ("Activity Overview", "Airun Intelligence Labs"); a product named by one (Ember) is capitalised nearly always. */
 export const DICTIONARY_NAME_SHARE = 0.9;
 
@@ -303,7 +306,7 @@ export class RecallHinter {
     //  - Latin words: at least NAME_SHARE of their prose occurrences across memory are written like a name; with no
     //    telling occurrence at all (only at sentence starts, in headings or code), a file holding it names it in its
     //    path, a heading or its front matter. An everyday English word also needs a file whose H1 or front matter
-    //    name/title is about it (at most 2 words), and DICTIONARY_NAME_SHARE.
+    //    name/title is that word alone, and DICTIONARY_NAME_SHARE.
     //  - A URL slug (vercel-labs): found whole, with a part that is not an everyday word.
     //  - CJK: a run of the best file's path, headings or front matter that it makes up at least half of (namesCjk). A CJK name that is only in note bodies is
     //    not found: without case or word boundaries it looks like any rare pair of words.

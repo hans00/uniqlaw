@@ -49,6 +49,11 @@ describe("tokens", () => {
   test("a URL path segment joined by - _ . is one token (an org or repo slug); query and fragment are left out", () => {
     const t = messageTokens("看 https://github.com/vercel-labs/skills/pull/2470?utm_source=feed#issuecomment-1 和 mybigday-bricks");
     expect(t.map((x) => [x.token, !!x.compound])).toEqual([["vercel-labs", true], ["skills", false], ["pull", false], ["mybigday", false], ["bricks", false]]);
+    // A URL ends at CJK or full-width punctuation glued to it; a file name's extension is dropped.
+    expect(messageTokens("看 https://huggingface.co/Cloudflare/clairic，克立淨的空清機").map((x) => x.token))
+      .toEqual(["cloudflare", "clairic", "克立淨", "立淨的", "淨的空", "的空清", "空清機"]);
+    expect(messageTokens("https://github.com/x/codec.cpp/blob/main/README.md https://a.io/b/my-tool.json").map((x) => x.token))
+      .toEqual(["codec", "blob", "main", "readme", "my-tool"]);
   });
 });
 
@@ -107,6 +112,13 @@ describe("recall hints", () => {
     writeFileSync(join(dir, "ref_skills_cli.md"), "# skills CLI\n\n- 來源：vercel-labs/skills，open-source 的 skills 安裝器。\n");
     expect(hinter.lookup("https://github.com/vercel-labs/skills/pull/2470").map((h) => [h.tokens, h.path])).toEqual([[["vercel-labs"], "ref_skills_cli.md"]]);
     expect(hinter.lookup("https://example.com/docs/open-source")).toEqual([]);
+    // File names in a URL: the extension is not a part that makes the slug specific.
+    writeFileSync(join(dir, "2026-10-03.md"), "# 2026-10-03\n\n- 10:00 改了 README.md 和 package.json。\n");
+    expect(hinter.lookup("https://github.com/x/y/blob/main/README.md https://github.com/x/y/blob/main/package.json")).toEqual([]);
+    // The title must be the word alone: "# Evidence plane", "# Activity Overview", "# 課程 Overview" don't count.
+    writeFileSync(join(dir, "n1.md"), "# 課程 Overview\n\n- x\n");
+    writeFileSync(join(dir, "n2.md"), "# Activity Overview\n\n- y\n");
+    expect(hinter.lookup("evidence plane overview activity")).toEqual([]);
     // Names: not dictionary words (cloudflare, clairic, snac); a product named by one (Ember) points through its
     // front matter name and H1, capitalised in all prose uses (≥ DICTIONARY_NAME_SHARE).
     expect(["cloudflare", "clairic", "snac", "bestrand"].map(isDictionaryWord)).toEqual([false, false, false, false]);
