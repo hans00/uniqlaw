@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ChannelManager, DEFAULT_RECALL_HINTS, DICTIONARY_NAME_SHARE, MemoryStore, NAME_SHARE, RECALL_HINT_HEADER, RecallHinter, StateStore, isDictionaryWord, messageTokens, parseSettings, silentLogger,
+  ChannelManager, DEFAULT_RECALL_HINTS, DICTIONARY_NAME_SHARE, MemoryStore, NAME_SHARE, RECALL_HINT_HEADER, RecallHinter, StateStore, isCommonCjk, isDictionaryWord, messageTokens, segmentCjk, parseSettings, silentLogger,
   type InboundMessage, type Origin, type Profile, type RecallHintOptions,
 } from "../src/index.ts";
 import { FakePlatform, FakeProvider } from "./fakes.ts";
@@ -128,6 +128,37 @@ describe("recall hints", () => {
     expect(hinter.lookup("ember 的圖表")).toEqual([]); // its only telling prose uses are lower case
   });
 
+  test("common words of any language (tokenizer vocabulary): a CJK heading that contains one is no name signal", () => {
+    const { dir, hinter } = setup();
+    // Production (2026-11-25): 「一個有趣的思路」 → 有趣的, from the heading 「最有趣的反轉」.
+    writeFileSync(join(dir, "ref_speechlab_xiaojin_0608_names.md"), "# 語音實驗室 0608\n\n## 最有趣的反轉\n\n- 結論和預期相反。\n");
+    expect(segmentCjk("一個有趣的思路")).toEqual(["一個", "有趣的", "思路"]);
+    expect(isCommonCjk("有趣的")).toBe(true);
+    expect(hinter.lookup("一個有趣的思路")).toEqual([]);
+    expect(hinter.lookup("有趣的")).toEqual([]);
+    // How names segment: a name no token knows falls apart into characters and stays eligible; one that is a
+    // vocabulary word (小金, 雷神) is common and points only from a file whose H1, front matter name or path is it.
+    expect(["克立淨", "小金", "李宏毅", "雷神"].map((w) => [w, segmentCjk(w).join("|"), isCommonCjk(w)]))
+      .toEqual([["克立淨", "克|立|淨", false], ["小金", "小金", true], ["李宏毅", "李|宏|毅", false], ["雷神", "雷神", true]]);
+    writeFileSync(join(dir, "topics", "people_李宏毅.md"), "# 李宏毅老師的課\n\n- 生成式 AI 導論。\n");
+    expect(hinter.lookup("李宏毅 的新影片").map((h) => h.path)).toEqual(["topics/people_李宏毅.md"]);
+    writeFileSync(join(dir, "topics", "people_xiaojin.md"), "# 小金老師\n\n- 每週的影片。\n");
+    expect(hinter.lookup("小金 的影片")).toEqual([]); // H1 「小金老師」 is not the word alone
+    writeFileSync(join(dir, "topics", "people_小金.md"), "- 小金老師每週出影片。\n");
+    expect(hinter.lookup("小金 的影片").map((h) => h.path)).toEqual(["topics/people_小金.md"]); // the path is
+    // Rare Latin names are no tokens: still hit.
+    expect(["clairic", "jevling"].map(isDictionaryWord)).toEqual([false, false]);
+    writeFileSync(join(dir, "topics", "proj_jevling.md"), "# Jevling evals\n\n- The Jevling E2B eval runs nightly.\n");
+    expect(hinter.lookup("Jevling 的 eval 跑完了嗎").map((h) => h.path)).toEqual(["topics/proj_jevling.md"]);
+    expect(hinter.lookup("clairic").map((h) => h.path)).toEqual(["ref_paper_261023_clairic_extraction.md"]);
+    // Other languages: French, German, Japanese, Korean common words are common too.
+    expect(["bonjour", "toujours", "zusammen", "straße"].map(isDictionaryWord)).toEqual([true, true, true, true]);
+    expect(["ありがとう", "大丈夫", "勉強", "사람"].map(isCommonCjk)).toEqual([true, true, true, true]);
+    writeFileSync(join(dir, "n_fr.md"), "## Notes Zusammen\n\n- 他說 Bonjour 就走了，隔天又說 Bonjour。\n");
+    writeFileSync(join(dir, "n_ja.md"), "## 大丈夫な理由\n\n- 勉強會的筆記。\n");
+    expect(hinter.lookup("bonjour zusammen 大丈夫 勉強")).toEqual([]);
+  });
+
   test("held-out notes and messages: no false hit, every name found", () => {
     const root = mkdtempSync(join(tmpdir(), "uq-recall-holdout-"));
     const store = new StateStore(join(root, "state.db"));
@@ -144,10 +175,10 @@ describe("recall hints", () => {
     writeFileSync(join(dir, "n1.md"), "- 10:00 Message from the operator: the reply was late.\n- 11:00 Cleaned /tmp/x and `tmp`; the message queue is fine.\n");
     writeFileSync(join(dir, "n2.md"), "- 10:00 The NO_REPLY turn left a message behind.\n- Request: check the history.\n- History was kept; the request went through.\n");
     // Names: capitalised wherever they appear (one lower-case use is fine), mixed case, all caps, letters with digits.
-    writeFileSync(join(dir, "n3.md"), "- 10:00 Read about Zorblax today; zorblax has two stages.\n- Ported it to GitHub; the ABCD codec and the E2B eval.\n- Asked Zorblax people.\n");
+    writeFileSync(join(dir, "n3.md"), "- 10:00 Read about Zorblax today; zorblax has two stages.\n- Ported it to GitQuarry; the ABCD codec and the E2B eval.\n- Asked Zorblax people.\n");
     writeFileSync(join(dir, "n4.md"), "# Kestrel\n\n- Kestrel is the budget app.\n");
     expect(hinter.lookup("message reply tmp request history check")).toEqual([]);
-    expect(hinter.lookup("zorblax github abcd e2b").flatMap((h) => h.tokens).sort()).toEqual(["abcd", "e2b", "github", "zorblax"]);
+    expect(hinter.lookup("zorblax gitquarry abcd e2b").flatMap((h) => h.tokens).sort()).toEqual(["abcd", "e2b", "gitquarry", "zorblax"]);
     // Only sentence-initial or in a heading: no prose use tells, so the heading decides.
     expect(hinter.lookup("kestrel").map((h) => h.path)).toEqual(["n4.md"]);
     // 收到 is rare here but only in body text: CJK needs the target file's heading, path or front matter.

@@ -2,10 +2,11 @@
 // one-line pointer to the memory file that has them, so the agent knows to look before answering as if it never
 // discussed them. No list of names: a token is a hit only when few memory files contain it (common words are in
 // many files; names never written to memory are in none) and memory consistently treats it as a name (see lookup).
-// Everyday English words (a fixed dictionary, assets/english-words.txt.gz) need more: English prose capitalises them
-// in titles and in names of things ("Airun Intelligence Labs", "Activity Overview"), and in a memory written mostly
-// in another language they are rare. Words already in MEMORY.md (the prompt) are skipped. Nothing is added when
-// nothing matches.
+// Common words of any language need more: a fixed lexicon (assets/: the whole-word tokens of a multilingual BPE
+// tokenizer's vocabulary, plus an English dictionary for inflections it lacks). English prose capitalises such words in
+// titles and names of things ("Airun Intelligence Labs", "Activity Overview"), a CJK heading contains them
+// (「最有趣的反轉」), and in a memory written mostly in another language they are rare. Words already in MEMORY.md (the
+// prompt) are skipped. Nothing is added when nothing matches.
 import { readFileSync, statSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { MEMORY_FILE, type MemoryStore } from "./memory.ts";
@@ -44,15 +45,75 @@ const LOCAL_PATH_RE = /(^|\s)[~.]{0,2}\/\S*/g;
 const MAX_MESSAGE_TOKENS = 200;
 const MAX_FILE_BYTES = 2_000_000;
 
-let dictionary: Set<string> | undefined;
-/** Whether `word` (lower case) is an everyday English word: SCOWL size 35, see assets/english-words.COPYRIGHT.
- *  Loaded once, on first use. If the asset can't be read, no word is (the rules fall back to case and rarity). */
+interface Lexicon { words: Set<string>; t2s: Map<string, string>; maxCjk: number }
+let lexicon: Lexicon | undefined;
+/** The common-word lexicon, loaded once on first use: english-words.txt.gz (SCOWL size 35, english-words.COPYRIGHT)
+ *  and tokenizer-words.txt.gz (the whole-word tokens of the Qwen3.5 tokenizer: CJK of 2+ characters, other scripts
+ *  of 3+ letters; t2s-chars.txt.gz maps Traditional Chinese characters onto its mostly Simplified vocabulary; see
+ *  tokenizer-words.NOTICE). An asset that can't be read adds nothing (the rules fall back to case and rarity). */
+function lex(): Lexicon {
+  if (lexicon) return lexicon;
+  const read = (file: string): string[] => {
+    try { return gunzipSync(readFileSync(new URL(`../assets/${file}`, import.meta.url))).toString("utf8").split("\n").filter(Boolean); }
+    catch { return []; }
+  };
+  const words = new Set([...read("english-words.txt.gz"), ...read("tokenizer-words.txt.gz")]);
+  const t2s = new Map<string, string>();
+  for (const l of read("t2s-chars.txt.gz")) { const [a, b] = [...l.split("\t")]; if (a && b) t2s.set(a, b); }
+  let maxCjk = 1;
+  for (const w of words) if (HAS_CJK.test(w)) maxCjk = Math.max(maxCjk, [...w].length);
+  return (lexicon = { words, t2s, maxCjk });
+}
+
+/** Whether `word` (lower case, not CJK) is a common word: in the English dictionary or a whole-word tokenizer token
+ *  (overview, bonjour, zusammen; not clairic, vercel). */
 export function isDictionaryWord(word: string): boolean {
-  if (!dictionary) {
-    try { dictionary = new Set(gunzipSync(readFileSync(new URL("../assets/english-words.txt.gz", import.meta.url))).toString("utf8").split("\n")); }
-    catch { dictionary = new Set(); }
+  return lex().words.has(word);
+}
+
+/** A CJK string that is one vocabulary token, as written or with its Traditional characters made Simplified. */
+function inVocab(chars: string[]): boolean {
+  const { words, t2s } = lex();
+  const s = chars.join("");
+  return words.has(s) || words.has(chars.map((c) => t2s.get(c) ?? c).join(""));
+}
+
+/** Greedy longest-match segmentation of a CJK run into vocabulary tokens; characters no token covers stand alone.
+ *  一個有趣的思路 → 一個 | 有趣的 | 思路; 克立淨 → 克 | 立 | 淨 (a name: no token knows it). */
+export function segmentCjk(run: string): string[] {
+  const ch = [...run];
+  const out: string[] = [];
+  for (let i = 0; i < ch.length;) {
+    let n = Math.min(lex().maxCjk, ch.length - i);
+    while (n > 1 && !inVocab(ch.slice(i, i + n))) n--;
+    out.push(ch.slice(i, i + n).join(""));
+    i += n;
   }
-  return dictionary.has(word);
+  return out;
+}
+
+/** A CJK token is a common word when the vocabulary covers it with tokens of 2+ characters (有趣的, 小金, 雷神); one
+ *  that falls apart into single characters (克立淨, 李宏毅) may be a name. */
+export function isCommonCjk(token: string): boolean {
+  return segmentCjk(token).every((p) => [...p].length >= 2);
+}
+
+/** Whether every occurrence of `token` in `run` lies inside a longer vocabulary token there: 話說 in 換句話說. */
+function insideVocabWord(run: string, token: string): boolean {
+  const ch = [...run];
+  const t = [...token];
+  const max = lex().maxCjk;
+  let found = false;
+  for (let i = 0; i + t.length <= ch.length; i++) {
+    if (ch.slice(i, i + t.length).join("") !== token) continue;
+    found = true;
+    let inside = false;
+    for (let a = Math.max(0, i + t.length - max); a <= i && !inside; a++)
+      for (let b = Math.max(i + t.length, a + t.length + 1); b <= Math.min(ch.length, a + max) && !inside; b++)
+        if (b - a > t.length && inVocab(ch.slice(a, b))) inside = true;
+    if (!inside) return false;
+  }
+  return found;
 }
 
 export interface MessageToken {
@@ -125,6 +186,8 @@ interface FileEntry {
   titleRuns: string[]; frontRuns: string[]; titleWords: Set<string>; frontWords: Set<string>;
   /** The word an H1 or front matter `name:` / `title:` consists of, when it is exactly one word (no CJK either). */
   standalone: Set<string>;
+  /** CJK runs that are a whole H1, front matter `name:` / `title:` value, or path segment run (小金 in people_小金.md). */
+  standaloneCjk: Set<string>;
 }
 
 /** Text before a word that makes it sentence-initial: list marker / number / time stamp at line start, or a
@@ -177,6 +240,7 @@ function digest(path: string, content: string): Omit<FileEntry, "mtime" | "size"
     ...front.split("\n").filter((l) => /^\s*(name|title)\s*:/i.test(l)).map((l) => l.replace(/^\s*\w+\s*:/, ""))];
   return { words, cjk: (lower.match(CJK_RUN) ?? []).join("\n"), named, plain,
     standalone: new Set(titles.filter((t) => !HAS_CJK.test(t)).map(proseWords).filter((ws) => ws.length === 1).flat()),
+    standaloneCjk: new Set([...titles, path].flatMap((t) => t.match(CJK_RUN) ?? [])),
     titleRuns: title.match(CJK_RUN) ?? [], frontRuns: front.toLowerCase().match(CJK_RUN) ?? [],
     titleWords: new Set(proseWords(`${headings.join("\n")}\n${front.replace(/^\s*\w+\s*:/gm, " ")}`)), frontWords: new Set(proseWords(front.replace(/^\s*\w+\s*:/gm, " "))) };
 }
@@ -192,11 +256,13 @@ export const NAME_SHARE = 0.5;
  *  ("Activity Overview", "Airun Intelligence Labs"); a product named by one (Ember) is capitalised nearly always. */
 export const DICTIONARY_NAME_SHARE = 0.9;
 
-/** A heading / path / front-matter CJK run names `token` when the token is at least half of it: 克立淨 in
- *  「克立淨空清機」 (two names run together) yes, 話說 in 「用自己的話換句話說」 (a phrase that happens to contain it) no. */
+/** A heading / path / front-matter CJK run names `token` when the token is at least half of it and not inside a
+ *  longer vocabulary word there: 克立淨 in 「克立淨空清機」 (two names run together) yes; 話說 in 「用自己的話換句話說」
+ *  (a phrase that happens to contain it) no. A greedy segmentation of the run would not do: it cuts unknown names
+ *  wherever a known word starts (克 | 立 | 淨空 | 清機). */
 function namesCjk(runs: string[], token: string): boolean {
   const n = [...token].length;
-  return runs.some((r) => r.includes(token) && [...r].length <= 2 * n);
+  return runs.some((r) => r.includes(token) && [...r].length <= 2 * n && !insideVocabWord(r, token));
 }
 
 function countIn(hay: string, needle: string): number {
@@ -280,24 +346,31 @@ export class RecallHinter {
       }
       if (!hits.length || hits.length > maxDf) continue;
       // The name signal (see below the loop).
+      let common = false;
       if (tok.compound) {
         // A whole slug (vercel-labs) found as such is specific enough, unless all its parts are everyday words.
         if (!tok.token.split(/[-_.]/).some((p) => [...p].length >= 3 && /\p{L}/u.test(p) && !isDictionaryWord(p))) continue;
       } else if (tok.cjk) {
-        // CJK has no case: a run of the target file's path, headings or front matter must be at least half this token (namesCjk).
-        if (!hits.some((h) => h.title)) continue;
+        // CJK has no case. A common word (isCommonCjk: 有趣的) needs a file whose H1, front matter name/title or path
+        // is that word; any other token a run of the target file's path, headings or front matter that it is at
+        // least half of, not inside a longer word (namesCjk).
+        if (isCommonCjk(tok.token)) { common = true; if (!hits.some((h) => h.f.standaloneCjk.has(tok.token))) continue; }
+        else if (!hits.some((h) => h.title)) continue;
       } else {
         const nameLike = hits.reduce((a, h) => a + (h.f.named.get(tok.token) ?? 0), 0);
         const plain = hits.reduce((a, h) => a + (h.f.plain.get(tok.token) ?? 0), 0);
         const dict = isDictionaryWord(tok.token);
+        common = dict;
         if (dict && !hits.some((h) => h.f.standalone.has(tok.token))) continue;
         // No prose occurrence that tells (only sentence starts, headings, code): the file's title decides.
         if (!nameLike && !plain) { if (!hits.some((h) => h.title)) continue; }
         else if (nameLike < (dict ? DICTIONARY_NAME_SHARE : NAME_SHARE) * (nameLike + plain)) continue;
       }
-      // Best file: front matter names it, then path/heading names it, then topic files before daily notes, then
+      // Best file: (a common word) its exact title, then front matter names it, then path/heading names it, then topic files before daily notes, then
       // most occurrences, then path.
-      hits.sort((a, b) => Number(b.front) - Number(a.front) || Number(b.title) - Number(a.title)
+      // A common word points to the file whose title is that word alone: that file is why it counts at all.
+      const exact = (h: (typeof hits)[number]) => common && (tok.cjk ? h.f.standaloneCjk : h.f.standalone).has(tok.token);
+      hits.sort((a, b) => Number(exact(b)) - Number(exact(a)) || Number(b.front) - Number(a.front) || Number(b.title) - Number(a.title)
         || Number(DAILY_RE.test(a.path)) - Number(DAILY_RE.test(b.path)) || b.count - a.count || a.path.localeCompare(b.path));
       found.push({ tok, df: hits.length, best: hits[0]!.path });
     }
